@@ -10,6 +10,20 @@ compile_commands.json
 CTestTestfile.cmake
 _deps
 CMakeUserPresets.json
+build
+*.o
+*.so
+*.a
+*.exe
+*.dll
+*.lib
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
 # CLion
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
