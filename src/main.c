@@ -30,6 +30,51 @@ void signal_handler(int signum) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * register_slash_commands
+ *
+ * Registers a guild-scoped slash command:
+ *   /ping [target]
+ *     target  (optional, user) – the guild member whose display name is
+ *             hashed.  Defaults to the invoking user when omitted.
+ *
+ * Guild commands become available instantly; global commands can take up to
+ * an hour to propagate, so guild scope is used here for a faster dev loop.
+ * --------------------------------------------------------------------------- */
+void register_slash_commands(struct discord *client,
+                             u64_snowflake_t application_id,
+                             u64_snowflake_t guild_id) {
+    /* The "target" option – a USER picker, not required. */
+    struct discord_application_command_option target_option = {
+        .type        = DISCORD_APPLICATION_COMMAND_OPTION_USER,
+        .name        = "target",
+        .description = "Member to hash (defaults to you)",
+        .required    = false,
+    };
+
+    /* Orca expects a NULL-terminated array of pointers. */
+    struct discord_application_command_option *options[] = {
+        &target_option,
+        NULL,
+    };
+
+    struct discord_create_guild_application_command_params params = {
+        .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+        .name        = "ping",
+        .description = "Pong! Optionally hash a target member's display name.",
+        .options     = options,
+    };
+
+    ORCAcode code = discord_create_guild_application_command(
+        client, application_id, guild_id, &params, NULL);
+
+    if (code == ORCA_OK)
+        printf("[ping] /ping slash command registered in guild %" PRIu64 "\n",
+               guild_id);
+    else
+        printf("[ping] Failed to register /ping (ORCAcode %d)\n", code);
+}
+
 // Ready event handler
 // This is the earliest point at which discord_get_self() is populated,
 // so slash-command registration lives here.
