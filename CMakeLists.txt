@@ -10,7 +10,7 @@ enable_language(ASM_NASM)
 
 # Find required packages
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBCURL REQUIRED libcurl)
+pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
 
 # Find Orca/Discord library manually
 # Check common installation paths

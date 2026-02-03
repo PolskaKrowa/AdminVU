@@ -1,29 +1,24 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Module sources
-set(MODULE_SOURCES
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
+
+add_executable(discord_bot
+    main.c
+    env_parser.c
     modules/ping.c
 )
 
-# Main executable
-add_executable(discord_bot 
-    main.c
-    env_parser.c
-    ${MODULE_SOURCES}
-)
-
-# Link libraries
-target_link_libraries(discord_bot 
-    ${LIBCURL_LIBRARIES}
+target_link_libraries(discord_bot
+    PkgConfig::LIBCURL
     ${ORCA_LIBRARY}
     bot_asm
     pthread
     m
 )
 
-# Include directories
-target_include_directories(discord_bot PRIVATE 
-    ${LIBCURL_INCLUDE_DIRS}
+target_include_directories(discord_bot PRIVATE
     ${ORCA_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/asm
