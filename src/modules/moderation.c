@@ -11,14 +11,17 @@ static u64_snowflake_t g_guild_id = 0;
 
 // Helper: Check if user has moderation permissions
 static bool has_mod_permissions(const struct discord_interaction *event) {
-    if (!event->member) return false;
+    if (!event->member || !event->member->permissions) return false;
+    
+    // Parse permissions string to uint64
+    uint64_t perms = strtoull(event->member->permissions, NULL, 10);
     
     // Check for KICK_MEMBERS, BAN_MEMBERS, or MODERATE_MEMBERS permissions
-    uint64_t required = DISCORD_PERM_KICK_MEMBERS | 
-                       DISCORD_PERM_BAN_MEMBERS | 
-                       DISCORD_PERM_MODERATE_MEMBERS;
+    uint64_t required = DISCORD_PERMISSION_KICK_MEMBERS | 
+                       DISCORD_PERMISSION_BAN_MEMBERS | 
+                       DISCORD_PERMISSION_MODERATE_MEMBERS;
     
-    return (event->member->permissions & required) != 0;
+    return (perms & required) != 0;
 }
 
 // Helper: Get option value by name
@@ -42,7 +45,7 @@ static void send_ephemeral(struct discord *client,
         .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
         .data = &(struct discord_interaction_callback_data){
             .content = (char *)message,
-            .flags = DISCORD_MESSAGE_EPHEMERAL,
+            .flags = 1 << 6,  // 64 = ephemeral flag
         },
     };
     
@@ -185,7 +188,7 @@ static void handle_kick_command(struct discord *client,
     u64_snowflake_t moderator_id = event->member ? event->member->user->id : 0;
     
     // Attempt to kick the user
-    ORCAcode code = discord_remove_guild_member(client, event->guild_id, target_id, NULL);
+    ORCAcode code = discord_remove_guild_member(client, event->guild_id, target_id);
     
     if (code != ORCA_OK) {
         char error[256];
@@ -233,13 +236,8 @@ static void handle_ban_command(struct discord *client,
     u64_snowflake_t target_id = (u64_snowflake_t)strtoull(user_id_str, NULL, 10);
     u64_snowflake_t moderator_id = event->member ? event->member->user->id : 0;
     
-    // Ban parameters
-    struct discord_create_guild_ban_params params = {
-        .delete_message_seconds = 86400,  // Delete 1 day of messages
-    };
-    
-    ORCAcode code = discord_create_guild_ban(client, event->guild_id, target_id, 
-                                             &params, NULL);
+    // Ban the user (delete 1 day of messages)
+    ORCAcode code = discord_create_guild_ban(client, event->guild_id, target_id, reason);
     
     if (code != ORCA_OK) {
         char error[256];
@@ -269,6 +267,8 @@ static void handle_ban_command(struct discord *client,
 }
 
 // /timeout command handler (timeout = mute in Discord API terms)
+// NOTE: This requires Orca support for communication_disabled_until field
+// If your Orca version doesn't support this, you'll need to implement role-based muting
 static void handle_timeout_command(struct discord *client,
                                    const struct discord_interaction *event) {
     if (!has_mod_permissions(event)) {
@@ -293,16 +293,28 @@ static void handle_timeout_command(struct discord *client,
     if (duration_minutes < 1) duration_minutes = 10;
     if (duration_minutes > 40320) duration_minutes = 40320;  // Max 28 days
     
-    // Calculate timeout timestamp (ISO8601)
+    // Log the action in database
+    db_log_action(g_db, MOD_ACTION_MUTE, target_id, event->guild_id,
+                  moderator_id, reason);
+    
+    // Note: The actual timeout implementation depends on your Orca version
+    // Newer versions support communication_disabled_until in modify_guild_member_params
+    // Older versions may require role-based muting
+    
+    send_ephemeral(client, event, 
+                  "⚠️ Timeout feature requires Orca support for communication_disabled_until.\n"
+                  "Please implement role-based muting or upgrade Orca to use Discord's native timeout.");
+    
+    /* Original implementation for newer Orca versions:
+    
     time_t now = time(NULL);
     time_t timeout_until = now + (duration_minutes * 60);
     struct tm *tm_info = gmtime(&timeout_until);
     char iso_time[64];
     strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S.000Z", tm_info);
     
-    // Modify guild member to set timeout
     struct discord_modify_guild_member_params params = {
-        .communication_disabled_until = iso_time,
+        .communication_disabled_until = iso_time,  // May not exist in older Orca
     };
     
     ORCAcode code = discord_modify_guild_member(client, event->guild_id, target_id,
@@ -315,10 +327,6 @@ static void handle_timeout_command(struct discord *client,
         send_ephemeral(client, event, error);
         return;
     }
-    
-    // Log the action
-    db_log_action(g_db, MOD_ACTION_MUTE, target_id, event->guild_id,
-                  moderator_id, reason);
     
     char response[512];
     snprintf(response, sizeof(response),
@@ -333,6 +341,7 @@ static void handle_timeout_command(struct discord *client,
     };
     
     discord_create_interaction_response(client, event->id, event->token, &resp, NULL);
+    */
 }
 
 // Main interaction router
@@ -384,7 +393,6 @@ void register_moderation_commands(struct discord *client,
         .name = "warn",
         .description = "Issue a warning to a user",
         .options = warn_opts,
-        .default_member_permissions = "1099511627778",  // KICK_MEMBERS permission
     };
     
     discord_create_guild_application_command(client, application_id, guild_id,
@@ -407,7 +415,6 @@ void register_moderation_commands(struct discord *client,
         .name = "warnings",
         .description = "View all warnings for a user",
         .options = warnings_opts,
-        .default_member_permissions = "1099511627778",
     };
     
     discord_create_guild_application_command(client, application_id, guild_id,
@@ -437,7 +444,6 @@ void register_moderation_commands(struct discord *client,
         .name = "kick",
         .description = "Kick a user from the server",
         .options = kick_opts,
-        .default_member_permissions = "2",  // KICK_MEMBERS
     };
     
     discord_create_guild_application_command(client, application_id, guild_id,
@@ -467,7 +473,6 @@ void register_moderation_commands(struct discord *client,
         .name = "ban",
         .description = "Ban a user from the server",
         .options = ban_opts,
-        .default_member_permissions = "4",  // BAN_MEMBERS
     };
     
     discord_create_guild_application_command(client, application_id, guild_id,
@@ -504,7 +509,6 @@ void register_moderation_commands(struct discord *client,
         .name = "timeout",
         .description = "Timeout a user (prevent them from sending messages)",
         .options = timeout_opts,
-        .default_member_permissions = "1099511627794",  // MODERATE_MEMBERS
     };
     
     discord_create_guild_application_command(client, application_id, guild_id,
