@@ -1,4 +1,4 @@
-# Discord Bot in C with Orca - Moderation Edition
+# AdminVU V3
 
 A modular Discord bot written in C using the Orca Discord API library, with x86_64 assembly optimisations and SQLite database for moderation.
 
@@ -308,4 +308,5 @@ Contributions are welcome! Areas for improvement:
 - Implement auto-moderation features (spam detection, etc.)
 - Add logging channel configuration
 - Create web dashboard for viewing mod logs
+
 - Implement appeal system for warnings/bans
