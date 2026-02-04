@@ -6,10 +6,13 @@
 #include <orca/discord.h>
 
 #include "env_parser.h"
+#include "database.h"
 #include "modules/ping.h"
+#include "modules/moderation.h"
 
 // Global client pointer for signal handling
 static struct discord *g_client = NULL;
+static Database g_database = { 0 };
 
 // Guild ID read from the environment at startup; used to register
 // guild-scoped slash commands (instant propagation vs. up to 1 h for global).
@@ -33,13 +36,7 @@ void signal_handler(int signum) {
 /* ---------------------------------------------------------------------------
  * register_slash_commands
  *
- * Registers a guild-scoped slash command:
- *   /ping [target]
- *     target  (optional, user) – the guild member whose display name is
- *             hashed.  Defaults to the invoking user when omitted.
- *
- * Guild commands become available instantly; global commands can take up to
- * an hour to propagate, so guild scope is used here for a faster dev loop.
+ * Registers guild-scoped slash commands for both ping and moderation modules.
  * --------------------------------------------------------------------------- */
 void register_slash_commands(struct discord *client,
                              u64_snowflake_t application_id,
@@ -73,11 +70,32 @@ void register_slash_commands(struct discord *client,
                guild_id);
     else
         printf("[ping] Failed to register /ping (ORCAcode %d)\n", code);
+    
+    // Register moderation commands
+    register_moderation_commands(client, application_id, guild_id);
+}
+
+// Combined interaction handler for all modules
+void on_interaction_create_combined(struct discord *client,
+                                    const struct discord_interaction *event) {
+    if (!event->data) return;
+    if (event->type != DISCORD_INTERACTION_APPLICATION_COMMAND) return;
+    
+    const char *cmd = event->data->name;
+    
+    // Route to appropriate module
+    if (strcmp(cmd, "ping") == 0) {
+        // Handled by ping module's original handler
+        extern void on_interaction_create(struct discord *client,
+                                         const struct discord_interaction *event);
+        on_interaction_create(client, event);
+    } else {
+        // Try moderation commands
+        on_moderation_interaction(client, event);
+    }
 }
 
 // Ready event handler
-// This is the earliest point at which discord_get_self() is populated,
-// so slash-command registration lives here.
 void on_ready(struct discord *client) {
     printf("Bot is ready!\n");
 
@@ -117,8 +135,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Get guild ID – slash commands are registered per-guild so that
-    // they propagate instantly during development.
+    // Get guild ID
     const char *guild_id_str = get_env("DISCORD_GUILD_ID");
     if (!guild_id_str) {
         fprintf(stderr, "Error: DISCORD_GUILD_ID not found\n");
@@ -132,6 +149,14 @@ int main(int argc, char *argv[]) {
     g_guild_id = parse_snowflake(guild_id_str);
     printf("Target guild ID: %" PRIu64 "\n", g_guild_id);
 
+    // Initialise database
+    printf("Initialising database...\n");
+    if (db_init(&g_database, "bot_data.db") != 0) {
+        fprintf(stderr, "Error: Failed to initialise database\n");
+        cleanup_env();
+        return EXIT_FAILURE;
+    }
+
     // Set up signal handlers
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -140,6 +165,7 @@ int main(int argc, char *argv[]) {
     struct discord *client = discord_init(token);
     if (!client) {
         fprintf(stderr, "Error: Failed to initialise Discord client\n");
+        db_cleanup(&g_database);
         cleanup_env();
         return EXIT_FAILURE;
     }
@@ -148,12 +174,14 @@ int main(int argc, char *argv[]) {
 
     // Set up event handlers
     discord_set_on_ready(client, (void*)&on_ready);
+    
+    // Use combined interaction handler
+    discord_set_on_interaction_create(client, &on_interaction_create_combined);
 
     // Initialise modules
-    // ping_module_init binds on_interaction_create; the actual /ping
-    // command registration is deferred to on_ready (needs application_id).
     printf("Initialising modules...\n");
     ping_module_init(client, g_guild_id);
+    moderation_module_init(client, &g_database, g_guild_id);
 
     // Start the bot
     printf("Starting bot...\n");
@@ -161,6 +189,7 @@ int main(int argc, char *argv[]) {
 
     // Cleanup
     discord_cleanup(client);
+    db_cleanup(&g_database);
     cleanup_env();
     printf("Bot shut down successfully\n");
 

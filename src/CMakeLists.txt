@@ -7,7 +7,9 @@ pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
 add_executable(discord_bot
     main.c
     env_parser.c
+    database.c
     modules/ping.c
+    modules/moderation.c
 )
 
 target_link_libraries(discord_bot
@@ -16,6 +18,7 @@ target_link_libraries(discord_bot
     bot_asm
     pthread
     m
+    sqlite3
 )
 
 target_include_directories(discord_bot PRIVATE
