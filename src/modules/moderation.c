@@ -238,7 +238,7 @@ static void handle_ban_command(struct discord *client,
     
     // Ban the user (delete 1 day of messages)
     struct discord_create_guild_ban_params params = {
-        .delete_message_days = 1  // Delete 1 day of messages
+        .delete_message_days = 1
     };
     
     ORCAcode code = discord_create_guild_ban(client, event->guild_id, target_id, &params);
@@ -270,84 +270,6 @@ static void handle_ban_command(struct discord *client,
     discord_create_interaction_response(client, event->id, event->token, &resp, NULL);
 }
 
-// /timeout command handler (timeout = mute in Discord API terms)
-// NOTE: This requires Orca support for communication_disabled_until field
-// If your Orca version doesn't support this, you'll need to implement role-based muting
-static void handle_timeout_command(struct discord *client,
-                                   const struct discord_interaction *event) {
-    if (!has_mod_permissions(event)) {
-        send_ephemeral(client, event, "❌ You don't have permission to timeout members.");
-        return;
-    }
-    
-    const char *user_id_str = get_option_value(event, "user");
-    const char *duration_str = get_option_value(event, "duration");
-    const char *reason = get_option_value(event, "reason");
-    
-    if (!user_id_str) {
-        send_ephemeral(client, event, "❌ User not specified.");
-        return;
-    }
-    
-    u64_snowflake_t target_id = (u64_snowflake_t)strtoull(user_id_str, NULL, 10);
-    u64_snowflake_t moderator_id = event->member ? event->member->user->id : 0;
-    
-    // Parse duration (in minutes)
-    int duration_minutes = duration_str ? atoi(duration_str) : 10;
-    if (duration_minutes < 1) duration_minutes = 10;
-    if (duration_minutes > 40320) duration_minutes = 40320;  // Max 28 days
-    
-    // Log the action in database
-    db_log_action(g_db, MOD_ACTION_MUTE, target_id, event->guild_id,
-                  moderator_id, reason);
-    
-    // Note: The actual timeout implementation depends on your Orca version
-    // Newer versions support communication_disabled_until in modify_guild_member_params
-    // Older versions may require role-based muting
-    
-    send_ephemeral(client, event, 
-                  "⚠️ Timeout feature requires Orca support for communication_disabled_until.\n"
-                  "Please implement role-based muting or upgrade Orca to use Discord's native timeout.");
-    
-    /* Original implementation for newer Orca versions:
-    
-    time_t now = time(NULL);
-    time_t timeout_until = now + (duration_minutes * 60);
-    struct tm *tm_info = gmtime(&timeout_until);
-    char iso_time[64];
-    strftime(iso_time, sizeof(iso_time), "%Y-%m-%dT%H:%M:%S.000Z", tm_info);
-    
-    struct discord_modify_guild_member_params params = {
-        .communication_disabled_until = iso_time,  // May not exist in older Orca
-    };
-    
-    ORCAcode code = discord_modify_guild_member(client, event->guild_id, target_id,
-                                                &params, NULL);
-    
-    if (code != ORCA_OK) {
-        char error[256];
-        snprintf(error, sizeof(error), 
-                 "❌ Failed to timeout user (ORCAcode %d). Check bot permissions.", code);
-        send_ephemeral(client, event, error);
-        return;
-    }
-    
-    char response[512];
-    snprintf(response, sizeof(response),
-             "🔇 User <@%" PRIu64 "> has been timed out for %d minutes.\n**Reason:** %s",
-             target_id, duration_minutes, reason ? reason : "No reason provided");
-    
-    struct discord_interaction_response resp = {
-        .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-        .data = &(struct discord_interaction_callback_data){
-            .content = response,
-        },
-    };
-    
-    discord_create_interaction_response(client, event->id, event->token, &resp, NULL);
-    */
-}
-
 // Main interaction router
 void on_moderation_interaction(struct discord *client,
                                const struct discord_interaction *event) {
@@ -364,8 +286,6 @@ void on_moderation_interaction(struct discord *client,
         handle_kick_command(client, event);
     } else if (strcmp(cmd, "ban") == 0) {
         handle_ban_command(client, event);
-    } else if (strcmp(cmd, "timeout") == 0) {
-        handle_timeout_command(client, event);
     }
 }
 
@@ -525,6 +445,5 @@ void moderation_module_init(struct discord *client, Database *db, u64_snowflake_
     g_db = db;
     g_guild_id = guild_id;
     
-    // The interaction handler is shared, so we just set a flag
     printf("[moderation] Moderation module initialised\n");
 }

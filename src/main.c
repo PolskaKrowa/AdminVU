@@ -83,15 +83,21 @@ void on_interaction_create_combined(struct discord *client,
     
     const char *cmd = event->data->name;
     
+    printf("[main] Received interaction: %s\n", cmd);
+    
     // Route to appropriate module
     if (strcmp(cmd, "ping") == 0) {
-        // Handled by ping module's original handler
-        extern void on_interaction_create(struct discord *client,
-                                         const struct discord_interaction *event);
-        on_interaction_create(client, event);
-    } else {
-        // Try moderation commands
+        // Handle ping command
+        on_ping_interaction(client, event);
+    } else if (strcmp(cmd, "warn") == 0 || 
+               strcmp(cmd, "warnings") == 0 ||
+               strcmp(cmd, "kick") == 0 ||
+               strcmp(cmd, "ban") == 0 ||
+               strcmp(cmd, "timeout") == 0) {
+        // Handle moderation commands
         on_moderation_interaction(client, event);
+    } else {
+        printf("[main] Unknown command: %s\n", cmd);
     }
 }
 

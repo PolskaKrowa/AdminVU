@@ -17,15 +17,13 @@ extern uint64_t fast_hash(const char *str, size_t len);
 static u64_snowflake_t g_guild_id = 0;
 
 /* ---------------------------------------------------------------------------
- * on_interaction_create
+ * on_ping_interaction
  *
- * Receives every interaction from the gateway.  We filter down to
- * APPLICATION_COMMAND interactions whose name is "ping", extract the
- * optional "target" option, compute the hash via the assembly routine,
- * and reply inline via discord_create_interaction_response.
+ * Receives ping command interactions, extracts the optional "target" option,
+ * computes the hash via the assembly routine, and replies inline.
  * --------------------------------------------------------------------------- */
-void on_interaction_create(struct discord *client,
-                           const struct discord_interaction *event) {
+void on_ping_interaction(struct discord *client,
+                         const struct discord_interaction *event) {
     /* Ignore interactions that carry no command payload. */
     if (!event->data)
         return;
@@ -150,8 +148,7 @@ void on_interaction_create(struct discord *client,
 /* ---------------------------------------------------------------------------
  * ping_module_init
  *
- * Called once during bot startup.  Stores the guild_id for later use and
- * binds the interaction-create gateway event to on_interaction_create.
+ * Called once during bot startup.  Stores the guild_id for later use.
  *
  * The actual slash-command registration must wait until on_ready fires
  * (so that discord_get_self() is populated and we can obtain the
@@ -160,7 +157,6 @@ void on_interaction_create(struct discord *client,
  * --------------------------------------------------------------------------- */
 void ping_module_init(struct discord *client, u64_snowflake_t guild_id) {
     g_guild_id = guild_id;
-    discord_set_on_interaction_create(client, &on_interaction_create);
     printf("[ping] Ping module initialised (guild_id = %" PRIu64 ")\n",
            guild_id);
 }
