@@ -10,6 +10,7 @@ add_executable(discord_bot
     database.c
     modules/ping.c
     modules/moderation.c
+    modules/ticket.c
 )
 
 target_link_libraries(discord_bot

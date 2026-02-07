@@ -9,6 +9,7 @@
 #include "database.h"
 #include "modules/ping.h"
 #include "modules/moderation.h"
+#include "modules/ticket.h"
 
 // Global client pointer for signal handling
 static struct discord *g_client = NULL;
@@ -36,7 +37,7 @@ void signal_handler(int signum) {
 /* ---------------------------------------------------------------------------
  * register_slash_commands
  *
- * Registers guild-scoped slash commands for both ping and moderation modules.
+ * Registers guild-scoped slash commands for ping, moderation, and ticket modules.
  * --------------------------------------------------------------------------- */
 void register_slash_commands(struct discord *client,
                              u64_snowflake_t application_id,
@@ -73,6 +74,9 @@ void register_slash_commands(struct discord *client,
     
     // Register moderation commands
     register_moderation_commands(client, application_id, guild_id);
+    
+    // Register ticket commands (guild-specific ones)
+    register_ticket_commands(client, application_id, guild_id);
 }
 
 // Combined interaction handler for all modules
@@ -96,9 +100,21 @@ void on_interaction_create_combined(struct discord *client,
                strcmp(cmd, "timeout") == 0) {
         // Handle moderation commands
         on_moderation_interaction(client, event);
+    } else if (strcmp(cmd, "ticket") == 0 ||
+               strcmp(cmd, "closeticket") == 0 ||
+               strcmp(cmd, "ticketconfig") == 0) {
+        // Handle ticket commands
+        on_ticket_interaction(client, event);
     } else {
         printf("[main] Unknown command: %s\n", cmd);
     }
+}
+
+// Message handler for ticket messages
+void on_message_create(struct discord *client,
+                       const struct discord_message *event) {
+    // Route to ticket module
+    on_ticket_message(client, event);
 }
 
 // Ready event handler
@@ -180,14 +196,14 @@ int main(int argc, char *argv[]) {
 
     // Set up event handlers
     discord_set_on_ready(client, (void*)&on_ready);
-    
-    // Use combined interaction handler
     discord_set_on_interaction_create(client, &on_interaction_create_combined);
+    discord_set_on_message_create(client, &on_message_create);
 
     // Initialise modules
     printf("Initialising modules...\n");
     ping_module_init(client, g_guild_id);
     moderation_module_init(client, &g_database, g_guild_id);
+    ticket_module_init(client, &g_database);
 
     // Start the bot
     printf("Starting bot...\n");
