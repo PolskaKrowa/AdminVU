@@ -237,7 +237,11 @@ static void handle_ban_command(struct discord *client,
     u64_snowflake_t moderator_id = event->member ? event->member->user->id : 0;
     
     // Ban the user (delete 1 day of messages)
-    ORCAcode code = discord_create_guild_ban(client, event->guild_id, target_id, reason);
+    struct discord_create_guild_ban_params params = {
+        .delete_message_days = 1  // Delete 1 day of messages
+    };
+    
+    ORCAcode code = discord_create_guild_ban(client, event->guild_id, target_id, &params);
     
     if (code != ORCA_OK) {
         char error[256];
