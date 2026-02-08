@@ -33,12 +33,19 @@ static const char *CREATE_TICKET_TABLES_SQL =
     "CREATE TABLE IF NOT EXISTS ticket_messages ("
     "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "    ticket_id INTEGER NOT NULL,"
+    "    message_id INTEGER NOT NULL,"
     "    author_id INTEGER NOT NULL,"
     "    content TEXT NOT NULL,"
+    "    attachments_json TEXT,"
     "    from_user INTEGER NOT NULL,"
+    "    is_deleted INTEGER DEFAULT 0,"
+    "    is_edited INTEGER DEFAULT 0,"
     "    timestamp INTEGER DEFAULT (strftime('%s', 'now')),"
+    "    edited_at INTEGER,"
     "    FOREIGN KEY (ticket_id) REFERENCES tickets(id)"
-    ");";
+    ");"
+    ""
+    "CREATE INDEX IF NOT EXISTS idx_message_id ON ticket_messages(message_id);";
 
 // Initialise ticket database tables
 static int init_ticket_tables(Database *db) {
@@ -226,11 +233,12 @@ int db_close_ticket(Database *db, int ticket_id) {
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-int db_add_ticket_message(Database *db, int ticket_id, u64_snowflake_t author_id,
-                           const char *content, bool from_user) {
+int db_add_ticket_message(Database *db, int ticket_id, u64_snowflake_t message_id,
+                           u64_snowflake_t author_id, const char *content, 
+                           const char *attachments_json, bool from_user) {
     const char *sql = "INSERT INTO ticket_messages "
-                      "(ticket_id, author_id, content, from_user) "
-                      "VALUES (?, ?, ?, ?)";
+                      "(ticket_id, message_id, author_id, content, attachments_json, from_user) "
+                      "VALUES (?, ?, ?, ?, ?, ?)";
     sqlite3_stmt *stmt;
     
     int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
@@ -239,9 +247,47 @@ int db_add_ticket_message(Database *db, int ticket_id, u64_snowflake_t author_id
     }
     
     sqlite3_bind_int(stmt, 1, ticket_id);
-    sqlite3_bind_int64(stmt, 2, author_id);
-    sqlite3_bind_text(stmt, 3, content, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 4, from_user ? 1 : 0);
+    sqlite3_bind_int64(stmt, 2, message_id);
+    sqlite3_bind_int64(stmt, 3, author_id);
+    sqlite3_bind_text(stmt, 4, content, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, attachments_json, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 6, from_user ? 1 : 0);
+    
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int db_update_ticket_message(Database *db, u64_snowflake_t message_id, const char *new_content) {
+    const char *sql = "UPDATE ticket_messages SET content = ?, is_edited = 1, "
+                      "edited_at = strftime('%s', 'now') WHERE message_id = ?";
+    sqlite3_stmt *stmt;
+    
+    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return -1;
+    }
+    
+    sqlite3_bind_text(stmt, 1, new_content, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, message_id);
+    
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int db_delete_ticket_message(Database *db, u64_snowflake_t message_id) {
+    const char *sql = "UPDATE ticket_messages SET is_deleted = 1 WHERE message_id = ?";
+    sqlite3_stmt *stmt;
+    
+    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return -1;
+    }
+    
+    sqlite3_bind_int64(stmt, 1, message_id);
     
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -251,7 +297,8 @@ int db_add_ticket_message(Database *db, int ticket_id, u64_snowflake_t author_id
 
 int db_get_ticket_messages(Database *db, int ticket_id,
                             TicketMessage **messages, int *count) {
-    const char *sql = "SELECT id, ticket_id, author_id, content, from_user, timestamp "
+    const char *sql = "SELECT id, ticket_id, message_id, author_id, content, attachments_json, "
+                      "from_user, is_deleted, is_edited, timestamp, edited_at "
                       "FROM ticket_messages WHERE ticket_id = ? ORDER BY timestamp ASC";
     sqlite3_stmt *stmt;
     
@@ -288,13 +335,20 @@ int db_get_ticket_messages(Database *db, int ticket_id,
     while (sqlite3_step(stmt) == SQLITE_ROW && idx < row_count) {
         (*messages)[idx].id = sqlite3_column_int(stmt, 0);
         (*messages)[idx].ticket_id = sqlite3_column_int(stmt, 1);
-        (*messages)[idx].author_id = sqlite3_column_int64(stmt, 2);
+        (*messages)[idx].message_id = sqlite3_column_int64(stmt, 2);
+        (*messages)[idx].author_id = sqlite3_column_int64(stmt, 3);
         
-        const char *content = (const char *)sqlite3_column_text(stmt, 3);
+        const char *content = (const char *)sqlite3_column_text(stmt, 4);
         (*messages)[idx].content = content ? strdup(content) : NULL;
         
-        (*messages)[idx].from_user = sqlite3_column_int(stmt, 4) != 0;
-        (*messages)[idx].timestamp = sqlite3_column_int64(stmt, 5);
+        const char *attachments = (const char *)sqlite3_column_text(stmt, 5);
+        (*messages)[idx].attachments_json = attachments ? strdup(attachments) : NULL;
+        
+        (*messages)[idx].from_user = sqlite3_column_int(stmt, 6) != 0;
+        (*messages)[idx].is_deleted = sqlite3_column_int(stmt, 7) != 0;
+        (*messages)[idx].is_edited = sqlite3_column_int(stmt, 8) != 0;
+        (*messages)[idx].timestamp = sqlite3_column_int64(stmt, 9);
+        (*messages)[idx].edited_at = sqlite3_column_int64(stmt, 10);
         idx++;
     }
     
@@ -307,6 +361,7 @@ void db_free_ticket_messages(TicketMessage *messages, int count) {
     
     for (int i = 0; i < count; i++) {
         free(messages[i].content);
+        free(messages[i].attachments_json);
     }
     free(messages);
 }
@@ -321,14 +376,14 @@ char* generate_ticket_html(Database *db, int ticket_id, const char *username) {
     }
     
     // Allocate a large buffer for the HTML
-    size_t html_size = 64 * 1024;  // 64KB initial size
+    size_t html_size = 128 * 1024;  // 128KB initial size
     char *html = malloc(html_size);
     if (!html) {
         db_free_ticket_messages(messages, count);
         return NULL;
     }
     
-    // Build HTML
+    // Build HTML with staff-oriented design
     int written = snprintf(html, html_size,
         "<!DOCTYPE html>\n"
         "<html lang=\"en\">\n"
@@ -339,95 +394,200 @@ char* generate_ticket_html(Database *db, int ticket_id, const char *username) {
         "    <style>\n"
         "        * { margin: 0; padding: 0; box-sizing: border-box; }\n"
         "        body {\n"
-        "            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;\n"
-        "            background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%);\n"
-        "            min-height: 100vh;\n"
+        "            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;\n"
+        "            background: #1a1d21;\n"
+        "            color: #dcddde;\n"
         "            padding: 20px;\n"
+        "            line-height: 1.5;\n"
         "        }\n"
         "        .container {\n"
-        "            max-width: 900px;\n"
+        "            max-width: 1200px;\n"
         "            margin: 0 auto;\n"
-        "            background: white;\n"
-        "            border-radius: 12px;\n"
-        "            box-shadow: 0 10px 40px rgba(0,0,0,0.2);\n"
+        "            background: #2f3136;\n"
+        "            border-radius: 8px;\n"
         "            overflow: hidden;\n"
         "        }\n"
         "        .header {\n"
-        "            background: linear-gradient(135deg, #5865F2 0%%, #7289DA 100%%);\n"
-        "            color: white;\n"
-        "            padding: 30px;\n"
-        "            text-align: center;\n"
+        "            background: #202225;\n"
+        "            padding: 24px 32px;\n"
+        "            border-bottom: 1px solid #1a1d21;\n"
         "        }\n"
-        "        .header h1 { font-size: 28px; margin-bottom: 8px; }\n"
-        "        .header p { opacity: 0.9; font-size: 14px; }\n"
-        "        .messages {\n"
-        "            padding: 30px;\n"
-        "            background: #f8f9fa;\n"
-        "        }\n"
-        "        .message {\n"
-        "            margin-bottom: 20px;\n"
-        "            padding: 16px 20px;\n"
-        "            border-radius: 8px;\n"
-        "            position: relative;\n"
-        "            animation: fadeIn 0.3s ease-in;\n"
-        "        }\n"
-        "        @keyframes fadeIn {\n"
-        "            from { opacity: 0; transform: translateY(10px); }\n"
-        "            to { opacity: 1; transform: translateY(0); }\n"
-        "        }\n"
-        "        .message.user {\n"
-        "            background: #e3f2fd;\n"
-        "            border-left: 4px solid #2196F3;\n"
-        "        }\n"
-        "        .message.staff {\n"
-        "            background: #fff3e0;\n"
-        "            border-left: 4px solid #FF9800;\n"
-        "        }\n"
-        "        .message-header {\n"
-        "            display: flex;\n"
-        "            justify-content: space-between;\n"
-        "            align-items: center;\n"
+        "        .header h1 {\n"
+        "            font-size: 24px;\n"
+        "            font-weight: 600;\n"
+        "            color: #fff;\n"
         "            margin-bottom: 8px;\n"
         "        }\n"
-        "        .author {\n"
-        "            font-weight: 600;\n"
+        "        .header .meta {\n"
         "            font-size: 14px;\n"
+        "            color: #b9bbbe;\n"
         "        }\n"
-        "        .message.user .author { color: #1976D2; }\n"
-        "        .message.staff .author { color: #F57C00; }\n"
+        "        .header .meta span {\n"
+        "            margin-right: 16px;\n"
+        "        }\n"
+        "        .messages {\n"
+        "            padding: 24px 32px;\n"
+        "        }\n"
+        "        .message-group {\n"
+        "            margin-bottom: 20px;\n"
+        "        }\n"
+        "        .message-group:hover {\n"
+        "            background: #32353b;\n"
+        "            margin-left: -8px;\n"
+        "            margin-right: -8px;\n"
+        "            padding-left: 8px;\n"
+        "            padding-right: 8px;\n"
+        "            border-radius: 4px;\n"
+        "        }\n"
+        "        .message-author {\n"
+        "            display: flex;\n"
+        "            align-items: baseline;\n"
+        "            margin-bottom: 4px;\n"
+        "        }\n"
+        "        .author-name {\n"
+        "            font-weight: 500;\n"
+        "            font-size: 15px;\n"
+        "            margin-right: 8px;\n"
+        "        }\n"
+        "        .message-group.user .author-name {\n"
+        "            color: #5865f2;\n"
+        "        }\n"
+        "        .message-group.staff .author-name {\n"
+        "            color: #ed4245;\n"
+        "        }\n"
+        "        .author-badge {\n"
+        "            background: #5865f2;\n"
+        "            color: #fff;\n"
+        "            font-size: 10px;\n"
+        "            font-weight: 600;\n"
+        "            padding: 2px 4px;\n"
+        "            border-radius: 3px;\n"
+        "            text-transform: uppercase;\n"
+        "            margin-right: 8px;\n"
+        "        }\n"
+        "        .message-group.staff .author-badge {\n"
+        "            background: #ed4245;\n"
+        "        }\n"
         "        .timestamp {\n"
         "            font-size: 12px;\n"
-        "            color: #666;\n"
+        "            color: #72767d;\n"
         "        }\n"
-        "        .content {\n"
-        "            color: #333;\n"
-        "            line-height: 1.6;\n"
+        "        .message-content {\n"
+        "            color: #dcddde;\n"
+        "            font-size: 15px;\n"
+        "            margin-bottom: 4px;\n"
+        "            white-space: pre-wrap;\n"
         "            word-wrap: break-word;\n"
         "        }\n"
+        "        .message-content.deleted {\n"
+        "            color: #72767d;\n"
+        "            font-style: italic;\n"
+        "            text-decoration: line-through;\n"
+        "        }\n"
+        "        .edit-indicator {\n"
+        "            color: #72767d;\n"
+        "            font-size: 11px;\n"
+        "            margin-left: 4px;\n"
+        "        }\n"
+        "        .attachments {\n"
+        "            margin-top: 8px;\n"
+        "            padding: 8px;\n"
+        "            background: #202225;\n"
+        "            border-radius: 4px;\n"
+        "            border-left: 2px solid #5865f2;\n"
+        "        }\n"
+        "        .attachment-item {\n"
+        "            color: #00a8fc;\n"
+        "            text-decoration: none;\n"
+        "            font-size: 14px;\n"
+        "            display: block;\n"
+        "            margin: 4px 0;\n"
+        "        }\n"
+        "        .attachment-item:hover {\n"
+        "            text-decoration: underline;\n"
+        "        }\n"
+        "        .attachment-item::before {\n"
+        "            content: '📎 ';\n"
+        "        }\n"
         "        .footer {\n"
-        "            background: #f1f3f4;\n"
-        "            padding: 20px;\n"
+        "            background: #202225;\n"
+        "            padding: 16px 32px;\n"
+        "            border-top: 1px solid #1a1d21;\n"
         "            text-align: center;\n"
-        "            color: #666;\n"
+        "            color: #72767d;\n"
         "            font-size: 12px;\n"
+        "        }\n"
+        "        .internal-note {\n"
+        "            background: #faa81a;\n"
+        "            color: #000;\n"
+        "            padding: 12px;\n"
+        "            border-radius: 4px;\n"
+        "            margin-bottom: 16px;\n"
+        "            font-size: 14px;\n"
+        "            font-weight: 500;\n"
         "        }\n"
         "    </style>\n"
         "</head>\n"
         "<body>\n"
         "    <div class=\"container\">\n"
         "        <div class=\"header\">\n"
-        "            <h1>🎫 Ticket #%d</h1>\n"
-        "            <p>User: %s | Total Messages: %d</p>\n"
+        "            <h1>Ticket #%d</h1>\n"
+        "            <div class=\"meta\">\n"
+        "                <span><strong>User:</strong> %s</span>\n"
+        "                <span><strong>Messages:</strong> %d</span>\n"
+        "                <span><strong>Status:</strong> Closed</span>\n"
+        "            </div>\n"
         "        </div>\n"
-        "        <div class=\"messages\">\n",
+        "        <div class=\"messages\">\n"
+        "            <div class=\"internal-note\">⚠️ STAFF ONLY - Internal Ticket Transcript</div>\n",
         ticket_id, username, ticket_id, username, count);
     
-    // Add messages
+    // Group consecutive messages from the same author
     for (int i = 0; i < count; i++) {
-        time_t ts = (time_t)messages[i].timestamp;
-        struct tm *tm_info = gmtime(&ts);
-        char time_buf[64];
-        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S UTC", tm_info);
+        bool is_user = messages[i].from_user;
+        
+        // Check if this is the start of a new group
+        bool start_group = (i == 0) || (messages[i-1].from_user != is_user) || 
+                          (!is_user && messages[i-1].author_id != messages[i].author_id);
+        
+        if (start_group) {
+            // Start a new message group
+            time_t first_ts = (time_t)messages[i].timestamp;
+            struct tm *first_tm = gmtime(&first_ts);
+            char time_buf[64];
+            strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S UTC", first_tm);
+            
+            // Get author name
+            char author_name[128];
+            if (is_user) {
+                snprintf(author_name, sizeof(author_name), "%s", username);
+            } else {
+                // Fetch staff member's username
+                struct discord_user staff_info = { 0 };
+                discord_get_user(g_client, messages[i].author_id, &staff_info);
+                if (staff_info.username && staff_info.username[0] != '\0') {
+                    snprintf(author_name, sizeof(author_name), "%s", staff_info.username);
+                    discord_user_cleanup(&staff_info);
+                } else {
+                    snprintf(author_name, sizeof(author_name), "Staff Member (ID: %" PRIu64 ")", messages[i].author_id);
+                }
+            }
+            
+            char group_header[512];
+            snprintf(group_header, sizeof(group_header),
+                "            <div class=\"message-group %s\">\n"
+                "                <div class=\"message-author\">\n"
+                "                    <span class=\"author-badge\">%s</span>\n"
+                "                    <span class=\"author-name\">%s</span>\n"
+                "                    <span class=\"timestamp\">%s</span>\n"
+                "                </div>\n",
+                is_user ? "user" : "staff",
+                is_user ? "USER" : "STAFF",
+                author_name,
+                time_buf);
+            
+            strncat(html, group_header, html_size - strlen(html) - 1);
+        }
         
         // Escape HTML in content
         char *escaped_content = malloc(strlen(messages[i].content) * 6 + 1);
@@ -446,29 +606,72 @@ char* generate_ticket_html(Database *db, int ticket_id, const char *username) {
         }
         *dst = '\0';
         
-        char msg_html[2048];
-        snprintf(msg_html, sizeof(msg_html),
-            "            <div class=\"message %s\">\n"
-            "                <div class=\"message-header\">\n"
-            "                    <span class=\"author\">%s</span>\n"
-            "                    <span class=\"timestamp\">%s</span>\n"
-            "                </div>\n"
-            "                <div class=\"content\">%s</div>\n"
-            "            </div>\n",
-            messages[i].from_user ? "user" : "staff",
-            messages[i].from_user ? username : "Staff Member (Anonymous)",
-            time_buf,
-            escaped_content);
+        // Add message content with edit/delete indicators
+        char content_html[4096];
+        if (messages[i].is_deleted) {
+            snprintf(content_html, sizeof(content_html),
+                "                <div class=\"message-content deleted\">[Message Deleted]</div>\n");
+        } else {
+            snprintf(content_html, sizeof(content_html),
+                "                <div class=\"message-content\">%s",
+                escaped_content);
+            
+            if (messages[i].is_edited) {
+                strncat(content_html, "<span class=\"edit-indicator\">(edited)</span>", 
+                       sizeof(content_html) - strlen(content_html) - 1);
+            }
+            
+            strncat(content_html, "</div>\n", sizeof(content_html) - strlen(content_html) - 1);
+        }
         
         free(escaped_content);
-        strncat(html, msg_html, html_size - strlen(html) - 1);
+        strncat(html, content_html, html_size - strlen(html) - 1);
+        
+        // Add attachments if present
+        if (messages[i].attachments_json && strlen(messages[i].attachments_json) > 2) {
+            strncat(html, "                <div class=\"attachments\">\n", 
+                   html_size - strlen(html) - 1);
+            
+            // Parse simple JSON array (just extract URLs between quotes)
+            const char *json = messages[i].attachments_json;
+            const char *url_start = strchr(json, '"');
+            while (url_start) {
+                url_start++; // Move past opening quote
+                const char *url_end = strchr(url_start, '"');
+                if (!url_end) break;
+                
+                size_t url_len = url_end - url_start;
+                char url[512];
+                if (url_len < sizeof(url)) {
+                    strncpy(url, url_start, url_len);
+                    url[url_len] = '\0';
+                    
+                    char att_html[600];
+                    snprintf(att_html, sizeof(att_html),
+                            "                    <a href=\"%s\" class=\"attachment-item\" target=\"_blank\">%s</a>\n",
+                            url, url);
+                    strncat(html, att_html, html_size - strlen(html) - 1);
+                }
+                
+                url_start = strchr(url_end + 1, '"');
+            }
+            
+            strncat(html, "                </div>\n", html_size - strlen(html) - 1);
+        }
+        
+        // Check if we should close the group
+        bool end_group = (i == count - 1) || (messages[i+1].from_user != is_user) ||
+                        (!is_user && i + 1 < count && messages[i+1].author_id != messages[i].author_id);
+        if (end_group) {
+            strncat(html, "            </div>\n", html_size - strlen(html) - 1);
+        }
     }
     
     // Close HTML
     const char *footer = 
         "        </div>\n"
         "        <div class=\"footer\">\n"
-        "            Generated by Discord Support Ticket System\n"
+        "            Internal Staff Transcript | Confidential\n"
         "        </div>\n"
         "    </div>\n"
         "</body>\n"
@@ -705,21 +908,37 @@ static void handle_ticket_close(struct discord *client,
             // Get server config for log channel
             ServerConfig config;
             if (db_get_server_config(g_db, ticket.main_guild_id, &config) == 0) {
-                // Send log file to log channel
-                char log_msg[256];
+                // Send log file to log channel with file attachment
+                char log_msg[512];
                 snprintf(log_msg, sizeof(log_msg),
-                         "📋 Ticket #%d closed by <@%" PRIu64 ">\nUser: %s",
+                         "📋 **Ticket #%d Closed**\n"
+                         "**Closed by:** <@%" PRIu64 ">\n"
+                         "**User:** %s (%" PRIu64 ")\n"
+                         "**Transcript:** See attached HTML file",
                          ticket.id,
                          event->member ? event->member->user->id : 0,
-                         username);
+                         username,
+                         ticket.user_id);
                 
-                struct discord_create_message_params log_params = {
-                    .content = log_msg
+                struct discord_attachment attachment = {
+                    .filename = filename,
                 };
                 
-                // Note: File upload would require additional implementation
+                struct discord_attachment *attachments[] = {
+                    &attachment,
+                    NULL
+                };
+                
+                struct discord_create_message_params log_params = {
+                    .content = log_msg,
+                    .attachments = attachments
+                };
+                
                 discord_create_message(client, config.log_channel_id, &log_params, NULL);
             }
+            
+            // Clean up file after sending
+            remove(filename);
         }
         free(html);
     }
@@ -816,6 +1035,25 @@ void on_ticket_message(struct discord *client,
     // Ignore bot messages
     if (event->author->bot) return;
     
+    // Ignore messages that match our forwarding pattern to prevent duplicates
+    if (event->content && strncmp(event->content, "**", 2) == 0) {
+        const char *colon_pos = strstr(event->content, ":** ");
+        if (colon_pos != NULL) {
+            // Extract the prefix
+            size_t prefix_len = colon_pos - event->content;
+            char prefix[256];
+            if (prefix_len < sizeof(prefix) - 1) {
+                strncpy(prefix, event->content, prefix_len);
+                prefix[prefix_len] = '\0';
+                
+                // Check if it's "**Staff:**" or "**username:**"
+                if (strcmp(prefix, "**Staff") == 0 || strstr(prefix, "**") == prefix) {
+                    return;  // This is already a forwarded message
+                }
+            }
+        }
+    }
+    
     // Check if this is a ticket channel
     Ticket ticket;
     if (db_get_ticket_by_channel(g_db, event->channel_id, &ticket) != 0) {
@@ -824,23 +1062,140 @@ void on_ticket_message(struct discord *client,
     
     bool from_user = (event->channel_id == ticket.dm_channel_id);
     
-    // Log message
-    db_add_ticket_message(g_db, ticket.id, event->author->id, event->content, from_user);
+    // Build attachments JSON if any
+    char *attachments_json = NULL;
+    // Check if attachments exist and the first one is not NULL
+    if (event->attachments && event->attachments[0]) {
+        size_t json_size = 1024;
+        attachments_json = malloc(json_size);
+        strcpy(attachments_json, "[");
+        
+        // Iterate until we hit a NULL pointer
+        for (int i = 0; event->attachments[i]; i++) {
+            struct discord_attachment *att = event->attachments[i];
+            
+            if (att->url) {
+                char entry[512];
+                // Add comma if not the first item
+                snprintf(entry, sizeof(entry), "%s\"%s\"", i > 0 ? "," : "", att->url);
+                strncat(attachments_json, entry, json_size - strlen(attachments_json) - 1);
+            }
+        }
+        strncat(attachments_json, "]", json_size - strlen(attachments_json) - 1);
+    }
+    
+    // Log message with message ID and attachments
+    db_add_ticket_message(g_db, ticket.id, event->id, event->author->id, 
+                         event->content ? event->content : "", 
+                         attachments_json, from_user);
+    
+    free(attachments_json);
     
     // Forward message
     u64_snowflake_t target_channel = from_user ? ticket.staff_channel_id : ticket.dm_channel_id;
     
+    // Build message content
     char forwarded[2048];
+    const char *content = event->content ? event->content : "";
     if (from_user) {
         // User to staff - show username
-        snprintf(forwarded, sizeof(forwarded), "**%s:** %s", event->author->username, event->content);
+        snprintf(forwarded, sizeof(forwarded), "**%s:** %s", event->author->username, content);
     } else {
         // Staff to user - anonymous
-        snprintf(forwarded, sizeof(forwarded), "**Staff:** %s", event->content);
+        snprintf(forwarded, sizeof(forwarded), "**Staff:** %s", content);
+    }
+    
+    // Add attachment info
+    if (event->attachments && event->attachments[0]) {
+        strncat(forwarded, "\n📎 Attachments:", sizeof(forwarded) - strlen(forwarded) - 1);
+        
+        // Iterate until we hit a NULL pointer
+        for (int i = 0; event->attachments[i]; i++) {
+            struct discord_attachment *att = event->attachments[i];
+            
+            if (att->url) {
+                char att_line[256];
+                snprintf(att_line, sizeof(att_line), "\n• %s", att->url);
+                strncat(forwarded, att_line, sizeof(forwarded) - strlen(forwarded) - 1);
+            }
+        }
     }
     
     struct discord_create_message_params params = {
         .content = forwarded
+    };
+    
+    discord_create_message(client, target_channel, &params, NULL);
+}
+
+// Message update handler
+void on_ticket_message_update(struct discord *client,
+                               const struct discord_message *event) {
+    // Ignore bot messages
+    if (event->author && event->author->bot) return;
+    
+    // Check if this is a ticket message
+    Ticket ticket;
+    if (db_get_ticket_by_channel(g_db, event->channel_id, &ticket) != 0) {
+        return;  // Not a ticket channel
+    }
+    
+    // Update the message in database
+    if (event->content) {
+        db_update_ticket_message(g_db, event->id, event->content);
+    }
+    
+    // Forward edit notification
+    bool from_user = (event->channel_id == ticket.dm_channel_id);
+    u64_snowflake_t target_channel = from_user ? ticket.staff_channel_id : ticket.dm_channel_id;
+    
+    char edit_notice[2048];
+    if (from_user) {
+        snprintf(edit_notice, sizeof(edit_notice), 
+                 "✏️ **%s** edited their message:\n**New content:** %s", 
+                 event->author ? event->author->username : "User",
+                 event->content ? event->content : "(no content)");
+    } else {
+        snprintf(edit_notice, sizeof(edit_notice), 
+                 "✏️ **Staff** edited their message:\n**New content:** %s",
+                 event->content ? event->content : "(no content)");
+    }
+    
+    struct discord_create_message_params params = {
+        .content = edit_notice
+    };
+    
+    discord_create_message(client, target_channel, &params, NULL);
+}
+
+// Message delete handler
+void on_ticket_message_delete(struct discord *client,
+                               u64_snowflake_t message_id,
+                               u64_snowflake_t channel_id) {
+    // Check if this is a ticket channel
+    Ticket ticket;
+    if (db_get_ticket_by_channel(g_db, channel_id, &ticket) != 0) {
+        return;  // Not a ticket channel
+    }
+    
+    // Mark message as deleted in database
+    db_delete_ticket_message(g_db, message_id);
+    
+    // Forward delete notification
+    bool from_user = (channel_id == ticket.dm_channel_id);
+    u64_snowflake_t target_channel = from_user ? ticket.staff_channel_id : ticket.dm_channel_id;
+    
+    char delete_notice[256];
+    if (from_user) {
+        snprintf(delete_notice, sizeof(delete_notice), 
+                 "🗑️ User deleted a message");
+    } else {
+        snprintf(delete_notice, sizeof(delete_notice), 
+                 "🗑️ Staff deleted a message");
+    }
+    
+    struct discord_create_message_params params = {
+        .content = delete_notice
     };
     
     discord_create_message(client, target_channel, &params, NULL);

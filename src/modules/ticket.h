@@ -29,9 +29,14 @@ typedef struct {
     int id;
     int ticket_id;
     u64_snowflake_t author_id;
+    u64_snowflake_t message_id;  // Discord message ID for tracking edits/deletes
     char *content;
+    char *attachments_json;  // JSON array of attachment URLs
     bool from_user;  // true if from user, false if from moderator
+    bool is_deleted;
+    bool is_edited;
     long timestamp;
+    long edited_at;
 } TicketMessage;
 
 // Server configuration structure
@@ -58,6 +63,15 @@ void on_ticket_interaction(struct discord *client,
 void on_ticket_message(struct discord *client,
                        const struct discord_message *event);
 
+// Message update handler for editing
+void on_ticket_message_update(struct discord *client,
+                               const struct discord_message *event);
+
+// Message delete handler
+void on_ticket_message_delete(struct discord *client,
+                               u64_snowflake_t message_id,
+                               u64_snowflake_t channel_id);
+
 // Database operations for tickets
 int db_create_ticket(Database *db, u64_snowflake_t user_id,
                      u64_snowflake_t main_guild_id,
@@ -69,8 +83,11 @@ int db_get_open_ticket_for_user(Database *db, u64_snowflake_t user_id, Ticket *t
 int db_get_ticket_by_channel(Database *db, u64_snowflake_t channel_id, Ticket *ticket);
 int db_close_ticket(Database *db, int ticket_id);
 
-int db_add_ticket_message(Database *db, int ticket_id, u64_snowflake_t author_id,
-                           const char *content, bool from_user);
+int db_add_ticket_message(Database *db, int ticket_id, u64_snowflake_t message_id,
+                           u64_snowflake_t author_id, const char *content, 
+                           const char *attachments_json, bool from_user);
+int db_update_ticket_message(Database *db, u64_snowflake_t message_id, const char *new_content);
+int db_delete_ticket_message(Database *db, u64_snowflake_t message_id);
 int db_get_ticket_messages(Database *db, int ticket_id,
                             TicketMessage **messages, int *count);
 void db_free_ticket_messages(TicketMessage *messages, int count);
