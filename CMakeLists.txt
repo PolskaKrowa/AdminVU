@@ -5,6 +5,8 @@ project(discord_bot C ASM_NASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+set(CMAKE_C_FLAGS_RELEASE "-O3 -march=native -mtune=native -flto -fopenmp")
+
 # Enable assembly
 enable_language(ASM_NASM)
 
