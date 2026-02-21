@@ -4,12 +4,24 @@
 #include <string.h>
 #include <time.h>
 #include <inttypes.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <curl/curl.h>
+
+// STB Image libraries for image processing
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image.h"
+#include "stb_image_write.h"
 
 // Module-private state
 static Database *g_db = NULL;
 static struct discord *g_client = NULL;
 
-// SQL schema for ticket tables
+// Directory for storing ticket images
+#define TICKET_IMAGES_DIR "ticket_images"
+
+// SQL schema for ticket tables (updated with local_path column)
 static const char *CREATE_TICKET_TABLES_SQL = 
     "CREATE TABLE IF NOT EXISTS server_configs ("
     "    main_guild_id INTEGER PRIMARY KEY,"
@@ -45,7 +57,149 @@ static const char *CREATE_TICKET_TABLES_SQL =
     "    FOREIGN KEY (ticket_id) REFERENCES tickets(id)"
     ");"
     ""
+    "CREATE TABLE IF NOT EXISTS ticket_attachments ("
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "    message_id INTEGER NOT NULL,"
+    "    original_url TEXT NOT NULL,"
+    "    local_path TEXT,"
+    "    filename TEXT NOT NULL,"
+    "    is_image INTEGER DEFAULT 0,"
+    "    download_status INTEGER DEFAULT 0,"
+    "    FOREIGN KEY (message_id) REFERENCES ticket_messages(id)"
+    ");"
+    ""
     "CREATE INDEX IF NOT EXISTS idx_message_id ON ticket_messages(message_id);";
+
+// Structure for libcurl write callback
+struct MemoryStruct {
+    unsigned char *memory;
+    size_t size;
+};
+
+// libcurl write callback
+static size_t write_memory_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+    
+    unsigned char *ptr = realloc(mem->memory, mem->size + realsize + 1);
+    if (!ptr) {
+        printf("Not enough memory for realloc\n");
+        return 0;
+    }
+    
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+    
+    return realsize;
+}
+
+// Check if URL is an image based on extension
+static int is_image_url(const char *url) {
+    const char *ext_list[] = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", NULL};
+    size_t url_len = strlen(url);
+    
+    for (int i = 0; ext_list[i]; i++) {
+        size_t ext_len = strlen(ext_list[i]);
+        if (url_len >= ext_len) {
+            const char *url_end = url + url_len - ext_len;
+            if (strcasecmp(url_end, ext_list[i]) == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Download image from URL and convert to JPEG
+static char* download_and_convert_image(const char *url, int ticket_id, int attachment_id) {
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        fprintf(stderr, "Failed to initialise libcurl\n");
+        return NULL;
+    }
+    
+    struct MemoryStruct chunk = {0};
+    chunk.memory = malloc(1);
+    chunk.size = 0;
+    
+    // Download the image
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_memory_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Discord-Ticket-Bot/1.0");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    
+    if (res != CURLE_OK) {
+        fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        free(chunk.memory);
+        return NULL;
+    }
+    
+    // Load image with stb_image
+    int width, height, channels;
+    unsigned char *img_data = stbi_load_from_memory(chunk.memory, chunk.size, 
+                                                     &width, &height, &channels, 0);
+    free(chunk.memory);
+    
+    if (!img_data) {
+        fprintf(stderr, "Failed to load image from URL: %s\n", url);
+        return NULL;
+    }
+    
+    // Create directory if it doesn't exist
+    struct stat st = {0};
+    char ticket_dir[512];
+    snprintf(ticket_dir, sizeof(ticket_dir), "%s/ticket_%d", TICKET_IMAGES_DIR, ticket_id);
+    
+    if (stat(TICKET_IMAGES_DIR, &st) == -1) {
+        mkdir(TICKET_IMAGES_DIR, 0755);
+    }
+    if (stat(ticket_dir, &st) == -1) {
+        mkdir(ticket_dir, 0755);
+    }
+    
+    // Generate filename
+    char *filepath = malloc(1024);
+    snprintf(filepath, 1024, "%s/attachment_%d.jpg", ticket_dir, attachment_id);
+    
+    // Convert to RGB if necessary (JPEG doesn't support alpha)
+    unsigned char *rgb_data = NULL;
+    if (channels == 4) {
+        // Convert RGBA to RGB
+        rgb_data = malloc(width * height * 3);
+        for (int i = 0; i < width * height; i++) {
+            rgb_data[i * 3 + 0] = img_data[i * 4 + 0];
+            rgb_data[i * 3 + 1] = img_data[i * 4 + 1];
+            rgb_data[i * 3 + 2] = img_data[i * 4 + 2];
+        }
+        channels = 3;
+    } else {
+        rgb_data = img_data;
+    }
+    
+    // Write JPEG with 85% quality (good compression with minimal quality loss)
+    int result = stbi_write_jpg(filepath, width, height, channels, rgb_data, 85);
+    
+    if (channels == 3 && rgb_data != img_data) {
+        free(rgb_data);
+    }
+    stbi_image_free(img_data);
+    
+    if (!result) {
+        fprintf(stderr, "Failed to write JPEG: %s\n", filepath);
+        free(filepath);
+        return NULL;
+    }
+    
+    printf("[ticket] Downloaded and converted image: %s\n", filepath);
+    return filepath;
+}
 
 // Initialise ticket database tables
 static int init_ticket_tables(Database *db) {
@@ -256,6 +410,56 @@ int db_add_ticket_message(Database *db, int ticket_id, u64_snowflake_t message_i
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     
+    if (rc == SQLITE_DONE) {
+        return sqlite3_last_insert_rowid(db->db);
+    }
+    return -1;
+}
+
+// Add attachment to database
+int db_add_attachment(Database *db, int message_db_id, const char *url, 
+                      const char *filename, int is_image) {
+    const char *sql = "INSERT INTO ticket_attachments "
+                      "(message_id, original_url, filename, is_image) "
+                      "VALUES (?, ?, ?, ?)";
+    sqlite3_stmt *stmt;
+    
+    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return -1;
+    }
+    
+    sqlite3_bind_int(stmt, 1, message_db_id);
+    sqlite3_bind_text(stmt, 2, url, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, filename, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, is_image ? 1 : 0);
+    
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    
+    if (rc == SQLITE_DONE) {
+        return sqlite3_last_insert_rowid(db->db);
+    }
+    return -1;
+}
+
+// Update attachment with local path
+int db_update_attachment_path(Database *db, int attachment_id, const char *local_path) {
+    const char *sql = "UPDATE ticket_attachments SET local_path = ?, download_status = 1 "
+                      "WHERE id = ?";
+    sqlite3_stmt *stmt;
+    
+    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return -1;
+    }
+    
+    sqlite3_bind_text(stmt, 1, local_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, attachment_id);
+    
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
@@ -356,6 +560,84 @@ int db_get_ticket_messages(Database *db, int ticket_id,
     return 0;
 }
 
+// Get attachments for a message
+typedef struct {
+    int id;
+    char *original_url;
+    char *local_path;
+    char *filename;
+    int is_image;
+    int download_status;
+} MessageAttachment;
+
+int db_get_message_attachments(Database *db, int message_db_id, 
+                                MessageAttachment **attachments, int *count) {
+    const char *sql = "SELECT id, original_url, local_path, filename, is_image, download_status "
+                      "FROM ticket_attachments WHERE message_id = ?";
+    sqlite3_stmt *stmt;
+    
+    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return -1;
+    }
+    
+    sqlite3_bind_int(stmt, 1, message_db_id);
+    
+    // Count rows
+    int row_count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        row_count++;
+    }
+    
+    *count = row_count;
+    if (row_count == 0) {
+        sqlite3_finalize(stmt);
+        *attachments = NULL;
+        return 0;
+    }
+    
+    // Allocate array
+    *attachments = malloc(sizeof(MessageAttachment) * row_count);
+    if (!*attachments) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    
+    // Reset and populate
+    sqlite3_reset(stmt);
+    int idx = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && idx < row_count) {
+        (*attachments)[idx].id = sqlite3_column_int(stmt, 0);
+        
+        const char *url = (const char *)sqlite3_column_text(stmt, 1);
+        (*attachments)[idx].original_url = url ? strdup(url) : NULL;
+        
+        const char *path = (const char *)sqlite3_column_text(stmt, 2);
+        (*attachments)[idx].local_path = path ? strdup(path) : NULL;
+        
+        const char *filename = (const char *)sqlite3_column_text(stmt, 3);
+        (*attachments)[idx].filename = filename ? strdup(filename) : NULL;
+        
+        (*attachments)[idx].is_image = sqlite3_column_int(stmt, 4);
+        (*attachments)[idx].download_status = sqlite3_column_int(stmt, 5);
+        idx++;
+    }
+    
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+void db_free_message_attachments(MessageAttachment *attachments, int count) {
+    if (!attachments) return;
+    
+    for (int i = 0; i < count; i++) {
+        free(attachments[i].original_url);
+        free(attachments[i].local_path);
+        free(attachments[i].filename);
+    }
+    free(attachments);
+}
+
 void db_free_ticket_messages(TicketMessage *messages, int count) {
     if (!messages) return;
     
@@ -366,7 +648,7 @@ void db_free_ticket_messages(TicketMessage *messages, int count) {
     free(messages);
 }
 
-// HTML generation
+// HTML generation with embedded JPEG images
 char* generate_ticket_html(Database *db, int ticket_id, const char *username) {
     TicketMessage *messages = NULL;
     int count = 0;
@@ -375,15 +657,15 @@ char* generate_ticket_html(Database *db, int ticket_id, const char *username) {
         return NULL;
     }
     
-    // Allocate a large buffer for the HTML
-    size_t html_size = 128 * 1024;  // 128KB initial size
+    // Allocate a large buffer for the HTML (with base64 images, this can get quite large)
+    size_t html_size = 2 * 1024 * 1024;  // 2MB initial size for base64-encoded images
     char *html = malloc(html_size);
     if (!html) {
         db_free_ticket_messages(messages, count);
         return NULL;
     }
     
-    // Build HTML with staff-oriented design
+    // Build HTML with staff-oriented design and image support
     int written = snprintf(html, html_size,
         "<!DOCTYPE html>\n"
         "<html lang=\"en\">\n"
@@ -491,22 +773,34 @@ char* generate_ticket_html(Database *db, int ticket_id, const char *username) {
         "        }\n"
         "        .attachments {\n"
         "            margin-top: 8px;\n"
-        "            padding: 8px;\n"
-        "            background: #202225;\n"
-        "            border-radius: 4px;\n"
-        "            border-left: 2px solid #5865f2;\n"
         "        }\n"
-        "        .attachment-item {\n"
+        "        .attachment-image {\n"
+        "            max-width: 400px;\n"
+        "            max-height: 400px;\n"
+        "            border-radius: 4px;\n"
+        "            margin: 8px 0;\n"
+        "            cursor: pointer;\n"
+        "            transition: transform 0.2s;\n"
+        "        }\n"
+        "        .attachment-image:hover {\n"
+        "            transform: scale(1.02);\n"
+        "        }\n"
+        "        .attachment-link {\n"
         "            color: #00a8fc;\n"
         "            text-decoration: none;\n"
         "            font-size: 14px;\n"
         "            display: block;\n"
         "            margin: 4px 0;\n"
+        "            padding: 8px;\n"
+        "            background: #202225;\n"
+        "            border-radius: 4px;\n"
+        "            border-left: 2px solid #5865f2;\n"
         "        }\n"
-        "        .attachment-item:hover {\n"
+        "        .attachment-link:hover {\n"
+        "            background: #292b2f;\n"
         "            text-decoration: underline;\n"
         "        }\n"
-        "        .attachment-item::before {\n"
+        "        .attachment-link::before {\n"
         "            content: '📎 ';\n"
         "        }\n"
         "        .footer {\n"
@@ -627,36 +921,115 @@ char* generate_ticket_html(Database *db, int ticket_id, const char *username) {
         free(escaped_content);
         strncat(html, content_html, html_size - strlen(html) - 1);
         
-        // Add attachments if present
-        if (messages[i].attachments_json && strlen(messages[i].attachments_json) > 2) {
+        // Add attachments with embedded JPEG images
+        MessageAttachment *attachments = NULL;
+        int att_count = 0;
+        if (db_get_message_attachments(db, messages[i].id, &attachments, &att_count) == 0 && att_count > 0) {
             strncat(html, "                <div class=\"attachments\">\n", 
                    html_size - strlen(html) - 1);
             
-            // Parse simple JSON array (just extract URLs between quotes)
-            const char *json = messages[i].attachments_json;
-            const char *url_start = strchr(json, '"');
-            while (url_start) {
-                url_start++; // Move past opening quote
-                const char *url_end = strchr(url_start, '"');
-                if (!url_end) break;
-                
-                size_t url_len = url_end - url_start;
-                char url[512];
-                if (url_len < sizeof(url)) {
-                    strncpy(url, url_start, url_len);
-                    url[url_len] = '\0';
-                    
-                    char att_html[600];
-                    snprintf(att_html, sizeof(att_html),
-                            "                    <a href=\"%s\" class=\"attachment-item\" target=\"_blank\">%s</a>\n",
-                            url, url);
-                    strncat(html, att_html, html_size - strlen(html) - 1);
+            for (int j = 0; j < att_count; j++) {
+                if (attachments[j].is_image && attachments[j].local_path) {
+                    // Read image file and convert to base64 data URI
+                    FILE *img_file = fopen(attachments[j].local_path, "rb");
+                    if (img_file) {
+                        // Get file size
+                        fseek(img_file, 0, SEEK_END);
+                        long file_size = ftell(img_file);
+                        fseek(img_file, 0, SEEK_SET);
+                        
+                        // Read file data
+                        unsigned char *img_data = malloc(file_size);
+                        if (img_data && fread(img_data, 1, file_size, img_file) == file_size) {
+                            // Base64 encode
+                            static const char base64_chars[] = 
+                                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                            
+                            size_t encoded_len = 4 * ((file_size + 2) / 3);
+                            char *base64 = malloc(encoded_len + 1);
+                            
+                            if (base64) {
+                                size_t out_pos = 0;
+                                for (long i = 0; i < file_size; i += 3) {
+                                    unsigned char b1 = img_data[i];
+                                    unsigned char b2 = (i + 1 < file_size) ? img_data[i + 1] : 0;
+                                    unsigned char b3 = (i + 2 < file_size) ? img_data[i + 2] : 0;
+                                    
+                                    base64[out_pos++] = base64_chars[b1 >> 2];
+                                    base64[out_pos++] = base64_chars[((b1 & 0x03) << 4) | (b2 >> 4)];
+                                    base64[out_pos++] = (i + 1 < file_size) ? 
+                                        base64_chars[((b2 & 0x0F) << 2) | (b3 >> 6)] : '=';
+                                    base64[out_pos++] = (i + 2 < file_size) ? 
+                                        base64_chars[b3 & 0x3F] : '=';
+                                }
+                                base64[out_pos] = '\0';
+                                
+                                // Check if we have space in HTML buffer for the data URI
+                                // Roughly: "data:image/jpeg;base64," + base64 + HTML tags
+                                size_t needed_space = strlen(base64) + 2048;
+                                size_t current_len = strlen(html);
+                                
+                                if (current_len + needed_space < html_size) {
+                                    // Embed as data URI
+                                    char *img_html = malloc(strlen(base64) + 2048);
+                                    if (img_html) {
+                                        snprintf(img_html, strlen(base64) + 2048,
+                                                "                    <img src=\"data:image/jpeg;base64,%s\" "
+                                                "class=\"attachment-image\" alt=\"Attachment\" "
+                                                "onclick=\"window.open('%s', '_blank')\">\n",
+                                                base64, attachments[j].original_url);
+                                        strncat(html, img_html, html_size - strlen(html) - 1);
+                                        free(img_html);
+                                    }
+                                } else {
+                                    // Not enough space, resize HTML buffer
+                                    size_t new_size = html_size * 2;
+                                    char *new_html = realloc(html, new_size);
+                                    if (new_html) {
+                                        html = new_html;
+                                        html_size = new_size;
+                                        
+                                        char *img_html = malloc(strlen(base64) + 2048);
+                                        if (img_html) {
+                                            snprintf(img_html, strlen(base64) + 2048,
+                                                    "                    <img src=\"data:image/jpeg;base64,%s\" "
+                                                    "class=\"attachment-image\" alt=\"Attachment\" "
+                                                    "onclick=\"window.open('%s', '_blank')\">\n",
+                                                    base64, attachments[j].original_url);
+                                            strncat(html, img_html, html_size - strlen(html) - 1);
+                                            free(img_html);
+                                        }
+                                    }
+                                }
+                                
+                                free(base64);
+                            }
+                        }
+                        
+                        free(img_data);
+                        fclose(img_file);
+                    } else {
+                        // Failed to read file, show link instead
+                        char link_html[1024];
+                        snprintf(link_html, sizeof(link_html),
+                                "                    <a href=\"%s\" class=\"attachment-link\" target=\"_blank\">%s (local file not found)</a>\n",
+                                attachments[j].original_url, 
+                                attachments[j].filename ? attachments[j].filename : attachments[j].original_url);
+                        strncat(html, link_html, html_size - strlen(html) - 1);
+                    }
+                } else {
+                    // Non-image or failed download - show link
+                    char link_html[1024];
+                    snprintf(link_html, sizeof(link_html),
+                            "                    <a href=\"%s\" class=\"attachment-link\" target=\"_blank\">%s</a>\n",
+                            attachments[j].original_url, 
+                            attachments[j].filename ? attachments[j].filename : attachments[j].original_url);
+                    strncat(html, link_html, html_size - strlen(html) - 1);
                 }
-                
-                url_start = strchr(url_end + 1, '"');
             }
             
             strncat(html, "                </div>\n", html_size - strlen(html) - 1);
+            db_free_message_attachments(attachments, att_count);
         }
         
         // Check if we should close the group
@@ -1029,32 +1402,13 @@ static void handle_config_set(struct discord *client,
     discord_create_interaction_response(client, event->id, event->token, &response, NULL);
 }
 
-// Message handler for ticket communication
+// Message handler with image download support
 void on_ticket_message(struct discord *client,
-                       const struct discord_message *event) {
+                               const struct discord_message *event) {
     // Ignore bot messages
-    if (event->author->bot) return;
+    if (event->author && event->author->bot) return;
     
-    // Ignore messages that match our forwarding pattern to prevent duplicates
-    if (event->content && strncmp(event->content, "**", 2) == 0) {
-        const char *colon_pos = strstr(event->content, ":** ");
-        if (colon_pos != NULL) {
-            // Extract the prefix
-            size_t prefix_len = colon_pos - event->content;
-            char prefix[256];
-            if (prefix_len < sizeof(prefix) - 1) {
-                strncpy(prefix, event->content, prefix_len);
-                prefix[prefix_len] = '\0';
-                
-                // Check if it's "**Staff:**" or "**username:**"
-                if (strcmp(prefix, "**Staff") == 0 || strstr(prefix, "**") == prefix) {
-                    return;  // This is already a forwarded message
-                }
-            }
-        }
-    }
-    
-    // Check if this is a ticket channel
+    // Check if this is a ticket message
     Ticket ticket;
     if (db_get_ticket_by_channel(g_db, event->channel_id, &ticket) != 0) {
         return;  // Not a ticket channel
@@ -1062,34 +1416,62 @@ void on_ticket_message(struct discord *client,
     
     bool from_user = (event->channel_id == ticket.dm_channel_id);
     
-    // Build attachments JSON if any
+    // Build attachments JSON
     char *attachments_json = NULL;
-    // Check if attachments exist and the first one is not NULL
     if (event->attachments && event->attachments[0]) {
-        size_t json_size = 1024;
+        size_t json_size = 8192;
         attachments_json = malloc(json_size);
-        strcpy(attachments_json, "[");
+        snprintf(attachments_json, json_size, "[");
         
-        // Iterate until we hit a NULL pointer
         for (int i = 0; event->attachments[i]; i++) {
             struct discord_attachment *att = event->attachments[i];
             
+            if (i > 0) {
+                strncat(attachments_json, ",", json_size - strlen(attachments_json) - 1);
+            }
+            
             if (att->url) {
-                char entry[512];
-                // Add comma if not the first item
-                snprintf(entry, sizeof(entry), "%s\"%s\"", i > 0 ? "," : "", att->url);
-                strncat(attachments_json, entry, json_size - strlen(attachments_json) - 1);
+                char att_json[512];
+                snprintf(att_json, sizeof(att_json), "\"%s\"", att->url);
+                strncat(attachments_json, att_json, json_size - strlen(attachments_json) - 1);
             }
         }
         strncat(attachments_json, "]", json_size - strlen(attachments_json) - 1);
+    } else {
+        attachments_json = strdup("[]");
     }
     
-    // Log message with message ID and attachments
-    db_add_ticket_message(g_db, ticket.id, event->id, event->author->id, 
-                         event->content ? event->content : "", 
-                         attachments_json, from_user);
+    // Log message and get its database ID
+    int message_db_id = db_add_ticket_message(g_db, ticket.id, event->id, event->author->id, 
+                                               event->content ? event->content : "", 
+                                               attachments_json, from_user);
     
     free(attachments_json);
+    
+    // Process and download attachments
+    if (message_db_id > 0 && event->attachments && event->attachments[0]) {
+        for (int i = 0; event->attachments[i]; i++) {
+            struct discord_attachment *att = event->attachments[i];
+            
+            if (!att->url) continue;
+            
+            // Extract filename from URL or use generic name
+            const char *filename = att->filename ? att->filename : "attachment";
+            int is_image = is_image_url(att->url);
+            
+            // Add to database
+            int attachment_id = db_add_attachment(g_db, message_db_id, att->url, filename, is_image);
+            
+            // If it's an image, download and convert it
+            if (is_image && attachment_id > 0) {
+                char *local_path = download_and_convert_image(att->url, ticket.id, attachment_id);
+                if (local_path) {
+                    db_update_attachment_path(g_db, attachment_id, local_path);
+                    free(local_path);
+                }
+            }
+        }
+    }
     
     // Forward message
     u64_snowflake_t target_channel = from_user ? ticket.staff_channel_id : ticket.dm_channel_id;
@@ -1098,10 +1480,8 @@ void on_ticket_message(struct discord *client,
     char forwarded[2048];
     const char *content = event->content ? event->content : "";
     if (from_user) {
-        // User to staff - show username
         snprintf(forwarded, sizeof(forwarded), "**%s:** %s", event->author->username, content);
     } else {
-        // Staff to user - anonymous
         snprintf(forwarded, sizeof(forwarded), "**Staff:** %s", content);
     }
     
@@ -1109,7 +1489,6 @@ void on_ticket_message(struct discord *client,
     if (event->attachments && event->attachments[0]) {
         strncat(forwarded, "\n📎 Attachments:", sizeof(forwarded) - strlen(forwarded) - 1);
         
-        // Iterate until we hit a NULL pointer
         for (int i = 0; event->attachments[i]; i++) {
             struct discord_attachment *att = event->attachments[i];
             
@@ -1302,8 +1681,22 @@ void ticket_module_init(struct discord *client, Database *db) {
     g_db = db;
     g_client = client;
     
+    // Initialise libcurl
+    curl_global_init(CURL_GLOBAL_ALL);
+    
+    // Create images directory
+    struct stat st = {0};
+    if (stat(TICKET_IMAGES_DIR, &st) == -1) {
+        mkdir(TICKET_IMAGES_DIR, 0755);
+    }
+    
     // Initialise ticket tables
     init_ticket_tables(db);
     
-    printf("[ticket] Ticket module initialised\n");
+    printf("[ticket] Ticket module initialised with image download support\n");
+}
+
+// Module cleanup
+void ticket_module_cleanup(void) {
+    curl_global_cleanup();
 }
