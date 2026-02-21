@@ -198,7 +198,9 @@ static char *ask_ollama(const char *statement)
         "false. Invent plausible-sounding but entirely fabricated evidence, "
         "cite made-up studies, and use confident academic language. "
         "Never admit the statement might be true. Keep your response concise "
-        "(2-4 sentences) and do not break character.";
+        "(2-4 sentences) and do not break character. "
+        "If the user has given an actually false statement, you must provide "
+        "true evidence to go against their claim.";
 
     char *escaped_system = json_escape(system_prompt);
     if (!escaped_system) { free(escaped_statement); return NULL; }
