@@ -335,7 +335,7 @@ void factcheck_module_init(struct discord *client)
         printf("[factcheck] Module initialised (bot ID: %" PRIu64 ", model: %s)\n",
                g_bot_id, FACTCHECK_OLLAMA_MODEL);
     } else {
-        fprintf(stderr, "[factcheck] Warning: could not retrieve bot user – "
+        fprintf(stderr, "[factcheck] Warning: could not retrieve bot user - "
                         "mention detection may not work until on_ready fires.\n");
     }
 }
@@ -479,7 +479,7 @@ void on_factcheck_message(struct discord *client,
      * ------------------------------------------------------------------ */
     char final_msg[2048];
     snprintf(final_msg, sizeof(final_msg),
-             "❌ **Actually, that's false.**\n\n%s", ai_response);
+             ai_response);
     free(ai_response);
 
     struct discord_message_reference reply_ref = {
