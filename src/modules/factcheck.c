@@ -173,7 +173,7 @@ static char *json_extract_string(const char *json, const char *key)
  * ---------------------------------------------------------------------- */
 
 /**
- * Send @p statement to Ollama and return a heap-allocated string containing
+ * Send the statement to Ollama and return a heap-allocated string containing
  * the model's response, or NULL on failure.  Caller must free().
  */
 static char *ask_ollama(const char *statement)
