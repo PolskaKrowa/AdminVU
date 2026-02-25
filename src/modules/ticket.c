@@ -1507,6 +1507,13 @@ void on_ticket_interaction(struct discord *client, const struct discord_interact
     if (event->type != DISCORD_INTERACTION_APPLICATION_COMMAND) return;
 
     const char *cmd = event->data->name;
+
+    /* Diagnostic: always log what Discord actually sent */
+    printf("[ticket] on_ticket_interaction: cmd='%s' guild_id=%" PRIu64 "\n",
+           cmd ? cmd : "(null)", event->guild_id);
+
+    if (!cmd) return;
+
     if      (strcmp(cmd, "ticket")       == 0) handle_ticket_create(client, event);
     else if (strcmp(cmd, "closeticket")  == 0) handle_ticket_close (client, event);
     else if (strcmp(cmd, "ticketconfig") == 0) handle_config_set   (client, event);
