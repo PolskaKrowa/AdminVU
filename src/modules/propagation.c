@@ -117,15 +117,17 @@ static bool notify_guild(struct discord  *client,
                           const char      *evidence_url,
                           int64_t          propagation_id,
                           int64_t          timestamp) {
-    /* Verify the target user is actually in this guild before notifying. */
-    struct discord_guild_member *member = NULL;
+    /* Verify the target user is actually in this guild before notifying.
+     * Orca's discord_get_guild_member takes a struct by pointer (single
+     * indirection) and is cleaned up with discord_guild_member_cleanup(). */
+    struct discord_guild_member member = { 0 };
     ORCAcode rc = discord_get_guild_member(client, guild_id,
                                            target_user_id, &member);
-    if (rc != ORCA_OK || !member) {
-        /* User is not in this guild – skip silently. */
+    if (rc != ORCA_OK) {
+        /* User is not in this guild, or the API call failed – skip silently. */
         return false;
     }
-    discord_guild_member_free(member);
+    discord_guild_member_cleanup(&member);
 
     uint64_t channel_id = db_get_propagation_channel(g_db, guild_id);
     if (!channel_id) return false;
@@ -491,34 +493,34 @@ void register_propagation_commands(struct discord *client,
                                     uint64_t        application_id,
                                     uint64_t        guild_id) {
     /* ── /propagate ─────────────────────────────────────────────────────── */
-    struct discord_application_command_option prop_user = {
+    static struct discord_application_command_option prop_user = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name        = "user",
         .description = "The user to flag across servers",
         .required    = true,
     };
-    struct discord_application_command_option prop_reason = {
+    static struct discord_application_command_option prop_reason = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "reason",
         .description = "What did this user do?",
         .required    = true,
     };
-    struct discord_application_command_option prop_evidence = {
+    static struct discord_application_command_option prop_evidence = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "evidence",
         .description = "URL to evidence (screenshot, video, etc.) — required",
         .required    = true,
     };
-    struct discord_application_command_option prop_confirm = {
+    static struct discord_application_command_option prop_confirm = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "confirm",
         .description = "Type: I UNDERSTAND THE CONSEQUENCES",
         .required    = true,
     };
-    struct discord_application_command_option *prop_opts[] = {
+    static struct discord_application_command_option *prop_opts[] = {
         &prop_user, &prop_reason, &prop_evidence, &prop_confirm, NULL
     };
-    struct discord_create_guild_application_command_params prop_params = {
+    static struct discord_create_guild_application_command_params prop_params = {
         .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name        = "propagate",
         .description = "Flag a user across all opted-in servers (mod only — misuse = ban)",
@@ -528,14 +530,19 @@ void register_propagation_commands(struct discord *client,
                                               &prop_params, NULL);
 
     /* ── /propagate-config ─────────────────────────────────────────────── */
-    struct discord_application_command_option cfg_channel = {
-        .type        = DISCORD_APPLICATION_COMMAND_OPTION_CHANNEL,
-        .name        = "channel",
-        .description = "Channel where cross-server alerts will be posted",
+    /* Note: DISCORD_APPLICATION_COMMAND_OPTION_CHANNEL is not available in
+     * all Orca builds.  We accept the channel ID as a plain STRING instead;
+     * moderators paste the channel's ID (right-click → Copy ID). */
+    static struct discord_application_command_option cfg_channel = {
+        .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+        .name        = "channel_id",
+        .description = "ID of the channel to post alerts in (right-click channel → Copy ID)",
         .required    = true,
     };
-    struct discord_application_command_option *cfg_opts[] = { &cfg_channel, NULL };
-    struct discord_create_guild_application_command_params cfg_params = {
+    static struct discord_application_command_option *cfg_opts[] = {
+        &cfg_channel, NULL
+    };
+    static struct discord_create_guild_application_command_params cfg_params = {
         .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name        = "propagate-config",
         .description = "Set the channel for incoming cross-server alerts (admin only)",
@@ -545,23 +552,26 @@ void register_propagation_commands(struct discord *client,
                                               &cfg_params, NULL);
 
     /* ── /propagate-opt-out ────────────────────────────────────────────── */
-    struct discord_create_guild_application_command_params optout_params = {
+    static struct discord_create_guild_application_command_params optout_params = {
         .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name        = "propagate-opt-out",
         .description = "Stop receiving cross-server alerts in this server (admin only)",
+        .options     = NULL,
     };
     discord_create_guild_application_command(client, application_id, guild_id,
                                               &optout_params, NULL);
 
     /* ── /propagate-history ────────────────────────────────────────────── */
-    struct discord_application_command_option hist_user = {
+    static struct discord_application_command_option hist_user = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name        = "user",
         .description = "The user to look up",
         .required    = true,
     };
-    struct discord_application_command_option *hist_opts[] = { &hist_user, NULL };
-    struct discord_create_guild_application_command_params hist_params = {
+    static struct discord_application_command_option *hist_opts[] = {
+        &hist_user, NULL
+    };
+    static struct discord_create_guild_application_command_params hist_params = {
         .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name        = "propagate-history",
         .description = "View all cross-server alerts for a user (mod only)",
@@ -571,22 +581,22 @@ void register_propagation_commands(struct discord *client,
                                               &hist_params, NULL);
 
     /* ── /propagate-revoke ─────────────────────────────────────────────── */
-    struct discord_application_command_option rev_mod = {
+    static struct discord_application_command_option rev_mod = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name        = "moderator",
         .description = "The moderator to blacklist",
         .required    = true,
     };
-    struct discord_application_command_option rev_reason = {
+    static struct discord_application_command_option rev_reason = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "reason",
         .description = "Why is their access being revoked?",
         .required    = true,
     };
-    struct discord_application_command_option *rev_opts[] = {
+    static struct discord_application_command_option *rev_opts[] = {
         &rev_mod, &rev_reason, NULL
     };
-    struct discord_create_guild_application_command_params rev_params = {
+    static struct discord_create_guild_application_command_params rev_params = {
         .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name        = "propagate-revoke",
         .description = "Permanently revoke a moderator's ability to issue alerts (admin only)",

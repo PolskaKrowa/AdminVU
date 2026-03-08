@@ -4,10 +4,12 @@
 #include <string.h>
 #include <time.h>
 #include <inttypes.h>
+#include <curl/curl.h>
 
 // Module-private state
-static Database *g_db = NULL;
-static u64_snowflake_t g_guild_id = 0;
+static Database        *g_db       = NULL;
+static u64_snowflake_t  g_guild_id = 0;
+static char             g_bot_token[256] = { 0 };
 
 // Helper: Check if user has moderation permissions
 static bool has_mod_permissions(const struct discord_interaction *event) {
@@ -271,13 +273,75 @@ static void handle_ban_command(struct discord *client,
 }
 
 /* ---------------------------------------------------------------------------
- * /timeout command handler
+ * patch_member_timeout
  *
- * Times out a member for a given duration (in minutes, default 10, max 40320
+ * Issues a PATCH /guilds/{guild}/members/{user} directly via libcurl,
+ * setting communication_disabled_until to the supplied ISO 8601 string.
+ * This bypasses Orca's typed struct layer, which does not expose that field
+ * in this build.
+ *
+ * Returns ORCA_OK (0) on HTTP 2xx, ORCA_CURLE_INTERNAL otherwise.
+ * --------------------------------------------------------------------------- */
+static ORCAcode patch_member_timeout(u64_snowflake_t guild_id,
+                                      u64_snowflake_t user_id,
+                                      const char     *iso_timestamp) {
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        fprintf(stderr, "[moderation] curl_easy_init() failed\n");
+        return ORCA_CURLE_INTERNAL;
+    }
+
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://discord.com/api/v10/guilds/%" PRIu64 "/members/%" PRIu64,
+             guild_id, user_id);
+
+    char body[256];
+    snprintf(body, sizeof(body),
+             "{\"communication_disabled_until\":\"%s\"}", iso_timestamp);
+
+    char auth_header[512];
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bot %s", g_bot_token);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, auth_header);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL,           url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    headers);
+    /* Silence response body – we only care about the status code. */
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                     (curl_write_callback)(void *)fwrite);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, stderr);
+
+    CURLcode res      = curl_easy_perform(curl);
+    long     http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        fprintf(stderr, "[moderation] curl error: %s\n", curl_easy_strerror(res));
+        return ORCA_CURLE_INTERNAL;
+    }
+    if (http_code < 200 || http_code >= 300) {
+        fprintf(stderr, "[moderation] Discord returned HTTP %ld for timeout PATCH\n",
+                http_code);
+        return ORCA_CURLE_INTERNAL;
+    }
+
+    return ORCA_OK;
+}
+
+
+/* Times out a member for a given duration (in minutes, default 10, max 40320
  * which equals 28 days — the Discord API ceiling).
  *
- * Discord requires the communication_disabled_until field to be an ISO 8601
- * timestamp.  We build one from time(NULL) + duration_seconds.
+ * The timeout is persisted in the database via db_add_timeout() so the bot
+ * can track active timeouts independently of Discord's own state.
  * --------------------------------------------------------------------------- */
 static void handle_timeout_command(struct discord *client,
                                    const struct discord_interaction *event) {
@@ -286,9 +350,9 @@ static void handle_timeout_command(struct discord *client,
         return;
     }
 
-    const char *user_id_str      = get_option_value(event, "user");
-    const char *duration_str     = get_option_value(event, "duration");
-    const char *reason           = get_option_value(event, "reason");
+    const char *user_id_str  = get_option_value(event, "user");
+    const char *duration_str = get_option_value(event, "duration");
+    const char *reason       = get_option_value(event, "reason");
 
     if (!user_id_str) {
         send_ephemeral(client, event, "❌ User not specified.");
@@ -297,36 +361,40 @@ static void handle_timeout_command(struct discord *client,
 
     /* Duration: default 10 minutes, capped at 40320 (28 days in minutes). */
     long duration_minutes = duration_str ? strtol(duration_str, NULL, 10) : 10;
-    if (duration_minutes < 1)      duration_minutes = 1;
-    if (duration_minutes > 40320)  duration_minutes = 40320;
+    if (duration_minutes < 1)     duration_minutes = 1;
+    if (duration_minutes > 40320) duration_minutes = 40320;
 
     u64_snowflake_t target_id    = (u64_snowflake_t)strtoull(user_id_str, NULL, 10);
     u64_snowflake_t moderator_id = event->member ? event->member->user->id : 0;
 
-    /* Build ISO 8601 timestamp for when the timeout expires. */
-    time_t expires_at = time(NULL) + (time_t)(duration_minutes * 60);
+    /* Compute Unix expiry and ISO 8601 string for Discord's API. */
+    time_t now       = time(NULL);
+    time_t expires_at = now + (time_t)(duration_minutes * 60);
     struct tm *tm_info = gmtime(&expires_at);
     char iso_timestamp[32];
     strftime(iso_timestamp, sizeof(iso_timestamp), "%Y-%m-%dT%H:%M:%SZ", tm_info);
 
-    /* Modify the guild member to apply the timeout. */
-    struct discord_modify_guild_member_params mod_params = {
-        .communication_disabled_until = iso_timestamp,
-    };
-
-    ORCAcode code = discord_modify_guild_member(client, event->guild_id,
-                                                target_id, &mod_params, NULL);
+    /* Apply the timeout via Discord's modify-guild-member endpoint.
+     * The communication_disabled_until field was added to Orca's struct in
+     * later builds.  If your compiler flags it as missing, replace the struct
+     * literal below with a discord_run_json() call. */
+    ORCAcode code = patch_member_timeout(event->guild_id, target_id, iso_timestamp);
     if (code != ORCA_OK) {
         char error[256];
         snprintf(error, sizeof(error),
                  "❌ Failed to timeout user (ORCAcode %d). "
-                 "Check bot permissions and that the target is below me in the role hierarchy.",
+                 "Check bot permissions and that the target is below me in "
+                 "the role hierarchy.",
                  code);
         send_ephemeral(client, event, error);
         return;
     }
 
-    /* Log the action. */
+    /* Persist to database so we can query / remove timeouts later. */
+    db_add_timeout(g_db, target_id, event->guild_id,
+                   moderator_id, reason, (long)expires_at);
+
+    /* Write to the audit log. */
     db_log_action(g_db, MOD_ACTION_TIMEOUT, target_id, event->guild_id,
                   moderator_id, reason);
 
@@ -376,156 +444,139 @@ void register_moderation_commands(struct discord *client,
                                    u64_snowflake_t application_id,
                                    u64_snowflake_t guild_id) {
     // /warn command
-    struct discord_application_command_option warn_user = {
+    static struct discord_application_command_option warn_user = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name = "user",
         .description = "The user to warn",
         .required = true,
     };
-    
-    struct discord_application_command_option warn_reason = {
+    static struct discord_application_command_option warn_reason = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name = "reason",
         .description = "Reason for the warning",
         .required = false,
     };
-    
-    struct discord_application_command_option *warn_opts[] = {
+    static struct discord_application_command_option *warn_opts[] = {
         &warn_user, &warn_reason, NULL
     };
-    
-    struct discord_create_guild_application_command_params warn_params = {
+    static struct discord_create_guild_application_command_params warn_params = {
         .type = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name = "warn",
         .description = "Issue a warning to a user",
         .options = warn_opts,
     };
-    
     discord_create_guild_application_command(client, application_id, guild_id,
                                              &warn_params, NULL);
-    
+
     // /warnings command
-    struct discord_application_command_option warnings_user = {
+    static struct discord_application_command_option warnings_user = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name = "user",
         .description = "The user to check warnings for",
         .required = true,
     };
-    
-    struct discord_application_command_option *warnings_opts[] = {
+    static struct discord_application_command_option *warnings_opts[] = {
         &warnings_user, NULL
     };
-    
-    struct discord_create_guild_application_command_params warnings_params = {
+    static struct discord_create_guild_application_command_params warnings_params = {
         .type = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name = "warnings",
         .description = "View all warnings for a user",
         .options = warnings_opts,
     };
-    
     discord_create_guild_application_command(client, application_id, guild_id,
                                              &warnings_params, NULL);
-    
+
     // /kick command
-    struct discord_application_command_option kick_user = {
+    static struct discord_application_command_option kick_user = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name = "user",
         .description = "The user to kick",
         .required = true,
     };
-    
-    struct discord_application_command_option kick_reason = {
+    static struct discord_application_command_option kick_reason = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name = "reason",
         .description = "Reason for kicking",
         .required = false,
     };
-    
-    struct discord_application_command_option *kick_opts[] = {
+    static struct discord_application_command_option *kick_opts[] = {
         &kick_user, &kick_reason, NULL
     };
-    
-    struct discord_create_guild_application_command_params kick_params = {
+    static struct discord_create_guild_application_command_params kick_params = {
         .type = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name = "kick",
         .description = "Kick a user from the server",
         .options = kick_opts,
     };
-    
     discord_create_guild_application_command(client, application_id, guild_id,
                                              &kick_params, NULL);
-    
+
     // /ban command
-    struct discord_application_command_option ban_user = {
+    static struct discord_application_command_option ban_user = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name = "user",
         .description = "The user to ban",
         .required = true,
     };
-    
-    struct discord_application_command_option ban_reason = {
+    static struct discord_application_command_option ban_reason = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name = "reason",
         .description = "Reason for banning",
         .required = false,
     };
-    
-    struct discord_application_command_option *ban_opts[] = {
+    static struct discord_application_command_option *ban_opts[] = {
         &ban_user, &ban_reason, NULL
     };
-    
-    struct discord_create_guild_application_command_params ban_params = {
+    static struct discord_create_guild_application_command_params ban_params = {
         .type = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name = "ban",
         .description = "Ban a user from the server",
         .options = ban_opts,
     };
-    
     discord_create_guild_application_command(client, application_id, guild_id,
                                              &ban_params, NULL);
-    
+
     // /timeout command
-    struct discord_application_command_option timeout_user = {
+    static struct discord_application_command_option timeout_user = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name = "user",
         .description = "The user to timeout",
         .required = true,
     };
-    
-    struct discord_application_command_option timeout_duration = {
+    static struct discord_application_command_option timeout_duration = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_INTEGER,
         .name = "duration",
         .description = "Duration in minutes (default: 10, max: 40320 = 28 days)",
         .required = false,
     };
-    
-    struct discord_application_command_option timeout_reason = {
+    static struct discord_application_command_option timeout_reason = {
         .type = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name = "reason",
         .description = "Reason for timeout",
         .required = false,
     };
-    
-    struct discord_application_command_option *timeout_opts[] = {
+    static struct discord_application_command_option *timeout_opts[] = {
         &timeout_user, &timeout_duration, &timeout_reason, NULL
     };
-    
-    struct discord_create_guild_application_command_params timeout_params = {
+    static struct discord_create_guild_application_command_params timeout_params = {
         .type = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name = "timeout",
         .description = "Timeout a user (prevent them from sending messages)",
         .options = timeout_opts,
     };
-    
     discord_create_guild_application_command(client, application_id, guild_id,
                                              &timeout_params, NULL);
-    
+
     printf("[moderation] All moderation commands registered\n");
 }
 
-void moderation_module_init(struct discord *client, Database *db, u64_snowflake_t guild_id) {
+void moderation_module_init(struct discord *client, Database *db,
+                             u64_snowflake_t guild_id, const char *bot_token) {
     g_db = db;
     g_guild_id = guild_id;
-    
+    if (bot_token)
+        snprintf(g_bot_token, sizeof(g_bot_token), "%s", bot_token);
+
     printf("[moderation] Moderation module initialised\n");
 }

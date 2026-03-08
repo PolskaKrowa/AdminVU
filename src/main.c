@@ -45,7 +45,7 @@ void register_slash_commands(struct discord *client,
                              u64_snowflake_t application_id,
                              u64_snowflake_t guild_id) {
     /* The "target" option – a USER picker, not required. */
-    struct discord_application_command_option target_option = {
+    static struct discord_application_command_option target_option = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name        = "target",
         .description = "Member to hash (defaults to you)",
@@ -53,12 +53,12 @@ void register_slash_commands(struct discord *client,
     };
 
     /* Orca expects a NULL-terminated array of pointers. */
-    struct discord_application_command_option *options[] = {
+    static struct discord_application_command_option *options[] = {
         &target_option,
         NULL,
     };
 
-    struct discord_create_guild_application_command_params params = {
+    static struct discord_create_guild_application_command_params params = {
         .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name        = "ping",
         .description = "Pong! Optionally hash a target member's display name.",
@@ -133,20 +133,6 @@ void on_message_create(struct discord *client,
 
     // Factcheck module – handles "@bot is this true?" replies
     on_factcheck_message(client, event);
-}
-
-/*
- * on_guild_create
- *
- * Fires when the bot joins a new guild (or on startup for existing ones).
- * We register the guild in the known_guilds table so the propagation
- * system can target it when delivering cross-server alerts.
- */
-void on_guild_create(struct discord *client,
-                     const struct discord_guild *event) {
-    if (!event) return;
-    propagation_on_guild_register(event->id);
-    printf("[main] Guild registered: %" PRIu64 "\n", event->id);
 }
 
 // Ready event handler
@@ -234,12 +220,11 @@ int main(int argc, char *argv[]) {
     discord_set_on_ready(client, (void*)&on_ready);
     discord_set_on_interaction_create(client, &on_interaction_create_combined);
     discord_set_on_message_create(client, &on_message_create);
-    discord_set_on_guild_create(client, &on_guild_create);   /* ← NEW */
 
     // Initialise modules
     printf("Initialising modules...\n");
     ping_module_init(client, g_guild_id);
-    moderation_module_init(client, &g_database, g_guild_id);
+    moderation_module_init(client, &g_database, g_guild_id, token);
     ticket_module_init(client, &g_database);
     propagation_module_init(client, &g_database, g_guild_id);  /* ← NEW */
 
