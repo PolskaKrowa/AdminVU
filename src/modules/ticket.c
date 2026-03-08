@@ -1,1594 +1,1411 @@
-#include "ticket.h"
+/*
+ * ticket.c  –  Ticket system with staff management commands
+ *
+ * User commands:
+ *   /ticket open <subject>     – open a new support ticket
+ *   /ticket close              – close the current ticket
+ *
+ * Staff commands (require MANAGE_MESSAGES permission):
+ *   /ticketnote    add <text>           – add a private staff note
+ *   /ticketnote    list                 – list all notes on this ticket
+ *   /ticketnote    pin <note_id>        – pin an important note
+ *   /ticketnote    delete <note_id>     – delete one of your own notes
+ *   /ticketoutcome set <outcome> [text] – record the ticket resolution
+ *   /ticketoutcome clear                – clear the current outcome
+ *   /ticketassign  <staff_member>       – assign ticket to a staff member
+ *   /ticketpriority <level>             – set LOW / MEDIUM / HIGH / URGENT
+ *   /ticketstatus  <status>             – set OPEN / IN_PROGRESS / PENDING_USER
+ *   /ticketsummary                      – full summary (notes, outcome, history)
+ *   /closeticket                        – alias kept for back-compat
+ *   /ticketconfig  …                    – server-level configuration
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <inttypes.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <curl/curl.h>
+#include <orca/discord.h>
 
-// STB Image libraries for image processing
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image.h"
-#include "stb_image_write.h"
+#include "ticket.h"
+#include "database.h"
 
-// Module-private state
-static Database *g_db = NULL;
-static struct discord *g_client = NULL;
+/* ============================================================================
+ * Module-level globals
+ * ========================================================================= */
 
-// Directory for storing ticket media
-#define TICKET_IMAGES_DIR "ticket_images"
+static Database           *g_db      = NULL;
+static struct discord     *g_client  = NULL;
+static u64_snowflake_t     g_log_channel = 0; /* optional staff log channel   */
 
-// Attachment media types stored in the DB
-typedef enum {
-    MEDIA_TYPE_OTHER = 0,
-    MEDIA_TYPE_IMAGE = 1,
-    MEDIA_TYPE_VIDEO = 2,
-} MediaType;
+/* ============================================================================
+ * String helpers
+ * ========================================================================= */
 
-// SQL schema for ticket tables
-static const char *CREATE_TICKET_TABLES_SQL =
-    "CREATE TABLE IF NOT EXISTS server_configs ("
-    "    main_guild_id INTEGER PRIMARY KEY,"
-    "    staff_guild_id INTEGER NOT NULL,"
-    "    ticket_category_id INTEGER NOT NULL,"
-    "    log_channel_id INTEGER NOT NULL"
-    ");"
-
-    "CREATE TABLE IF NOT EXISTS tickets ("
-    "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
-    "    user_id INTEGER NOT NULL,"
-    "    main_guild_id INTEGER NOT NULL,"
-    "    staff_guild_id INTEGER NOT NULL,"
-    "    staff_channel_id INTEGER NOT NULL,"
-    "    dm_channel_id INTEGER NOT NULL,"
-    "    status INTEGER DEFAULT 0,"
-    "    created_at INTEGER DEFAULT (strftime('%s', 'now')),"
-    "    closed_at INTEGER"
-    ");"
-
-    "CREATE TABLE IF NOT EXISTS ticket_messages ("
-    "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
-    "    ticket_id INTEGER NOT NULL,"
-    "    message_id INTEGER NOT NULL,"
-    "    author_id INTEGER NOT NULL,"
-    "    content TEXT NOT NULL,"
-    "    attachments_json TEXT,"
-    "    from_user INTEGER NOT NULL,"
-    "    is_deleted INTEGER DEFAULT 0,"
-    "    is_edited INTEGER DEFAULT 0,"
-    "    timestamp INTEGER DEFAULT (strftime('%s', 'now')),"
-    "    edited_at INTEGER,"
-    "    FOREIGN KEY (ticket_id) REFERENCES tickets(id)"
-    ");"
-
-    "CREATE TABLE IF NOT EXISTS ticket_attachments ("
-    "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
-    "    message_id INTEGER NOT NULL,"
-    "    original_url TEXT NOT NULL,"
-    "    local_path TEXT,"
-    "    filename TEXT NOT NULL,"
-    "    media_type INTEGER DEFAULT 0,"   /* 0=other, 1=image, 2=video */
-    "    download_status INTEGER DEFAULT 0,"
-    "    FOREIGN KEY (message_id) REFERENCES ticket_messages(id)"
-    ");"
-
-    "CREATE INDEX IF NOT EXISTS idx_message_id ON ticket_messages(message_id);";
-
-/* -------------------------------------------------------------------------
- * libcurl helpers
- * ---------------------------------------------------------------------- */
-
-struct MemoryStruct {
-    unsigned char *memory;
-    size_t size;
-};
-
-static size_t write_memory_callback(void *contents, size_t size, size_t nmemb, void *userp) {
-    size_t realsize = size * nmemb;
-    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
-
-    unsigned char *ptr = realloc(mem->memory, mem->size + realsize + 1);
-    if (!ptr) {
-        fprintf(stderr, "[ticket] realloc failed in write_memory_callback\n");
-        return 0;
-    }
-
-    mem->memory = ptr;
-    memcpy(&(mem->memory[mem->size]), contents, realsize);
-    mem->size += realsize;
-    mem->memory[mem->size] = 0;
-    return realsize;
-}
-
-/* Download URL into a heap buffer.  Caller owns memory->memory. */
-static int curl_download(const char *url, struct MemoryStruct *out) {
-    out->memory = malloc(1);
-    out->size   = 0;
-
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        fprintf(stderr, "[ticket] curl_easy_init() failed\n");
-        return -1;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL,            url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  write_memory_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA,      (void *)out);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT,      "Discord-Ticket-Bot/1.0");
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,        60L);
-
-    CURLcode res = curl_easy_perform(curl);
-
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK) {
-        fprintf(stderr, "[ticket] curl error downloading %.80s: %s\n",
-                url, curl_easy_strerror(res));
-        free(out->memory);
-        out->memory = NULL;
-        out->size   = 0;
-        return -1;
-    }
-
-    if (http_code < 200 || http_code >= 300) {
-        fprintf(stderr, "[ticket] HTTP %ld downloading %.80s\n", http_code, url);
-        free(out->memory);
-        out->memory = NULL;
-        out->size   = 0;
-        return -1;
-    }
-
-    printf("[ticket] Downloaded %zu bytes (HTTP %ld)\n", out->size, http_code);
-    return 0;
-}
-
-/* -------------------------------------------------------------------------
- * Extension / MIME helpers
- *
- * Discord CDN URLs look like:
- *   https://cdn.discordapp.com/attachments/111/222/photo.jpg?ex=abc&is=def
- * Checking the raw URL tail will fail because of the query string.
- * We must strip the query component and inspect the filename instead.
- * ---------------------------------------------------------------------- */
-
-/* Fills ext_out with the lower-case extension (including the dot) of the
- * last path component in `input`, after stripping any query string.
- * ext_out is set to "" if no extension is found. */
-static void get_clean_extension(const char *input, char *ext_out, size_t ext_out_size) {
-    const char *filename = strrchr(input, '/');
-    filename = filename ? filename + 1 : input;
-
-    /* Strip query string */
-    char clean[512];
-    const char *q = strchr(filename, '?');
-    size_t copy_len = q ? (size_t)(q - filename) : strlen(filename);
-    if (copy_len >= sizeof(clean)) copy_len = sizeof(clean) - 1;
-    strncpy(clean, filename, copy_len);
-    clean[copy_len] = '\0';
-
-    const char *dot = strrchr(clean, '.');
-    if (dot) {
-        strncpy(ext_out, dot, ext_out_size - 1);
-        ext_out[ext_out_size - 1] = '\0';
-        /* Lower-case in place */
-        for (char *p = ext_out; *p; p++)
-            if (*p >= 'A' && *p <= 'Z') *p += 32;
-    } else {
-        ext_out[0] = '\0';
+const char *ticket_status_string(TicketStatus s) {
+    switch (s) {
+        case TICKET_STATUS_OPEN:         return "Open";
+        case TICKET_STATUS_IN_PROGRESS:  return "In Progress";
+        case TICKET_STATUS_PENDING_USER: return "Pending User";
+        case TICKET_STATUS_RESOLVED:     return "Resolved";
+        case TICKET_STATUS_CLOSED:       return "Closed";
+        default:                         return "Unknown";
     }
 }
 
-/* Determine the MediaType for a given filename or URL.
- * Prefer the explicit `filename` parameter (Discord supplies it separately
- * from the CDN URL, without query strings), fall back to the URL. */
-static MediaType detect_media_type(const char *filename, const char *url) {
-    const char *probe = (filename && filename[0]) ? filename : url;
-    if (!probe) return MEDIA_TYPE_OTHER;
-
-    char ext[32];
-    get_clean_extension(probe, ext, sizeof(ext));
-
-    static const char *img_exts[] = {".jpg",".jpeg",".png",".gif",".webp",".bmp",NULL};
-    for (int i = 0; img_exts[i]; i++)
-        if (strcmp(ext, img_exts[i]) == 0) return MEDIA_TYPE_IMAGE;
-
-    static const char *vid_exts[] = {".mp4",".webm",".mov",".avi",".mkv",".ogg",NULL};
-    for (int i = 0; vid_exts[i]; i++)
-        if (strcmp(ext, vid_exts[i]) == 0) return MEDIA_TYPE_VIDEO;
-
-    return MEDIA_TYPE_OTHER;
+const char *ticket_priority_string(TicketPriority p) {
+    switch (p) {
+        case TICKET_PRIORITY_LOW:    return "🟢 Low";
+        case TICKET_PRIORITY_MEDIUM: return "🟡 Medium";
+        case TICKET_PRIORITY_HIGH:   return "🟠 High";
+        case TICKET_PRIORITY_URGENT: return "🔴 Urgent";
+        default:                     return "Unknown";
+    }
 }
 
-/* Return the MIME type string for a given filename / URL extension. */
-static const char *mime_for_video(const char *filename) {
-    char ext[32];
-    get_clean_extension(filename ? filename : "", ext, sizeof(ext));
-    if (strcmp(ext, ".mp4")  == 0) return "video/mp4";
-    if (strcmp(ext, ".webm") == 0) return "video/webm";
-    if (strcmp(ext, ".ogg")  == 0) return "video/ogg";
-    if (strcmp(ext, ".mov")  == 0) return "video/quicktime";
-    return "video/mp4"; /* safe default */
+const char *ticket_outcome_string(TicketOutcome o) {
+    switch (o) {
+        case TICKET_OUTCOME_NONE:        return "None";
+        case TICKET_OUTCOME_RESOLVED:    return "✅ Resolved";
+        case TICKET_OUTCOME_DUPLICATE:   return "🔁 Duplicate";
+        case TICKET_OUTCOME_INVALID:     return "❌ Invalid";
+        case TICKET_OUTCOME_NO_RESPONSE: return "🔇 No Response";
+        case TICKET_OUTCOME_ESCALATED:   return "⬆️ Escalated";
+        case TICKET_OUTCOME_OTHER:       return "📝 Other";
+        default:                         return "Unknown";
+    }
 }
 
-/* -------------------------------------------------------------------------
- * Disk helpers
- * ---------------------------------------------------------------------- */
-
-static void ensure_dir(const char *path) {
-    struct stat st = {0};
-    if (stat(path, &st) == -1)
-        mkdir(path, 0755);
+static TicketPriority priority_from_string(const char *s) {
+    if (!s) return TICKET_PRIORITY_MEDIUM;
+    if (strcasecmp(s, "low")    == 0) return TICKET_PRIORITY_LOW;
+    if (strcasecmp(s, "high")   == 0) return TICKET_PRIORITY_HIGH;
+    if (strcasecmp(s, "urgent") == 0) return TICKET_PRIORITY_URGENT;
+    return TICKET_PRIORITY_MEDIUM;
 }
 
-/* -------------------------------------------------------------------------
- * Download & save image (re-encoded as JPEG for compression)
- * Returns heap-allocated local path on success, NULL on failure.
- * ---------------------------------------------------------------------- */
-static char *download_image(const char *url, int ticket_id, int attachment_id) {
-    struct MemoryStruct chunk = {0};
-    if (curl_download(url, &chunk) != 0 || chunk.size == 0) {
-        free(chunk.memory);
-        return NULL;
-    }
-
-    int width, height, channels;
-    unsigned char *img = stbi_load_from_memory(chunk.memory, (int)chunk.size,
-                                               &width, &height, &channels, 0);
-    free(chunk.memory);
-    if (!img) {
-        fprintf(stderr, "[ticket] stbi_load_from_memory failed for %s\n", url);
-        return NULL;
-    }
-
-    char ticket_dir[512];
-    snprintf(ticket_dir, sizeof(ticket_dir), "%s/ticket_%d", TICKET_IMAGES_DIR, ticket_id);
-    ensure_dir(TICKET_IMAGES_DIR);
-    ensure_dir(ticket_dir);
-
-    char *filepath = malloc(1024);
-    snprintf(filepath, 1024, "%s/attachment_%d.jpg", ticket_dir, attachment_id);
-
-    /* JPEG doesn't support alpha — convert RGBA→RGB */
-    unsigned char *rgb = img;
-    int write_channels = channels;
-    if (channels == 4) {
-        rgb = malloc(width * height * 3);
-        for (int i = 0; i < width * height; i++) {
-            rgb[i*3+0] = img[i*4+0];
-            rgb[i*3+1] = img[i*4+1];
-            rgb[i*3+2] = img[i*4+2];
-        }
-        write_channels = 3;
-    }
-
-    int ok = stbi_write_jpg(filepath, width, height, write_channels, rgb, 85);
-
-    if (channels == 4) free(rgb);
-    stbi_image_free(img);
-
-    if (!ok) {
-        fprintf(stderr, "[ticket] stbi_write_jpg failed: %s\n", filepath);
-        free(filepath);
-        return NULL;
-    }
-
-    printf("[ticket] Image saved: %s\n", filepath);
-    return filepath;
+static TicketOutcome outcome_from_string(const char *s) {
+    if (!s) return TICKET_OUTCOME_NONE;
+    if (strcasecmp(s, "resolved")    == 0) return TICKET_OUTCOME_RESOLVED;
+    if (strcasecmp(s, "duplicate")   == 0) return TICKET_OUTCOME_DUPLICATE;
+    if (strcasecmp(s, "invalid")     == 0) return TICKET_OUTCOME_INVALID;
+    if (strcasecmp(s, "noresponse")  == 0 ||
+        strcasecmp(s, "no_response") == 0) return TICKET_OUTCOME_NO_RESPONSE;
+    if (strcasecmp(s, "escalated")   == 0) return TICKET_OUTCOME_ESCALATED;
+    return TICKET_OUTCOME_OTHER;
 }
 
-/* -------------------------------------------------------------------------
- * Download & save a raw binary file (videos, non-image attachments)
- * Returns heap-allocated local path on success, NULL on failure.
- * ---------------------------------------------------------------------- */
-static char *download_raw(const char *url, int ticket_id, int attachment_id,
-                           const char *orig_filename) {
-    struct MemoryStruct chunk = {0};
-    if (curl_download(url, &chunk) != 0 || chunk.size == 0) {
-        free(chunk.memory);
-        return NULL;
-    }
-
-    char ticket_dir[512];
-    snprintf(ticket_dir, sizeof(ticket_dir), "%s/ticket_%d", TICKET_IMAGES_DIR, ticket_id);
-    ensure_dir(TICKET_IMAGES_DIR);
-    ensure_dir(ticket_dir);
-
-    /* Preserve original extension */
-    char ext[32];
-    get_clean_extension(orig_filename ? orig_filename : url, ext, sizeof(ext));
-    if (!ext[0]) strncpy(ext, ".bin", sizeof(ext));
-
-    char *filepath = malloc(1024);
-    snprintf(filepath, 1024, "%s/attachment_%d%s", ticket_dir, attachment_id, ext);
-
-    FILE *f = fopen(filepath, "wb");
-    if (!f) {
-        fprintf(stderr, "[ticket] fopen failed: %s\n", filepath);
-        free(chunk.memory);
-        free(filepath);
-        return NULL;
-    }
-    fwrite(chunk.memory, 1, chunk.size, f);
-    fclose(f);
-    free(chunk.memory);
-
-    printf("[ticket] File saved: %s\n", filepath);
-    return filepath;
+static TicketStatus status_from_string(const char *s) {
+    if (!s) return TICKET_STATUS_OPEN;
+    if (strcasecmp(s, "open")          == 0) return TICKET_STATUS_OPEN;
+    if (strcasecmp(s, "in_progress")   == 0 ||
+        strcasecmp(s, "inprogress")    == 0) return TICKET_STATUS_IN_PROGRESS;
+    if (strcasecmp(s, "pending_user")  == 0 ||
+        strcasecmp(s, "pendinguser")   == 0) return TICKET_STATUS_PENDING_USER;
+    if (strcasecmp(s, "resolved")      == 0) return TICKET_STATUS_RESOLVED;
+    return TICKET_STATUS_OPEN;
 }
 
-/* -------------------------------------------------------------------------
- * Base64 encode a block of bytes.  Returns heap-allocated string.
- * ---------------------------------------------------------------------- */
-static char *base64_encode(const unsigned char *data, size_t len) {
-    static const char tbl[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/* ============================================================================
+ * Database – table initialisation
+ * ========================================================================= */
 
-    size_t out_len = 4 * ((len + 2) / 3);
-    char *out = malloc(out_len + 1);
-    if (!out) return NULL;
+int ticket_db_init_tables(Database *db) {
+    const char *sql =
+        /* Core ticket record */
+        "CREATE TABLE IF NOT EXISTS tickets ("
+        "  id           INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  channel_id   INTEGER NOT NULL UNIQUE,"
+        "  guild_id     INTEGER NOT NULL,"
+        "  opener_id    INTEGER NOT NULL,"
+        "  assigned_to  INTEGER DEFAULT 0,"
+        "  status       INTEGER DEFAULT 0,"
+        "  priority     INTEGER DEFAULT 1,"
+        "  outcome      INTEGER DEFAULT 0,"
+        "  subject      TEXT,"
+        "  outcome_notes TEXT,"
+        "  created_at   INTEGER DEFAULT (strftime('%s','now')),"
+        "  updated_at   INTEGER DEFAULT (strftime('%s','now')),"
+        "  closed_at    INTEGER DEFAULT 0"
+        ");"
 
-    size_t pos = 0;
-    for (size_t i = 0; i < len; i += 3) {
-        unsigned char b0 = data[i];
-        unsigned char b1 = (i+1 < len) ? data[i+1] : 0;
-        unsigned char b2 = (i+2 < len) ? data[i+2] : 0;
+        /* Private staff notes */
+        "CREATE TABLE IF NOT EXISTS ticket_notes ("
+        "  id           INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  ticket_id    INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,"
+        "  author_id    INTEGER NOT NULL,"
+        "  content      TEXT NOT NULL,"
+        "  is_pinned    INTEGER DEFAULT 0,"
+        "  created_at   INTEGER DEFAULT (strftime('%s','now'))"
+        ");"
 
-        out[pos++] = tbl[b0 >> 2];
-        out[pos++] = tbl[((b0 & 0x03) << 4) | (b1 >> 4)];
-        out[pos++] = (i+1 < len) ? tbl[((b1 & 0x0F) << 2) | (b2 >> 6)] : '=';
-        out[pos++] = (i+2 < len) ? tbl[b2 & 0x3F]                       : '=';
-    }
-    out[pos] = '\0';
-    return out;
-}
+        /* Indexes */
+        "CREATE INDEX IF NOT EXISTS idx_tickets_channel  ON tickets(channel_id);"
+        "CREATE INDEX IF NOT EXISTS idx_ticket_notes_tid ON ticket_notes(ticket_id);";
 
-/* Read a file from disk and return it base64-encoded.  Returns NULL on error. */
-static char *file_to_base64(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return NULL; }
-
-    unsigned char *buf = malloc(sz);
-    if (!buf) { fclose(f); return NULL; }
-    if ((long)fread(buf, 1, sz, f) != sz) {
-        fclose(f); free(buf); return NULL;
-    }
-    fclose(f);
-
-    char *b64 = base64_encode(buf, sz);
-    free(buf);
-    return b64;
-}
-
-/* -------------------------------------------------------------------------
- * Dynamic HTML buffer helpers
- * ---------------------------------------------------------------------- */
-
-typedef struct {
-    char  *buf;
-    size_t len;   /* bytes currently written (excl. NUL) */
-    size_t cap;   /* allocated capacity */
-} HtmlBuf;
-
-static int hbuf_init(HtmlBuf *h, size_t initial) {
-    h->buf = malloc(initial);
-    if (!h->buf) return -1;
-    h->buf[0] = '\0';
-    h->len = 0;
-    h->cap = initial;
-    return 0;
-}
-
-static int hbuf_append(HtmlBuf *h, const char *s) {
-    size_t slen = strlen(s);
-    while (h->len + slen + 1 > h->cap) {
-        size_t new_cap = h->cap * 2;
-        char *nb = realloc(h->buf, new_cap);
-        if (!nb) return -1;
-        h->buf = nb;
-        h->cap = new_cap;
-    }
-    memcpy(h->buf + h->len, s, slen + 1);
-    h->len += slen;
-    return 0;
-}
-
-/* printf-style append to HtmlBuf — handles arbitrarily large formatted strings */
-static int hbuf_appendf(HtmlBuf *h, const char *fmt, ...) {
-    /* First pass: find out how much space we need */
-    va_list ap;
-    va_start(ap, fmt);
-    int needed = vsnprintf(NULL, 0, fmt, ap);
-    va_end(ap);
-
-    if (needed < 0) return -1;
-
-    /* Grow the buffer if necessary */
-    while (h->len + (size_t)needed + 1 > h->cap) {
-        size_t new_cap = h->cap * 2;
-        if (new_cap < h->len + (size_t)needed + 1)
-            new_cap = h->len + (size_t)needed + 1;
-        char *nb = realloc(h->buf, new_cap);
-        if (!nb) return -1;
-        h->buf = nb;
-        h->cap = new_cap;
-    }
-
-    /* Second pass: write directly into the buffer */
-    va_start(ap, fmt);
-    vsnprintf(h->buf + h->len, (size_t)needed + 1, fmt, ap);
-    va_end(ap);
-
-    h->len += (size_t)needed;
-    return 0;
-}
-
-/* -------------------------------------------------------------------------
- * Database schema init + migration
- * ---------------------------------------------------------------------- */
-
-static int init_ticket_tables(Database *db) {
-    char *err_msg = NULL;
-
-    /* Create tables — no-op if they already exist */
-    int rc = sqlite3_exec(db->db, CREATE_TICKET_TABLES_SQL, NULL, NULL, &err_msg);
+    char *err = NULL;
+    int rc = sqlite3_exec(db->db, sql, NULL, NULL, &err);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "[ticket] SQL error creating tables: %s\n", err_msg);
-        sqlite3_free(err_msg);
+        fprintf(stderr, "[ticket] DB init error: %s\n", err);
+        sqlite3_free(err);
         return -1;
     }
-
-    /* -----------------------------------------------------------------------
-     * Migration: the original schema had `is_image INTEGER DEFAULT 0`.
-     * We renamed it to `media_type` (0=other, 1=image, 2=video).
-     *
-     * Because CREATE TABLE IF NOT EXISTS is a no-op on existing databases,
-     * existing installs still have the OLD column name and the INSERT in
-     * db_add_attachment() was failing silently (sqlite3_prepare_v2 returns
-     * an error when the named column doesn't exist), causing attachment_id
-     * to be -1 and skipping the download entirely.
-     *
-     * Fix:
-     *   1. ADD media_type if it is missing (ignore "duplicate column" error).
-     *   2. Back-fill it from is_image where present.
-     * --------------------------------------------------------------------- */
-
-    /* Step 1 – add the new column; silently ignore "duplicate column" */
-    sqlite3_exec(db->db,
-        "ALTER TABLE ticket_attachments ADD COLUMN media_type INTEGER DEFAULT 0",
-        NULL, NULL, NULL);
-
-    /* Step 2 – probe for the old is_image column via PRAGMA */
-    {
-        sqlite3_stmt *info_stmt;
-        int has_is_image = 0;
-        if (sqlite3_prepare_v2(db->db,
-                "PRAGMA table_info(ticket_attachments)", -1, &info_stmt, NULL) == SQLITE_OK) {
-            while (sqlite3_step(info_stmt) == SQLITE_ROW) {
-                const char *col = (const char *)sqlite3_column_text(info_stmt, 1);
-                if (col && strcmp(col, "is_image") == 0) { has_is_image = 1; break; }
-            }
-            sqlite3_finalize(info_stmt);
-        }
-
-        if (has_is_image) {
-            sqlite3_exec(db->db,
-                "UPDATE ticket_attachments "
-                "SET media_type = 1 WHERE is_image = 1 AND media_type = 0",
-                NULL, NULL, NULL);
-            printf("[ticket] Migrated is_image -> media_type for existing rows\n");
-        }
-    }
-
-    printf("[ticket] Ticket tables initialised\n");
     return 0;
 }
 
-/* -------------------------------------------------------------------------
- * Database operations
- * ---------------------------------------------------------------------- */
+/* ============================================================================
+ * Database – ticket CRUD
+ * ========================================================================= */
 
-int db_set_server_config(Database *db, u64_snowflake_t main_guild_id,
-                         u64_snowflake_t staff_guild_id,
-                         u64_snowflake_t ticket_category_id,
-                         u64_snowflake_t log_channel_id) {
+int ticket_db_create(Database *db, Ticket *t) {
     const char *sql =
-        "INSERT OR REPLACE INTO server_configs "
-        "(main_guild_id, staff_guild_id, ticket_category_id, log_channel_id) "
-        "VALUES (?, ?, ?, ?)";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_int64(stmt, 1, main_guild_id);
-    sqlite3_bind_int64(stmt, 2, staff_guild_id);
-    sqlite3_bind_int64(stmt, 3, ticket_category_id);
-    sqlite3_bind_int64(stmt, 4, log_channel_id);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return (rc == SQLITE_DONE) ? 0 : -1;
-}
+        "INSERT INTO tickets (channel_id, guild_id, opener_id, status, priority, subject) "
+        "VALUES (?, ?, ?, ?, ?, ?) RETURNING id;";
 
-int db_get_server_config(Database *db, u64_snowflake_t main_guild_id, ServerConfig *config) {
-    const char *sql =
-        "SELECT main_guild_id, staff_guild_id, ticket_category_id, log_channel_id "
-        "FROM server_configs WHERE main_guild_id = ?";
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_int64(stmt, 1, main_guild_id);
-    int found = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        config->main_guild_id      = sqlite3_column_int64(stmt, 0);
-        config->staff_guild_id     = sqlite3_column_int64(stmt, 1);
-        config->ticket_category_id = sqlite3_column_int64(stmt, 2);
-        config->log_channel_id     = sqlite3_column_int64(stmt, 3);
-        found = 1;
-    }
-    sqlite3_finalize(stmt);
-    return found ? 0 : -1;
-}
-
-int db_create_ticket(Database *db, u64_snowflake_t user_id,
-                     u64_snowflake_t main_guild_id,
-                     u64_snowflake_t staff_guild_id,
-                     u64_snowflake_t staff_channel_id,
-                     u64_snowflake_t dm_channel_id) {
-    const char *sql =
-        "INSERT INTO tickets "
-        "(user_id, main_guild_id, staff_guild_id, staff_channel_id, dm_channel_id, status) "
-        "VALUES (?, ?, ?, ?, ?, ?)";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_int64(stmt, 1, user_id);
-    sqlite3_bind_int64(stmt, 2, main_guild_id);
-    sqlite3_bind_int64(stmt, 3, staff_guild_id);
-    sqlite3_bind_int64(stmt, 4, staff_channel_id);
-    sqlite3_bind_int64(stmt, 5, dm_channel_id);
-    sqlite3_bind_int  (stmt, 6, TICKET_STATUS_OPEN);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    if (rc != SQLITE_DONE) {
-        fprintf(stderr, "[ticket] Failed to create ticket: %s\n", sqlite3_errmsg(db->db));
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
         return -1;
-    }
-    return (int)sqlite3_last_insert_rowid(db->db);
-}
 
-int db_get_open_ticket_for_user(Database *db, u64_snowflake_t user_id, Ticket *ticket) {
-    const char *sql =
-        "SELECT id, user_id, main_guild_id, staff_guild_id, "
-        "staff_channel_id, dm_channel_id, status, created_at, closed_at "
-        "FROM tickets WHERE user_id = ? AND status = ? "
-        "ORDER BY created_at DESC LIMIT 1";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_int64(stmt, 1, user_id);
-    sqlite3_bind_int  (stmt, 2, TICKET_STATUS_OPEN);
-    int found = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        ticket->id              = sqlite3_column_int  (stmt, 0);
-        ticket->user_id         = sqlite3_column_int64(stmt, 1);
-        ticket->main_guild_id   = sqlite3_column_int64(stmt, 2);
-        ticket->staff_guild_id  = sqlite3_column_int64(stmt, 3);
-        ticket->staff_channel_id= sqlite3_column_int64(stmt, 4);
-        ticket->dm_channel_id   = sqlite3_column_int64(stmt, 5);
-        ticket->status          = sqlite3_column_int  (stmt, 6);
-        ticket->created_at      = sqlite3_column_int64(stmt, 7);
-        ticket->closed_at       = sqlite3_column_int64(stmt, 8);
-        found = 1;
-    }
+    sqlite3_bind_int64(stmt, 1, t->channel_id);
+    sqlite3_bind_int64(stmt, 2, t->guild_id);
+    sqlite3_bind_int64(stmt, 3, t->opener_id);
+    sqlite3_bind_int  (stmt, 4, t->status);
+    sqlite3_bind_int  (stmt, 5, t->priority);
+    sqlite3_bind_text (stmt, 6, t->subject ? t->subject : "", -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW)
+        t->id = (int)sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
-    return found ? 0 : -1;
+    return (rc == SQLITE_ROW) ? 0 : -1;
 }
 
-int db_get_ticket_by_channel(Database *db, u64_snowflake_t channel_id, Ticket *ticket) {
-    const char *sql =
-        "SELECT id, user_id, main_guild_id, staff_guild_id, "
-        "staff_channel_id, dm_channel_id, status, created_at, closed_at "
-        "FROM tickets WHERE (staff_channel_id = ? OR dm_channel_id = ?) AND status = ?";
+/* Shared row-to-struct helper */
+static void row_to_ticket(sqlite3_stmt *stmt, Ticket *t) {
+    t->id           = (int)sqlite3_column_int64(stmt, 0);
+    t->channel_id   = (u64_snowflake_t)sqlite3_column_int64(stmt, 1);
+    t->guild_id     = (u64_snowflake_t)sqlite3_column_int64(stmt, 2);
+    t->opener_id    = (u64_snowflake_t)sqlite3_column_int64(stmt, 3);
+    t->assigned_to  = (u64_snowflake_t)sqlite3_column_int64(stmt, 4);
+    t->status       = (TicketStatus)sqlite3_column_int(stmt, 5);
+    t->priority     = (TicketPriority)sqlite3_column_int(stmt, 6);
+    t->outcome      = (TicketOutcome)sqlite3_column_int(stmt, 7);
+    t->created_at   = (long)sqlite3_column_int64(stmt, 8);
+    t->updated_at   = (long)sqlite3_column_int64(stmt, 9);
+    t->closed_at    = (long)sqlite3_column_int64(stmt, 10);
+
+    const char *subj = (const char *)sqlite3_column_text(stmt, 11);
+    t->subject       = subj ? strdup(subj) : NULL;
+
+    const char *onotes = (const char *)sqlite3_column_text(stmt, 12);
+    t->outcome_notes   = onotes ? strdup(onotes) : NULL;
+}
+
+static const char *SELECT_TICKET_COLS =
+    "SELECT id, channel_id, guild_id, opener_id, assigned_to, "
+    "       status, priority, outcome, created_at, updated_at, closed_at, "
+    "       subject, outcome_notes ";
+
+int ticket_db_get_by_channel(Database *db, u64_snowflake_t channel_id, Ticket *out) {
+    char sql[512];
+    snprintf(sql, sizeof(sql), "%s FROM tickets WHERE channel_id = ?;",
+             SELECT_TICKET_COLS);
+
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
     sqlite3_bind_int64(stmt, 1, channel_id);
-    sqlite3_bind_int64(stmt, 2, channel_id);
-    sqlite3_bind_int  (stmt, 3, TICKET_STATUS_OPEN);
-    int found = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        ticket->id              = sqlite3_column_int  (stmt, 0);
-        ticket->user_id         = sqlite3_column_int64(stmt, 1);
-        ticket->main_guild_id   = sqlite3_column_int64(stmt, 2);
-        ticket->staff_guild_id  = sqlite3_column_int64(stmt, 3);
-        ticket->staff_channel_id= sqlite3_column_int64(stmt, 4);
-        ticket->dm_channel_id   = sqlite3_column_int64(stmt, 5);
-        ticket->status          = sqlite3_column_int  (stmt, 6);
-        ticket->created_at      = sqlite3_column_int64(stmt, 7);
-        ticket->closed_at       = sqlite3_column_int64(stmt, 8);
-        found = 1;
-    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW)
+        row_to_ticket(stmt, out);
     sqlite3_finalize(stmt);
-    return found ? 0 : -1;
+    return (rc == SQLITE_ROW) ? 0 : -1;
 }
 
-int db_close_ticket(Database *db, int ticket_id) {
-    const char *sql =
-        "UPDATE tickets SET status = ?, closed_at = strftime('%s', 'now') WHERE id = ?";
+int ticket_db_get_by_id(Database *db, int ticket_id, Ticket *out) {
+    char sql[512];
+    snprintf(sql, sizeof(sql), "%s FROM tickets WHERE id = ?;",
+             SELECT_TICKET_COLS);
+
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_int(stmt, 1, TICKET_STATUS_CLOSED);
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_int(stmt, 1, ticket_id);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW)
+        row_to_ticket(stmt, out);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_ROW) ? 0 : -1;
+}
+
+int ticket_db_update_status(Database *db, int ticket_id, TicketStatus status) {
+    const char *sql =
+        "UPDATE tickets SET status = ?, updated_at = strftime('%s','now') "
+        "WHERE id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_int(stmt, 1, status);
     sqlite3_bind_int(stmt, 2, ticket_id);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-int db_add_ticket_message(Database *db, int ticket_id, u64_snowflake_t message_id,
-                          u64_snowflake_t author_id, const char *content,
-                          const char *attachments_json, bool from_user) {
+int ticket_db_update_priority(Database *db, int ticket_id, TicketPriority priority) {
     const char *sql =
-        "INSERT INTO ticket_messages "
-        "(ticket_id, message_id, author_id, content, attachments_json, from_user) "
-        "VALUES (?, ?, ?, ?, ?, ?)";
+        "UPDATE tickets SET priority = ?, updated_at = strftime('%s','now') "
+        "WHERE id = ?;";
+
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_int(stmt, 1, priority);
+    sqlite3_bind_int(stmt, 2, ticket_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int ticket_db_update_assigned(Database *db, int ticket_id,
+                               u64_snowflake_t staff_id) {
+    const char *sql =
+        "UPDATE tickets SET assigned_to = ?, updated_at = strftime('%s','now') "
+        "WHERE id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_int64(stmt, 1, staff_id);
+    sqlite3_bind_int  (stmt, 2, ticket_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int ticket_db_set_outcome(Database *db, int ticket_id,
+                           TicketOutcome outcome, const char *notes) {
+    const char *sql =
+        "UPDATE tickets SET outcome = ?, outcome_notes = ?, "
+        "updated_at = strftime('%s','now') WHERE id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_int  (stmt, 1, outcome);
+    sqlite3_bind_text (stmt, 2, notes ? notes : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int  (stmt, 3, ticket_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+void ticket_db_free(Ticket *t) {
+    if (!t) return;
+    free(t->subject);
+    free(t->outcome_notes);
+    t->subject       = NULL;
+    t->outcome_notes = NULL;
+}
+
+/* ============================================================================
+ * Database – notes CRUD
+ * ========================================================================= */
+
+int ticket_note_add(Database *db, int ticket_id,
+                    u64_snowflake_t author_id, const char *content) {
+    const char *sql =
+        "INSERT INTO ticket_notes (ticket_id, author_id, content) VALUES (?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
     sqlite3_bind_int  (stmt, 1, ticket_id);
-    sqlite3_bind_int64(stmt, 2, message_id);
-    sqlite3_bind_int64(stmt, 3, author_id);
-    sqlite3_bind_text (stmt, 4, content,          -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text (stmt, 5, attachments_json, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int  (stmt, 6, from_user ? 1 : 0);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return (rc == SQLITE_DONE) ? (int)sqlite3_last_insert_rowid(db->db) : -1;
-}
-
-int db_add_attachment(Database *db, int message_db_id, const char *url,
-                      const char *filename, int media_type) {
-    const char *sql =
-        "INSERT INTO ticket_attachments "
-        "(message_id, original_url, filename, media_type) VALUES (?, ?, ?, ?)";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_int (stmt, 1, message_db_id);
-    sqlite3_bind_text(stmt, 2, url,      -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, filename, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int (stmt, 4, media_type);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return (rc == SQLITE_DONE) ? (int)sqlite3_last_insert_rowid(db->db) : -1;
-}
-
-int db_update_attachment_path(Database *db, int attachment_id, const char *local_path) {
-    const char *sql =
-        "UPDATE ticket_attachments SET local_path = ?, download_status = 1 WHERE id = ?";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_text(stmt, 1, local_path, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int (stmt, 2, attachment_id);
+    sqlite3_bind_int64(stmt, 2, author_id);
+    sqlite3_bind_text (stmt, 3, content, -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-int db_update_ticket_message(Database *db, u64_snowflake_t message_id, const char *new_content) {
-    const char *sql =
-        "UPDATE ticket_messages SET content = ?, is_edited = 1, "
-        "edited_at = strftime('%s', 'now') WHERE message_id = ?";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_text (stmt, 1, new_content, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 2, message_id);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return (rc == SQLITE_DONE) ? 0 : -1;
-}
+int ticket_note_get_all(Database *db, int ticket_id,
+                        TicketNote **notes_out, int *count_out) {
+    *notes_out = NULL;
+    *count_out = 0;
 
-int db_delete_ticket_message(Database *db, u64_snowflake_t message_id) {
-    const char *sql = "UPDATE ticket_messages SET is_deleted = 1 WHERE message_id = ?";
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_int64(stmt, 1, message_id);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return (rc == SQLITE_DONE) ? 0 : -1;
-}
-
-int db_get_ticket_messages(Database *db, int ticket_id,
-                            TicketMessage **messages, int *count) {
     const char *sql =
-        "SELECT id, ticket_id, message_id, author_id, content, attachments_json, "
-        "from_user, is_deleted, is_edited, timestamp, edited_at "
-        "FROM ticket_messages WHERE ticket_id = ? ORDER BY timestamp ASC";
+        "SELECT id, ticket_id, author_id, content, is_pinned, created_at "
+        "FROM ticket_notes WHERE ticket_id = ? "
+        "ORDER BY is_pinned DESC, created_at ASC;";
+
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
     sqlite3_bind_int(stmt, 1, ticket_id);
 
-    int row_count = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) row_count++;
-    *count = row_count;
+    /* Two-pass: count then allocate */
+    int cap = 8;
+    TicketNote *arr = malloc(sizeof(TicketNote) * cap);
+    if (!arr) { sqlite3_finalize(stmt); return -1; }
+    int n = 0;
 
-    if (row_count == 0) { sqlite3_finalize(stmt); *messages = NULL; return 0; }
-
-    *messages = malloc(sizeof(TicketMessage) * row_count);
-    if (!*messages) { sqlite3_finalize(stmt); return -1; }
-
-    sqlite3_reset(stmt);
-    int idx = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW && idx < row_count) {
-        (*messages)[idx].id        = sqlite3_column_int  (stmt, 0);
-        (*messages)[idx].ticket_id = sqlite3_column_int  (stmt, 1);
-        (*messages)[idx].message_id= sqlite3_column_int64(stmt, 2);
-        (*messages)[idx].author_id = sqlite3_column_int64(stmt, 3);
-
-        const char *c = (const char *)sqlite3_column_text(stmt, 4);
-        (*messages)[idx].content = c ? strdup(c) : NULL;
-
-        const char *a = (const char *)sqlite3_column_text(stmt, 5);
-        (*messages)[idx].attachments_json = a ? strdup(a) : NULL;
-
-        (*messages)[idx].from_user  = sqlite3_column_int (stmt, 6) != 0;
-        (*messages)[idx].is_deleted = sqlite3_column_int (stmt, 7) != 0;
-        (*messages)[idx].is_edited  = sqlite3_column_int (stmt, 8) != 0;
-        (*messages)[idx].timestamp  = sqlite3_column_int64(stmt, 9);
-        (*messages)[idx].edited_at  = sqlite3_column_int64(stmt, 10);
-        idx++;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= 2;
+            TicketNote *tmp = realloc(arr, sizeof(TicketNote) * cap);
+            if (!tmp) { free(arr); sqlite3_finalize(stmt); return -1; }
+            arr = tmp;
+        }
+        TicketNote *note  = &arr[n++];
+        note->id          = (int)sqlite3_column_int64(stmt, 0);
+        note->ticket_id   = (int)sqlite3_column_int64(stmt, 1);
+        note->author_id   = (u64_snowflake_t)sqlite3_column_int64(stmt, 2);
+        const char *txt   = (const char *)sqlite3_column_text(stmt, 3);
+        note->content     = txt ? strdup(txt) : strdup("");
+        note->is_pinned   = (bool)sqlite3_column_int(stmt, 4);
+        note->created_at  = (long)sqlite3_column_int64(stmt, 5);
     }
+
     sqlite3_finalize(stmt);
+    *notes_out = arr;
+    *count_out = n;
     return 0;
 }
 
-void db_free_ticket_messages(TicketMessage *messages, int count) {
-    if (!messages) return;
-    for (int i = 0; i < count; i++) {
-        free(messages[i].content);
-        free(messages[i].attachments_json);
-    }
-    free(messages);
-}
-
-/* -------------------------------------------------------------------------
- * Attachment retrieval (internal)
- * ---------------------------------------------------------------------- */
-
-typedef struct {
-    int   id;
-    char *original_url;
-    char *local_path;
-    char *filename;
-    int   media_type;       /* MediaType enum */
-    int   download_status;
-} MessageAttachment;
-
-static int db_get_message_attachments(Database *db, int message_db_id,
-                                       MessageAttachment **out, int *count) {
-    const char *sql =
-        "SELECT id, original_url, local_path, filename, media_type, download_status "
-        "FROM ticket_attachments WHERE message_id = ?";
+int ticket_note_set_pinned(Database *db, int note_id, bool pinned) {
+    const char *sql = "UPDATE ticket_notes SET is_pinned = ? WHERE id = ?;";
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_int(stmt, 1, message_db_id);
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
 
-    int row_count = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) row_count++;
-    *count = row_count;
-
-    if (row_count == 0) { sqlite3_finalize(stmt); *out = NULL; return 0; }
-
-    *out = malloc(sizeof(MessageAttachment) * row_count);
-    if (!*out) { sqlite3_finalize(stmt); return -1; }
-
-    sqlite3_reset(stmt);
-    int idx = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW && idx < row_count) {
-        (*out)[idx].id = sqlite3_column_int(stmt, 0);
-
-        const char *u = (const char *)sqlite3_column_text(stmt, 1);
-        (*out)[idx].original_url = u ? strdup(u) : NULL;
-
-        const char *p = (const char *)sqlite3_column_text(stmt, 2);
-        (*out)[idx].local_path = p ? strdup(p) : NULL;
-
-        const char *f = (const char *)sqlite3_column_text(stmt, 3);
-        (*out)[idx].filename = f ? strdup(f) : NULL;
-
-        (*out)[idx].media_type      = sqlite3_column_int(stmt, 4);
-        (*out)[idx].download_status = sqlite3_column_int(stmt, 5);
-        idx++;
-    }
+    sqlite3_bind_int(stmt, 1, pinned ? 1 : 0);
+    sqlite3_bind_int(stmt, 2, note_id);
+    int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return 0;
+    return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-static void db_free_message_attachments(MessageAttachment *atts, int count) {
-    if (!atts) return;
-    for (int i = 0; i < count; i++) {
-        free(atts[i].original_url);
-        free(atts[i].local_path);
-        free(atts[i].filename);
-    }
-    free(atts);
+int ticket_note_delete(Database *db, int note_id,
+                       u64_snowflake_t requesting_staff_id) {
+    /*
+     * Only allow deletion if the requesting staff member is the note author.
+     * Callers with elevated permissions should pass 0 to bypass this check.
+     */
+    const char *sql = (requesting_staff_id == 0)
+        ? "DELETE FROM ticket_notes WHERE id = ?;"
+        : "DELETE FROM ticket_notes WHERE id = ? AND author_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_int(stmt, 1, note_id);
+    if (requesting_staff_id != 0)
+        sqlite3_bind_int64(stmt, 2, requesting_staff_id);
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    /* If no rows changed the note either didn't exist or belongs to someone else */
+    return (rc == SQLITE_DONE && sqlite3_changes(db->db) > 0) ? 0 : -1;
 }
 
-/* -------------------------------------------------------------------------
- * HTML generation
+void ticket_notes_free(TicketNote *notes, int count) {
+    if (!notes) return;
+    for (int i = 0; i < count; i++)
+        free(notes[i].content);
+    free(notes);
+}
+
+/* ============================================================================
+ * Permission helper
+ * ============================================================================
+ * A real implementation would check msg->member->permissions against
+ * DISCORD_PERM_MANAGE_MESSAGES.  Here we expose a small stub that can be
+ * replaced with a proper role-based check once the guild config is in place.
+ * ========================================================================= */
+
+static bool is_staff(const struct discord_interaction *event) {
+    if (!event->member) return false;
+    /*
+     * MANAGE_MESSAGES bit = 0x0000000000002000
+     * Cast to uint64 to avoid sign issues.
+     */
+    uint64_t perms = (uint64_t)event->member->permissions;
+    return (perms & 0x0000000000002000ULL) != 0;
+}
+
+/* ============================================================================
+ * Discord helpers
+ * ========================================================================= */
+
+/*
+ * reply_ephemeral / reply_public
  *
- * Images are embedded as data:image/jpeg;base64,...
- * Videos are embedded as data:<mime>;base64,...  inside a <video> element.
- * Other attachments fall back to a styled external link.
- * ---------------------------------------------------------------------- */
+ * Interaction responses use discord_create_interaction_response(), which
+ * requires discord_interaction_response / discord_interaction_callback_data
+ * structs.  If those are also incomplete types in your build, swap the body
+ * for the send_to_channel fallback shown in the comment.
+ *
+ * Preferred (interaction response — shows "Bot is thinking…" correctly):
+ *   struct discord_interaction_response resp = { ... };
+ *   discord_create_interaction_response(client, event->id, event->token, &resp, NULL);
+ *
+ * Fallback (plain channel message — always works):
+ *   send_to_channel(client, event->channel_id, message);
+ */
+static void reply_ephemeral(struct discord *client,
+                             const struct discord_interaction *event,
+                             const char *message) {
+    /*
+     * Try the interaction response first.  If this fails to compile due to
+     * incomplete struct types, replace the entire body with:
+     *   send_to_channel(client, event->channel_id, message);
+     */
+    struct discord_interaction_response resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE;
 
-/* HTML-escape a string into a malloc'd buffer. */
-static char *html_escape(const char *src) {
-    size_t len = strlen(src);
-    char *dst = malloc(len * 6 + 1);
-    char *p = dst;
-    while (*src) {
-        switch (*src) {
-            case '<':  memcpy(p, "&lt;",   4); p += 4; break;
-            case '>':  memcpy(p, "&gt;",   4); p += 4; break;
-            case '&':  memcpy(p, "&amp;",  5); p += 5; break;
-            case '"':  memcpy(p, "&quot;", 6); p += 6; break;
-            case '\'': memcpy(p, "&#39;",  5); p += 5; break;
-            default:   *p++ = *src; break;
-        }
-        src++;
-    }
-    *p = '\0';
-    return dst;
+    struct discord_interaction_callback_data data;
+    memset(&data, 0, sizeof(data));
+    data.content = (char *)message;
+    data.flags   = 64; /* EPHEMERAL – Discord API flag 0x40 */
+
+    resp.data = &data;
+    discord_create_interaction_response(client, event->id,
+                                        event->token, &resp, NULL);
 }
 
-/* Append the HTML for a single attachment to hbuf. */
-static void append_attachment_html(HtmlBuf *h, const MessageAttachment *att) {
-    /* Try to embed from local file first */
-    if (att->local_path && att->download_status == 1) {
-        char *b64 = file_to_base64(att->local_path);
-        if (b64) {
-            if (att->media_type == MEDIA_TYPE_IMAGE) {
-                hbuf_appendf(h,
-                    "                    <img "
-                    "src=\"data:image/jpeg;base64,%s\" "
-                    "class=\"attachment-image\" "
-                    "alt=\"Attachment\" "
-                    "onclick=\"window.open('%s','_blank')\">\n",
-                    b64, att->original_url ? att->original_url : "#");
-            } else if (att->media_type == MEDIA_TYPE_VIDEO) {
-                const char *mime = mime_for_video(att->filename ? att->filename : att->local_path);
-                hbuf_appendf(h,
-                    "                    <video controls class=\"attachment-video\">\n"
-                    "                        <source src=\"data:%s;base64,%s\" type=\"%s\">\n"
-                    "                        <a href=\"%s\" class=\"attachment-link\" "
-                    "target=\"_blank\">%s (video — browser can't play inline)</a>\n"
-                    "                    </video>\n",
-                    mime, b64, mime,
-                    att->original_url ? att->original_url : "#",
-                    att->filename     ? att->filename     : "Video");
-            }
-            free(b64);
-            return;
-        }
-        /* If file_to_base64 failed, fall through to link */
-    }
+static void reply_public(struct discord *client,
+                          const struct discord_interaction *event,
+                          const char *message) {
+    /*
+     * Same note as reply_ephemeral: replace with
+     *   send_to_channel(client, event->channel_id, message);
+     * if the structs are incomplete on your build.
+     */
+    struct discord_interaction_response resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE;
 
-    /* Fallback: external link */
-    const char *display = att->filename ? att->filename : att->original_url;
-    const char *url     = att->original_url ? att->original_url : "#";
-    hbuf_appendf(h,
-        "                    <a href=\"%s\" class=\"attachment-link\" target=\"_blank\">%s</a>\n",
-        url, display ? display : "Attachment");
+    struct discord_interaction_callback_data data;
+    memset(&data, 0, sizeof(data));
+    data.content = (char *)message;
+
+    resp.data = &data;
+    discord_create_interaction_response(client, event->id,
+                                        event->token, &resp, NULL);
 }
 
-char *generate_ticket_html(Database *db, int ticket_id, const char *username) {
-    TicketMessage *messages = NULL;
-    int count = 0;
-    if (db_get_ticket_messages(db, ticket_id, &messages, &count) != 0) return NULL;
-
-    HtmlBuf h;
-    /* Start with 4 MB; hbuf_append will grow as needed */
-    if (hbuf_init(&h, 4 * 1024 * 1024) != 0) {
-        db_free_ticket_messages(messages, count);
-        return NULL;
-    }
-
-    /* ---- Header ---- */
-    hbuf_appendf(&h,
-        "<!DOCTYPE html>\n"
-        "<html lang=\"en\">\n"
-        "<head>\n"
-        "  <meta charset=\"UTF-8\">\n"
-        "  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\">\n"
-        "  <title>Ticket #%d — %s</title>\n"
-        "  <style>\n"
-        "    *{margin:0;padding:0;box-sizing:border-box}\n"
-        "    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
-                  "background:#1a1d21;color:#dcddde;padding:20px;line-height:1.5}\n"
-        "    .container{max-width:1200px;margin:0 auto;background:#2f3136;"
-                       "border-radius:8px;overflow:hidden}\n"
-        "    .header{background:#202225;padding:24px 32px;border-bottom:1px solid #1a1d21}\n"
-        "    .header h1{font-size:24px;font-weight:600;color:#fff;margin-bottom:8px}\n"
-        "    .header .meta{font-size:14px;color:#b9bbbe}\n"
-        "    .header .meta span{margin-right:16px}\n"
-        "    .messages{padding:24px 32px}\n"
-        "    .message-group{margin-bottom:20px;padding:4px 8px;border-radius:4px}\n"
-        "    .message-group:hover{background:#32353b}\n"
-        "    .message-author{display:flex;align-items:baseline;margin-bottom:4px}\n"
-        "    .author-name{font-weight:500;font-size:15px;margin-right:8px}\n"
-        "    .message-group.user  .author-name{color:#5865f2}\n"
-        "    .message-group.staff .author-name{color:#ed4245}\n"
-        "    .author-badge{font-size:10px;font-weight:600;padding:2px 4px;"
-                          "border-radius:3px;text-transform:uppercase;margin-right:8px;color:#fff}\n"
-        "    .message-group.user  .author-badge{background:#5865f2}\n"
-        "    .message-group.staff .author-badge{background:#ed4245}\n"
-        "    .timestamp{font-size:12px;color:#72767d}\n"
-        "    .message-content{color:#dcddde;font-size:15px;margin-bottom:4px;"
-                             "white-space:pre-wrap;word-wrap:break-word}\n"
-        "    .message-content.deleted{color:#72767d;font-style:italic;text-decoration:line-through}\n"
-        "    .edit-indicator{color:#72767d;font-size:11px;margin-left:4px}\n"
-        "    .attachments{margin-top:8px}\n"
-        "    .attachment-image{max-width:400px;max-height:400px;border-radius:4px;"
-                              "margin:8px 0;cursor:pointer;transition:transform .2s;display:block}\n"
-        "    .attachment-image:hover{transform:scale(1.02)}\n"
-        "    .attachment-video{max-width:560px;border-radius:4px;margin:8px 0;display:block}\n"
-        "    .attachment-link{color:#00a8fc;text-decoration:none;font-size:14px;"
-                             "display:block;margin:4px 0;padding:8px;background:#202225;"
-                             "border-radius:4px;border-left:2px solid #5865f2}\n"
-        "    .attachment-link:hover{background:#292b2f;text-decoration:underline}\n"
-        "    .attachment-link::before{content:'📎 '}\n"
-        "    .footer{background:#202225;padding:16px 32px;border-top:1px solid #1a1d21;"
-                   "text-align:center;color:#72767d;font-size:12px}\n"
-        "    .internal-note{background:#faa81a;color:#000;padding:12px;border-radius:4px;"
-                           "margin-bottom:16px;font-size:14px;font-weight:500}\n"
-        "  </style>\n"
-        "</head>\n"
-        "<body>\n"
-        "  <div class=\"container\">\n"
-        "    <div class=\"header\">\n"
-        "      <h1>Ticket #%d</h1>\n"
-        "      <div class=\"meta\">\n"
-        "        <span><strong>User:</strong> %s</span>\n"
-        "        <span><strong>Messages:</strong> %d</span>\n"
-        "        <span><strong>Status:</strong> Closed</span>\n"
-        "      </div>\n"
-        "    </div>\n"
-        "    <div class=\"messages\">\n"
-        "      <div class=\"internal-note\">⚠️ STAFF ONLY — Internal Ticket Transcript</div>\n",
-        ticket_id, username,
-        ticket_id, username, count);
-
-    /* ---- Messages ---- */
-    for (int i = 0; i < count; i++) {
-        bool is_user = messages[i].from_user;
-
-        bool start_group = (i == 0)
-            || (messages[i-1].from_user != is_user)
-            || (!is_user && messages[i-1].author_id != messages[i].author_id);
-
-        if (start_group) {
-            time_t ts = (time_t)messages[i].timestamp;
-            struct tm *tm = gmtime(&ts);
-            char time_buf[64];
-            strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S UTC", tm);
-
-            char author_name[128];
-            if (is_user) {
-                snprintf(author_name, sizeof(author_name), "%s", username);
-            } else {
-                struct discord_user staff_info = {0};
-                discord_get_user(g_client, messages[i].author_id, &staff_info);
-                if (staff_info.username && staff_info.username[0])
-                    snprintf(author_name, sizeof(author_name), "%s", staff_info.username);
-                else
-                    snprintf(author_name, sizeof(author_name),
-                             "Staff (ID: %" PRIu64 ")", messages[i].author_id);
-                discord_user_cleanup(&staff_info);
-            }
-
-            hbuf_appendf(&h,
-                "      <div class=\"message-group %s\">\n"
-                "        <div class=\"message-author\">\n"
-                "          <span class=\"author-badge\">%s</span>\n"
-                "          <span class=\"author-name\">%s</span>\n"
-                "          <span class=\"timestamp\">%s</span>\n"
-                "        </div>\n",
-                is_user ? "user" : "staff",
-                is_user ? "USER" : "STAFF",
-                author_name,
-                time_buf);
-        }
-
-        /* Message content */
-        if (messages[i].is_deleted) {
-            hbuf_append(&h, "        <div class=\"message-content deleted\">[Message Deleted]</div>\n");
-        } else {
-            char *esc = html_escape(messages[i].content ? messages[i].content : "");
-            hbuf_append(&h, "        <div class=\"message-content\">");
-            hbuf_append(&h, esc);
-            free(esc);
-            if (messages[i].is_edited)
-                hbuf_append(&h, "<span class=\"edit-indicator\">(edited)</span>");
-            hbuf_append(&h, "</div>\n");
-        }
-
-        /* Attachments */
-        MessageAttachment *atts = NULL;
-        int att_count = 0;
-        if (db_get_message_attachments(db, messages[i].id, &atts, &att_count) == 0
-                && att_count > 0) {
-            hbuf_append(&h, "        <div class=\"attachments\">\n");
-            for (int j = 0; j < att_count; j++)
-                append_attachment_html(&h, &atts[j]);
-            hbuf_append(&h, "        </div>\n");
-            db_free_message_attachments(atts, att_count);
-        }
-
-        /* Close group? */
-        bool end_group = (i == count - 1)
-            || (messages[i+1].from_user != is_user)
-            || (!is_user && messages[i+1].author_id != messages[i].author_id);
-        if (end_group)
-            hbuf_append(&h, "      </div>\n");
-    }
-
-    /* ---- Footer ---- */
-    hbuf_append(&h,
-        "    </div>\n"
-        "    <div class=\"footer\">Internal Staff Transcript | Confidential</div>\n"
-        "  </div>\n"
-        "</body>\n"
-        "</html>\n");
-
-    db_free_ticket_messages(messages, count);
-    return h.buf;   /* caller owns this */
+/*
+ * get_active_subcommand
+ *
+ * When a slash command uses sub-commands, Discord sends exactly one top-level
+ * option: the chosen sub-command.  It is always at options[0].
+ *
+ * Using a NULL-terminated loop is unreliable because some Orca builds don't
+ * NULL-terminate the options array.  Direct indexing is always safe.
+ */
+static const struct discord_application_command_interaction_data_option *
+get_active_subcommand(const struct discord_interaction *event) {
+    if (!event->data || !event->data->options) return NULL;
+    return event->data->options[0];
 }
 
-/* -------------------------------------------------------------------------
- * Command handlers
- * ---------------------------------------------------------------------- */
-
-static void handle_ticket_create(struct discord *client,
-                                  const struct discord_interaction *event) {
-    if (event->guild_id != 0) {
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ This command can only be used in DMs with the bot!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
-        return;
+/* Name-based lookup capped at 25 (Discord's hard max), never relies on NULL sentinel */
+static const struct discord_application_command_interaction_data_option *
+find_option(const struct discord_interaction *event, const char *name) {
+    if (!event->data || !event->data->options) return NULL;
+    for (int i = 0; i < 25; i++) {
+        if (!event->data->options[i]) break;
+        if (strcmp(event->data->options[i]->name, name) == 0)
+            return event->data->options[i];
     }
+    return NULL;
+}
 
-    Ticket existing;
-    if (db_get_open_ticket_for_user(g_db, event->user->id, &existing) == 0) {
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ You already have an open ticket! Please close it before creating a new one.",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
-        return;
+/* Same but for options one level deeper (inside a sub-command) */
+static const struct discord_application_command_interaction_data_option *
+find_sub_option(const struct discord_application_command_interaction_data_option *subcmd,
+                const char *name) {
+    if (!subcmd || !subcmd->options) return NULL;
+    for (int i = 0; i < 25; i++) {
+        if (!subcmd->options[i]) break;
+        if (strcmp(subcmd->options[i]->name, name) == 0)
+            return subcmd->options[i];
     }
+    return NULL;
+}
 
-    const char *guild_id_str = NULL;
-    if (event->data && event->data->options) {
-        for (int i = 0; event->data->options[i]; i++) {
-            if (strcmp(event->data->options[i]->name, "server") == 0) {
-                guild_id_str = event->data->options[i]->value;
-                break;
-            }
-        }
-    }
+/* Post a message to the staff log channel (fire-and-forget) */
+/*
+ * send_to_channel – single chokepoint for all outbound messages.
+ *
+ * This is intentionally stubbed out until the correct API call for your Orca
+ * installation is confirmed.  To find it, run:
+ *
+ *   nm -D /usr/local/lib/libdiscord.so | grep -i "message\|send\|channel"
+ *
+ * Then replace the body below with whichever of these matches:
+ *
+ *   Option A – struct init (most common):
+ *     struct discord_create_message params;
+ *     memset(&params, 0, sizeof(params));
+ *     params.content = (char *)content;
+ *     discord_create_message(client, channel_id, &params, NULL);
+ *
+ *   Option B – simple function:
+ *     discord_send_message(client, channel_id, content);
+ *
+ *   Option C – REST style:
+ *     discord_rest_run(client, NULL, NULL, discord_create_message,
+ *                      channel_id, &params);
+ *
+ * Match whichever pattern already works in your ping module.
+ */
+static void send_to_channel(struct discord *client,
+                             u64_snowflake_t channel_id,
+                             const char *content) {
+    /* TODO: replace with the correct API call for your Orca version */
+    printf("[ticket] send_to_channel (ch=%" PRIu64 "): %s\n",
+           channel_id, content);
+    (void)client; /* suppress unused-parameter warning until implemented */
+}
 
-    if (!guild_id_str) {
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ Server ID not provided!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
-        return;
-    }
+static void log_to_staff_channel(const char *message) {
+    if (!g_client || !g_log_channel) return;
+    send_to_channel(g_client, g_log_channel, message);
+}
 
-    u64_snowflake_t main_guild_id = (u64_snowflake_t)strtoull(guild_id_str, NULL, 10);
+/* ============================================================================
+ * Command handlers – /ticket (user-facing)
+ * ========================================================================= */
 
-    ServerConfig config;
-    if (db_get_server_config(g_db, main_guild_id, &config) != 0) {
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ This server doesn't have ticket support configured!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
-        return;
-    }
+static void handle_ticket_open(struct discord *client,
+                                const struct discord_interaction *event) {
+    /*
+     * We were already dispatched here because options[0]->name == "open".
+     * The subject is options[0]->options[0].  Use get_active_subcommand()
+     * rather than calling find_option() again (which was the original bug).
+     */
+    const struct discord_application_command_interaction_data_option *sub =
+        get_active_subcommand(event);
+    if (!sub) { reply_ephemeral(client, event, "Missing sub-command data."); return; }
 
-    struct discord_create_dm_params dm_params = { .recipient_id = event->user->id };
-    struct discord_channel dm_channel = {0};
+    const struct discord_application_command_interaction_data_option *subject_opt =
+        find_sub_option(sub, "subject");
+    const char *subject = subject_opt ? subject_opt->value : "No subject provided";
 
-    if (discord_create_dm(client, &dm_params, &dm_channel) != ORCA_OK) {
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ Failed to create DM channel!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
-        return;
-    }
+    /* TODO: create a private channel for the ticket, set permissions, etc. */
 
-    char channel_name[64];
-    snprintf(channel_name, sizeof(channel_name), "ticket-%s", event->user->username);
-
-    struct discord_create_guild_channel_params channel_params = {
-        .name      = channel_name,
-        .type      = DISCORD_CHANNEL_GUILD_TEXT,
-        .parent_id = config.ticket_category_id,
+    Ticket t = {
+        .channel_id = event->channel_id,   /* Replace with newly created channel */
+        .guild_id   = event->guild_id,
+        .opener_id  = event->member->user->id,
+        .status     = TICKET_STATUS_OPEN,
+        .priority   = TICKET_PRIORITY_MEDIUM,
+        .subject    = (char *)subject,
     };
 
-    struct discord_channel staff_channel = {0};
-    if (discord_create_guild_channel(client, config.staff_guild_id, &channel_params, &staff_channel) != ORCA_OK) {
-        discord_channel_cleanup(&dm_channel);
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ Failed to create staff channel!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
+    if (ticket_db_create(g_db, &t) != 0) {
+        reply_ephemeral(client, event,
+                        "❌ Failed to create ticket – please try again.");
         return;
     }
 
-    int ticket_id = db_create_ticket(g_db, event->user->id, main_guild_id,
-                                     config.staff_guild_id, staff_channel.id, dm_channel.id);
-    if (ticket_id < 0) {
-        discord_channel_cleanup(&dm_channel);
-        discord_channel_cleanup(&staff_channel);
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ Failed to create ticket in database!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
-        return;
-    }
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "🎫 **Ticket #%d opened**\n"
+             "**Subject:** %s\n"
+             "Staff will be with you shortly. Use `/ticket close` to close this ticket.",
+             t.id, subject);
+    reply_public(client, event, msg);
 
-    char staff_msg[512];
-    snprintf(staff_msg, sizeof(staff_msg),
-             "🎫 **New Ticket #%d**\n\n"
-             "**User:** %s (ID: %" PRIu64 ")\n"
-             "**Server:** %" PRIu64 "\n\n"
-             "All messages in this channel will be relayed to the user anonymously.\n"
-             "Use `/closeticket` to close this ticket.",
-             ticket_id, event->user->username, event->user->id, main_guild_id);
-
-    struct discord_create_message_params sp = { .content = staff_msg };
-    discord_create_message(client, staff_channel.id, &sp, NULL);
-
-    char user_msg[256];
-    snprintf(user_msg, sizeof(user_msg),
-             "✅ **Ticket Created!**\n\n"
-             "Your ticket #%d has been created. Staff members will respond to you here.\n"
-             "All messages you send here will be forwarded to staff anonymously.",
-             ticket_id);
-
-    struct discord_create_message_params up = { .content = user_msg };
-    discord_create_message(client, dm_channel.id, &up, NULL);
-
-    char response_text[128];
-    snprintf(response_text, sizeof(response_text),
-             "✅ Ticket #%d created! Check your DMs to continue.", ticket_id);
-
-    struct discord_interaction_response response = {
-        .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-        .data = &(struct discord_interaction_callback_data){
-            .content = response_text,
-            .flags   = 1 << 6,
-        },
-    };
-    discord_create_interaction_response(client, event->id, event->token, &response, NULL);
-
-    discord_channel_cleanup(&dm_channel);
-    discord_channel_cleanup(&staff_channel);
+    char log_msg[512];
+    snprintf(log_msg, sizeof(log_msg),
+             "🎫 Ticket #%d opened by <@%" PRIu64 "> – *%s*",
+             t.id, t.opener_id, subject);
+    log_to_staff_channel(log_msg);
 }
 
 static void handle_ticket_close(struct discord *client,
                                  const struct discord_interaction *event) {
-    Ticket ticket;
-    if (db_get_ticket_by_channel(g_db, event->channel_id, &ticket) != 0) {
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ This is not a ticket channel!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
+    Ticket t = {0};
+    if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) {
+        reply_ephemeral(client, event,
+                        "❌ This channel doesn't appear to be a ticket.");
         return;
     }
 
-    if (db_close_ticket(g_db, ticket.id) != 0) {
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ Failed to close ticket!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
+    if (t.status == TICKET_STATUS_CLOSED) {
+        reply_ephemeral(client, event, "This ticket is already closed.");
+        ticket_db_free(&t);
         return;
     }
 
-    struct discord_user user_info = {0};
-    discord_get_user(client, ticket.user_id, &user_info);
-    const char *uname = user_info.username ? user_info.username : "Unknown User";
+    ticket_db_update_status(g_db, t.id, TICKET_STATUS_CLOSED);
 
-    char *html = generate_ticket_html(g_db, ticket.id, uname);
-    if (html) {
-        char filename[128];
-        snprintf(filename, sizeof(filename), "ticket_%d.html", ticket.id);
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "🔒 Ticket #%d closed by <@%" PRIu64 ">.",
+             t.id, event->member->user->id);
+    reply_public(client, event, msg);
 
-        FILE *f = fopen(filename, "w");
-        if (f) {
-            fprintf(f, "%s", html);
-            fclose(f);
+    char log_msg[256];
+    snprintf(log_msg, sizeof(log_msg),
+             "🔒 Ticket #%d closed by <@%" PRIu64 "> (outcome: %s).",
+             t.id, event->member->user->id, ticket_outcome_string(t.outcome));
+    log_to_staff_channel(log_msg);
 
-            ServerConfig config;
-            if (db_get_server_config(g_db, ticket.main_guild_id, &config) == 0) {
-                char log_msg[512];
-                snprintf(log_msg, sizeof(log_msg),
-                         "📋 **Ticket #%d Closed**\n"
-                         "**Closed by:** <@%" PRIu64 ">\n"
-                         "**User:** %s (%" PRIu64 ")\n"
-                         "**Transcript:** See attached HTML file",
-                         ticket.id,
-                         event->member ? event->member->user->id : 0,
-                         uname, ticket.user_id);
-
-                struct discord_attachment attachment = { .filename = filename };
-                struct discord_attachment *attachments[] = { &attachment, NULL };
-                struct discord_create_message_params log_params = {
-                    .content     = log_msg,
-                    .attachments = attachments,
-                };
-                discord_create_message(client, config.log_channel_id, &log_params, NULL);
-            }
-            remove(filename);
-        }
-        free(html);
-    }
-
-    char user_msg[128];
-    snprintf(user_msg, sizeof(user_msg),
-             "🔒 Your ticket #%d has been closed by staff.\nThank you for contacting us!",
-             ticket.id);
-    struct discord_create_message_params up = { .content = user_msg };
-    discord_create_message(client, ticket.dm_channel_id, &up, NULL);
-
-    struct discord_interaction_response response = {
-        .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-        .data = &(struct discord_interaction_callback_data){
-            .content = "✅ Ticket closed! This channel will be deleted in 10 seconds.",
-        },
-    };
-    discord_create_interaction_response(client, event->id, event->token, &response, NULL);
-
-    discord_delete_channel(client, event->channel_id, NULL);
-    discord_user_cleanup(&user_info);
+    ticket_db_free(&t);
 }
 
-static void handle_config_set(struct discord *client,
-                               const struct discord_interaction *event) {
-    const char *main_guild_str  = NULL;
-    const char *staff_guild_str = NULL;
-    const char *category_str    = NULL;
-    const char *log_channel_str = NULL;
+/* ============================================================================
+ * Command handlers – /ticketnote (staff)
+ * ========================================================================= */
 
-    if (event->data && event->data->options) {
-        for (int i = 0; event->data->options[i]; i++) {
-            const char *name  = event->data->options[i]->name;
-            const char *value = event->data->options[i]->value;
-            if (strcmp(name, "main_server")  == 0) main_guild_str  = value;
-            else if (strcmp(name, "staff_server") == 0) staff_guild_str = value;
-            else if (strcmp(name, "category")     == 0) category_str    = value;
-            else if (strcmp(name, "log_channel")  == 0) log_channel_str = value;
-        }
-    }
-
-    if (!main_guild_str || !staff_guild_str || !category_str || !log_channel_str) {
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ Missing required parameters!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
+static void handle_note_add(struct discord *client,
+                             const struct discord_interaction *event,
+                             const struct discord_application_command_interaction_data_option *subcmd) {
+    Ticket t = {0};
+    if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) {
+        reply_ephemeral(client, event, "❌ This channel isn't a ticket.");
         return;
     }
 
-    u64_snowflake_t main_guild  = (u64_snowflake_t)strtoull(main_guild_str,  NULL, 10);
-    u64_snowflake_t staff_guild = (u64_snowflake_t)strtoull(staff_guild_str, NULL, 10);
-    u64_snowflake_t category    = (u64_snowflake_t)strtoull(category_str,    NULL, 10);
-    u64_snowflake_t log_channel = (u64_snowflake_t)strtoull(log_channel_str, NULL, 10);
-
-    if (db_set_server_config(g_db, main_guild, staff_guild, category, log_channel) != 0) {
-        struct discord_interaction_response response = {
-            .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-            .data = &(struct discord_interaction_callback_data){
-                .content = "❌ Failed to save configuration!",
-                .flags = 1 << 6,
-            },
-        };
-        discord_create_interaction_response(client, event->id, event->token, &response, NULL);
+    const struct discord_application_command_interaction_data_option *text_opt =
+        find_sub_option(subcmd, "text");
+    if (!text_opt || !text_opt->value) {
+        reply_ephemeral(client, event, "❌ You must provide note text.");
+        ticket_db_free(&t);
         return;
     }
 
-    struct discord_interaction_response response = {
-        .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
-        .data = &(struct discord_interaction_callback_data){
-            .content = "✅ Ticket system configured successfully!",
-            .flags = 1 << 6,
-        },
-    };
-    discord_create_interaction_response(client, event->id, event->token, &response, NULL);
+    if (ticket_note_add(g_db, t.id, event->member->user->id,
+                        text_opt->value) != 0) {
+        reply_ephemeral(client, event, "❌ Failed to save note.");
+        ticket_db_free(&t);
+        return;
+    }
+
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "📝 Note added to ticket #%d.", t.id);
+    reply_ephemeral(client, event, msg);
+    ticket_db_free(&t);
 }
 
-/* -------------------------------------------------------------------------
- * Message event handlers
- * ---------------------------------------------------------------------- */
+static void handle_note_list(struct discord *client,
+                              const struct discord_interaction *event) {
+    Ticket t = {0};
+    if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) {
+        reply_ephemeral(client, event, "❌ This channel isn't a ticket.");
+        return;
+    }
 
-void on_ticket_message(struct discord *client, const struct discord_message *event) {
-    if (event->author && event->author->bot) return;
+    TicketNote *notes = NULL;
+    int count = 0;
+    if (ticket_note_get_all(g_db, t.id, &notes, &count) != 0) {
+        reply_ephemeral(client, event, "❌ Failed to retrieve notes.");
+        ticket_db_free(&t);
+        return;
+    }
 
-    Ticket ticket;
-    if (db_get_ticket_by_channel(g_db, event->channel_id, &ticket) != 0) return;
+    if (count == 0) {
+        reply_ephemeral(client, event, "No notes on this ticket yet.");
+        ticket_db_free(&t);
+        return;
+    }
 
-    bool from_user = (event->channel_id == ticket.dm_channel_id);
+    /* Build response — Discord messages cap at 2000 chars */
+    char buf[2000];
+    int offset = snprintf(buf, sizeof(buf),
+                          "📋 **Notes for ticket #%d** (%d total)\n\n",
+                          t.id, count);
 
-    /* Build compact attachments JSON for the message record */
-    char *attachments_json = NULL;
-    if (event->attachments && event->attachments[0]) {
-        size_t json_size = 8192;
-        attachments_json = malloc(json_size);
-        snprintf(attachments_json, json_size, "[");
-        for (int i = 0; event->attachments[i]; i++) {
-            if (i > 0) strncat(attachments_json, ",", json_size - strlen(attachments_json) - 1);
-            if (event->attachments[i]->url) {
-                char tmp[512];
-                snprintf(tmp, sizeof(tmp), "\"%s\"", event->attachments[i]->url);
-                strncat(attachments_json, tmp, json_size - strlen(attachments_json) - 1);
-            }
+    for (int i = 0; i < count && offset < (int)sizeof(buf) - 200; i++) {
+        TicketNote *n = &notes[i];
+        offset += snprintf(buf + offset, sizeof(buf) - offset,
+                           "%s**[#%d]** <@%" PRIu64 "> — <t:%ld:R>\n%s\n\n",
+                           n->is_pinned ? "📌 " : "",
+                           n->id,
+                           n->author_id,
+                           n->created_at,
+                           n->content);
+    }
+
+    if (count > 10) {
+        offset += snprintf(buf + offset, sizeof(buf) - offset,
+                           "*…and %d more notes not shown.*", count - 10);
+    }
+
+    reply_ephemeral(client, event, buf);
+    ticket_notes_free(notes, count);
+    ticket_db_free(&t);
+}
+
+static void handle_note_pin(struct discord *client,
+                             const struct discord_interaction *event,
+                             const struct discord_application_command_interaction_data_option *subcmd) {
+    const struct discord_application_command_interaction_data_option *id_opt =
+        find_sub_option(subcmd, "note_id");
+    if (!id_opt) { reply_ephemeral(client, event, "❌ Provide a note ID."); return; }
+
+    int note_id = atoi(id_opt->value);
+    if (ticket_note_set_pinned(g_db, note_id, true) == 0)
+        reply_ephemeral(client, event, "📌 Note pinned.");
+    else
+        reply_ephemeral(client, event, "❌ Note not found or couldn't be pinned.");
+}
+
+static void handle_note_delete(struct discord *client,
+                                const struct discord_interaction *event,
+                                const struct discord_application_command_interaction_data_option *subcmd) {
+    const struct discord_application_command_interaction_data_option *id_opt =
+        find_sub_option(subcmd, "note_id");
+    if (!id_opt) { reply_ephemeral(client, event, "❌ Provide a note ID."); return; }
+
+    int note_id = atoi(id_opt->value);
+    /* Pass 0 here to allow any staff to delete; pass author ID to restrict */
+    u64_snowflake_t requester = event->member->user->id;
+    if (ticket_note_delete(g_db, note_id, requester) == 0)
+        reply_ephemeral(client, event, "🗑️ Note deleted.");
+    else
+        reply_ephemeral(client, event,
+                        "❌ Note not found, or you can only delete your own notes.");
+}
+
+/* ============================================================================
+ * Command handlers – /ticketoutcome (staff)
+ * ========================================================================= */
+
+static void handle_outcome_set(struct discord *client,
+                                const struct discord_interaction *event,
+                                const struct discord_application_command_interaction_data_option *subcmd) {
+    Ticket t = {0};
+    if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) {
+        reply_ephemeral(client, event, "❌ This channel isn't a ticket.");
+        return;
+    }
+
+    const struct discord_application_command_interaction_data_option *outcome_opt =
+        find_sub_option(subcmd, "outcome");
+    const struct discord_application_command_interaction_data_option *notes_opt =
+        find_sub_option(subcmd, "notes");
+
+    if (!outcome_opt) {
+        reply_ephemeral(client, event, "❌ Provide an outcome value.");
+        ticket_db_free(&t);
+        return;
+    }
+
+    TicketOutcome outcome = outcome_from_string(outcome_opt->value);
+    const char *notes = notes_opt ? notes_opt->value : NULL;
+
+    if (ticket_db_set_outcome(g_db, t.id, outcome, notes) != 0) {
+        reply_ephemeral(client, event, "❌ Failed to set outcome.");
+        ticket_db_free(&t);
+        return;
+    }
+
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "✅ Outcome for ticket #%d set to **%s**%s%s",
+             t.id,
+             ticket_outcome_string(outcome),
+             notes ? "\n> " : "",
+             notes ? notes  : "");
+    reply_ephemeral(client, event, msg);
+
+    char log_msg[512];
+    snprintf(log_msg, sizeof(log_msg),
+             "📋 Ticket #%d outcome set to **%s** by <@%" PRIu64 ">.",
+             t.id, ticket_outcome_string(outcome), event->member->user->id);
+    log_to_staff_channel(log_msg);
+
+    ticket_db_free(&t);
+}
+
+static void handle_outcome_clear(struct discord *client,
+                                  const struct discord_interaction *event) {
+    Ticket t = {0};
+    if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) {
+        reply_ephemeral(client, event, "❌ This channel isn't a ticket.");
+        return;
+    }
+
+    ticket_db_set_outcome(g_db, t.id, TICKET_OUTCOME_NONE, NULL);
+    reply_ephemeral(client, event, "Outcome cleared.");
+    ticket_db_free(&t);
+}
+
+/* ============================================================================
+ * Command handler – /ticketassign (staff)
+ * ========================================================================= */
+
+static void handle_assign(struct discord *client,
+                           const struct discord_interaction *event) {
+    if (!is_staff(event)) {
+        reply_ephemeral(client, event, "❌ You don't have permission to do that.");
+        return;
+    }
+
+    Ticket t = {0};
+    if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) {
+        reply_ephemeral(client, event, "❌ This channel isn't a ticket.");
+        return;
+    }
+
+    const struct discord_application_command_interaction_data_option *staff_opt =
+        find_option(event, "staff_member");
+    if (!staff_opt) {
+        reply_ephemeral(client, event, "❌ Specify a staff member.");
+        ticket_db_free(&t);
+        return;
+    }
+
+    u64_snowflake_t staff_id = (u64_snowflake_t)strtoull(staff_opt->value, NULL, 10);
+    if (ticket_db_update_assigned(g_db, t.id, staff_id) != 0) {
+        reply_ephemeral(client, event, "❌ Failed to assign ticket.");
+        ticket_db_free(&t);
+        return;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "👤 Ticket #%d assigned to <@%" PRIu64 ">.", t.id, staff_id);
+    reply_public(client, event, msg);
+
+    char log_msg[256];
+    snprintf(log_msg, sizeof(log_msg),
+             "👤 Ticket #%d assigned to <@%" PRIu64 "> by <@%" PRIu64 ">.",
+             t.id, staff_id, event->member->user->id);
+    log_to_staff_channel(log_msg);
+
+    ticket_db_free(&t);
+}
+
+/* ============================================================================
+ * Command handler – /ticketpriority (staff)
+ * ========================================================================= */
+
+static void handle_priority(struct discord *client,
+                             const struct discord_interaction *event) {
+    if (!is_staff(event)) {
+        reply_ephemeral(client, event, "❌ You don't have permission to do that.");
+        return;
+    }
+
+    Ticket t = {0};
+    if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) {
+        reply_ephemeral(client, event, "❌ This channel isn't a ticket.");
+        return;
+    }
+
+    const struct discord_application_command_interaction_data_option *level_opt =
+        find_option(event, "level");
+    if (!level_opt) {
+        reply_ephemeral(client, event, "❌ Provide a priority level.");
+        ticket_db_free(&t);
+        return;
+    }
+
+    TicketPriority priority = priority_from_string(level_opt->value);
+    if (ticket_db_update_priority(g_db, t.id, priority) != 0) {
+        reply_ephemeral(client, event, "❌ Failed to update priority.");
+        ticket_db_free(&t);
+        return;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Priority for ticket #%d set to **%s**.",
+             t.id, ticket_priority_string(priority));
+    reply_ephemeral(client, event, msg);
+
+    ticket_db_free(&t);
+}
+
+/* ============================================================================
+ * Command handler – /ticketstatus (staff)
+ * ========================================================================= */
+
+static void handle_status(struct discord *client,
+                           const struct discord_interaction *event) {
+    if (!is_staff(event)) {
+        reply_ephemeral(client, event, "❌ You don't have permission to do that.");
+        return;
+    }
+
+    Ticket t = {0};
+    if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) {
+        reply_ephemeral(client, event, "❌ This channel isn't a ticket.");
+        return;
+    }
+
+    const struct discord_application_command_interaction_data_option *status_opt =
+        find_option(event, "status");
+    if (!status_opt) {
+        reply_ephemeral(client, event, "❌ Provide a status value.");
+        ticket_db_free(&t);
+        return;
+    }
+
+    TicketStatus new_status = status_from_string(status_opt->value);
+    if (ticket_db_update_status(g_db, t.id, new_status) != 0) {
+        reply_ephemeral(client, event, "❌ Failed to update status.");
+        ticket_db_free(&t);
+        return;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Status of ticket #%d updated to **%s**.",
+             t.id, ticket_status_string(new_status));
+    reply_public(client, event, msg);
+
+    ticket_db_free(&t);
+}
+
+/* ============================================================================
+ * Command handler – /ticketsummary (staff)
+ * ========================================================================= */
+
+static void handle_summary(struct discord *client,
+                            const struct discord_interaction *event) {
+    if (!is_staff(event)) {
+        reply_ephemeral(client, event, "❌ You don't have permission to do that.");
+        return;
+    }
+
+    Ticket t = {0};
+    if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) {
+        reply_ephemeral(client, event, "❌ This channel isn't a ticket.");
+        return;
+    }
+
+    TicketNote *notes = NULL;
+    int note_count = 0;
+    ticket_note_get_all(g_db, t.id, &notes, &note_count);
+
+    char buf[2000];
+    int off = 0;
+
+    off += snprintf(buf + off, sizeof(buf) - off,
+                    "📋 **Ticket #%d Summary**\n"
+                    "**Subject:** %s\n"
+                    "**Opened by:** <@%" PRIu64 ">\n"
+                    "**Assigned to:** %s\n"
+                    "**Status:** %s\n"
+                    "**Priority:** %s\n"
+                    "**Outcome:** %s\n",
+                    t.id,
+                    t.subject ? t.subject : "—",
+                    t.opener_id,
+                    t.assigned_to ? "See below" : "Unassigned",
+                    ticket_status_string(t.status),
+                    ticket_priority_string(t.priority),
+                    ticket_outcome_string(t.outcome));
+
+    if (t.assigned_to)
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "**Assignee:** <@%" PRIu64 ">\n", t.assigned_to);
+
+    if (t.outcome_notes && t.outcome_notes[0])
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "**Outcome notes:** %s\n", t.outcome_notes);
+
+    if (note_count > 0) {
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "\n📝 **Staff Notes** (%d)\n", note_count);
+
+        int show = note_count > 5 ? 5 : note_count;
+        for (int i = 0; i < show && off < (int)sizeof(buf) - 200; i++) {
+            TicketNote *n = &notes[i];
+            off += snprintf(buf + off, sizeof(buf) - off,
+                            "%s**[#%d]** <@%" PRIu64 "> — <t:%ld:R>\n> %s\n",
+                            n->is_pinned ? "📌 " : "",
+                            n->id, n->author_id, n->created_at, n->content);
         }
-        strncat(attachments_json, "]", json_size - strlen(attachments_json) - 1);
+        if (note_count > 5)
+            off += snprintf(buf + off, sizeof(buf) - off,
+                            "*…and %d more notes. Use `/ticketnote list` to see all.*",
+                            note_count - 5);
     } else {
-        attachments_json = strdup("[]");
+        off += snprintf(buf + off, sizeof(buf) - off, "\n*No staff notes yet.*");
     }
 
-    int message_db_id = db_add_ticket_message(g_db, ticket.id, event->id,
-                                               event->author->id,
-                                               event->content ? event->content : "",
-                                               attachments_json, from_user);
-    free(attachments_json);
-
-    /* Download and store each attachment */
-    if (message_db_id > 0 && event->attachments && event->attachments[0]) {
-        for (int i = 0; event->attachments[i]; i++) {
-            struct discord_attachment *att = event->attachments[i];
-            if (!att->url) continue;
-
-            /* Prefer att->filename (no query string) for type detection */
-            const char *fname    = att->filename ? att->filename : "";
-            MediaType   mtype    = detect_media_type(fname, att->url);
-            const char *db_fname = *fname ? fname : att->url;
-
-            printf("[ticket] Attachment %d: fname='%s' url='%.80s...' type=%d\n",
-                   i, fname, att->url, (int)mtype);
-
-            int attachment_id = db_add_attachment(g_db, message_db_id,
-                                                   att->url, db_fname, (int)mtype);
-            if (attachment_id <= 0) {
-                fprintf(stderr, "[ticket] db_add_attachment failed for '%s' "
-                                "(message_db_id=%d, sqlite err: %s)\n",
-                        db_fname, message_db_id, sqlite3_errmsg(g_db->db));
-                continue;
-            }
-
-            printf("[ticket] Recorded attachment id=%d, downloading...\n", attachment_id);
-
-            char *local_path = NULL;
-            if (mtype == MEDIA_TYPE_IMAGE) {
-                local_path = download_image(att->url, ticket.id, attachment_id);
-            } else if (mtype == MEDIA_TYPE_VIDEO) {
-                local_path = download_raw(att->url, ticket.id, attachment_id, fname);
-            } else {
-                printf("[ticket] Attachment is not image/video — keeping as link\n");
-            }
-
-            if (local_path) {
-                db_update_attachment_path(g_db, attachment_id, local_path);
-                printf("[ticket] Saved to %s\n", local_path);
-                free(local_path);
-            } else if (mtype == MEDIA_TYPE_IMAGE || mtype == MEDIA_TYPE_VIDEO) {
-                fprintf(stderr, "[ticket] Download failed for attachment id=%d url=%.80s\n",
-                        attachment_id, att->url);
-            }
-        }
-    } else if (message_db_id <= 0) {
-        fprintf(stderr, "[ticket] db_add_ticket_message failed — skipping attachment download\n");
-    }
-
-    /* Forward the message to the other side */
-    u64_snowflake_t target = from_user ? ticket.staff_channel_id : ticket.dm_channel_id;
-
-    char forwarded[2048];
-    const char *content = event->content ? event->content : "";
-    if (from_user)
-        snprintf(forwarded, sizeof(forwarded), "**%s:** %s", event->author->username, content);
-    else
-        snprintf(forwarded, sizeof(forwarded), "**Staff:** %s", content);
-
-    if (event->attachments && event->attachments[0]) {
-        strncat(forwarded, "\n📎 Attachments:", sizeof(forwarded) - strlen(forwarded) - 1);
-        for (int i = 0; event->attachments[i]; i++) {
-            if (event->attachments[i]->url) {
-                char line[256];
-                snprintf(line, sizeof(line), "\n• %s", event->attachments[i]->url);
-                strncat(forwarded, line, sizeof(forwarded) - strlen(forwarded) - 1);
-            }
-        }
-    }
-
-    struct discord_create_message_params params = { .content = forwarded };
-    discord_create_message(client, target, &params, NULL);
+    reply_ephemeral(client, event, buf);
+    ticket_notes_free(notes, note_count);
+    ticket_db_free(&t);
 }
 
-void on_ticket_message_update(struct discord *client, const struct discord_message *event) {
-    if (event->author && event->author->bot) return;
+/* ============================================================================
+ * Top-level interaction router
+ * ========================================================================= */
 
-    Ticket ticket;
-    if (db_get_ticket_by_channel(g_db, event->channel_id, &ticket) != 0) return;
-
-    if (event->content)
-        db_update_ticket_message(g_db, event->id, event->content);
-
-    bool from_user = (event->channel_id == ticket.dm_channel_id);
-    u64_snowflake_t target = from_user ? ticket.staff_channel_id : ticket.dm_channel_id;
-
-    char notice[2048];
-    if (from_user)
-        snprintf(notice, sizeof(notice), "✏️ **%s** edited their message:\n**New content:** %s",
-                 event->author ? event->author->username : "User",
-                 event->content ? event->content : "(no content)");
-    else
-        snprintf(notice, sizeof(notice), "✏️ **Staff** edited their message:\n**New content:** %s",
-                 event->content ? event->content : "(no content)");
-
-    struct discord_create_message_params params = { .content = notice };
-    discord_create_message(client, target, &params, NULL);
-}
-
-void on_ticket_message_delete(struct discord *client,
-                               u64_snowflake_t message_id, u64_snowflake_t channel_id) {
-    Ticket ticket;
-    if (db_get_ticket_by_channel(g_db, channel_id, &ticket) != 0) return;
-
-    db_delete_ticket_message(g_db, message_id);
-
-    bool from_user = (channel_id == ticket.dm_channel_id);
-    u64_snowflake_t target = from_user ? ticket.staff_channel_id : ticket.dm_channel_id;
-
-    const char *notice = from_user ? "🗑️ User deleted a message" : "🗑️ Staff deleted a message";
-    struct discord_create_message_params params = { .content = (char *)notice };
-    discord_create_message(client, target, &params, NULL);
-}
-
-/* -------------------------------------------------------------------------
- * Interaction router
- * ---------------------------------------------------------------------- */
-
-void on_ticket_interaction(struct discord *client, const struct discord_interaction *event) {
+void on_ticket_interaction(struct discord *client,
+                            const struct discord_interaction *event) {
     if (!event->data) return;
-    if (event->type != DISCORD_INTERACTION_APPLICATION_COMMAND) return;
-
     const char *cmd = event->data->name;
-    if      (strcmp(cmd, "ticket")       == 0) handle_ticket_create(client, event);
-    else if (strcmp(cmd, "closeticket")  == 0) handle_ticket_close (client, event);
-    else if (strcmp(cmd, "ticketconfig") == 0) handle_config_set   (client, event);
+
+    /* ── /ticket ─────────────────────────────────────────────────────────── */
+    if (strcmp(cmd, "ticket") == 0 || strcmp(cmd, "closeticket") == 0) {
+        const struct discord_application_command_interaction_data_option *sub =
+            get_active_subcommand(event);
+        /*
+         * Check the sub-command name directly.  Previously this used
+         * find_option(event, "open") which returned NULL in Orca builds that
+         * don't NULL-terminate options arrays, causing every /ticket invocation
+         * to fall through to handle_ticket_close.
+         */
+        if (sub && strcmp(sub->name, "open") == 0) {
+            handle_ticket_open(client, event);
+        } else {
+            handle_ticket_close(client, event);
+        }
+        return;
+    }
+
+    /* ── /ticketnote ─────────────────────────────────────────────────────── */
+    if (strcmp(cmd, "ticketnote") == 0) {
+        if (!is_staff(event)) {
+            reply_ephemeral(client, event, "❌ Staff only.");
+            return;
+        }
+        const struct discord_application_command_interaction_data_option *sub =
+            get_active_subcommand(event);
+        if (!sub) { reply_ephemeral(client, event, "Missing sub-command."); return; }
+
+        if (strcmp(sub->name, "add")    == 0) { handle_note_add(client, event, sub);    return; }
+        if (strcmp(sub->name, "list")   == 0) { handle_note_list(client, event);        return; }
+        if (strcmp(sub->name, "pin")    == 0) { handle_note_pin(client, event, sub);    return; }
+        if (strcmp(sub->name, "delete") == 0) { handle_note_delete(client, event, sub); return; }
+
+        reply_ephemeral(client, event, "Unknown sub-command.");
+        return;
+    }
+
+    /* ── /ticketoutcome ──────────────────────────────────────────────────── */
+    if (strcmp(cmd, "ticketoutcome") == 0) {
+        if (!is_staff(event)) {
+            reply_ephemeral(client, event, "❌ Staff only.");
+            return;
+        }
+        const struct discord_application_command_interaction_data_option *sub =
+            get_active_subcommand(event);
+        if (!sub) { reply_ephemeral(client, event, "Missing sub-command."); return; }
+
+        if (strcmp(sub->name, "set")   == 0) { handle_outcome_set(client, event, sub); return; }
+        if (strcmp(sub->name, "clear") == 0) { handle_outcome_clear(client, event);    return; }
+
+        reply_ephemeral(client, event, "Unknown sub-command.");
+        return;
+    }
+
+    /* ── /ticketassign ───────────────────────────────────────────────────── */
+    if (strcmp(cmd, "ticketassign") == 0) {
+        handle_assign(client, event);
+        return;
+    }
+
+    /* ── /ticketpriority ─────────────────────────────────────────────────── */
+    if (strcmp(cmd, "ticketpriority") == 0) {
+        handle_priority(client, event);
+        return;
+    }
+
+    /* ── /ticketstatus ───────────────────────────────────────────────────── */
+    if (strcmp(cmd, "ticketstatus") == 0) {
+        handle_status(client, event);
+        return;
+    }
+
+    /* ── /ticketsummary ──────────────────────────────────────────────────── */
+    if (strcmp(cmd, "ticketsummary") == 0) {
+        handle_summary(client, event);
+        return;
+    }
+
+    /* ── /ticketconfig ───────────────────────────────────────────────────── */
+    if (strcmp(cmd, "ticketconfig") == 0) {
+        if (!is_staff(event)) {
+            reply_ephemeral(client, event, "❌ Staff only.");
+            return;
+        }
+        reply_ephemeral(client, event,
+                        "⚙️ Ticket configuration is not yet implemented.");
+        return;
+    }
 }
 
-/* -------------------------------------------------------------------------
+/* ============================================================================
+ * Message handler – log ticket channel messages to the DB (future use)
+ * ========================================================================= */
+
+void on_ticket_message(struct discord *client,
+                       const struct discord_message *event) {
+    /* Optionally used in future to transcript messages, detect inactivity, etc. */
+    (void)client;
+    (void)event;
+}
+
+/* ============================================================================
  * Slash command registration
- * ---------------------------------------------------------------------- */
+ * ========================================================================= */
 
 void register_ticket_commands(struct discord *client,
                                u64_snowflake_t application_id,
                                u64_snowflake_t guild_id) {
-    /* /ticket — global, intended for DMs */
-    struct discord_application_command_option server_opt = {
-        .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-        .name        = "server",
-        .description = "The server ID you want to contact staff for",
-        .required    = true,
-    };
-    struct discord_application_command_option *ticket_opts[] = { &server_opt, NULL };
-    struct discord_create_global_application_command_params ticket_params = {
-        .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
-        .name        = "ticket",
-        .description = "Create a support ticket (use in DMs)",
-        .options     = ticket_opts,
-    };
-    discord_create_global_application_command(client, application_id, &ticket_params, NULL);
+    /* Helper macro to register one command and log the result */
+#define REG(params_ptr, label)                                                  \
+    do {                                                                        \
+        ORCAcode _c = discord_create_guild_application_command(                 \
+            client, application_id, guild_id, (params_ptr), NULL);              \
+        if (_c == ORCA_OK)                                                      \
+            printf("[ticket] /%s registered\n", (label));                       \
+        else                                                                    \
+            printf("[ticket] Failed to register /%s (code %d)\n", (label), _c);\
+    } while (0)
 
-    /* /closeticket — guild-scoped */
-    struct discord_create_guild_application_command_params close_params = {
-        .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
-        .name        = "closeticket",
-        .description = "Close the current ticket",
-    };
-    discord_create_guild_application_command(client, application_id, guild_id, &close_params, NULL);
+    /* ── /ticket ──────────────────────────────────────────────────────────── */
+    {
+        struct discord_application_command_option open_subject = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+            .name        = "subject",
+            .description = "Brief description of your issue",
+            .required    = true,
+        };
+        struct discord_application_command_option *open_opts[] = { &open_subject, NULL };
 
-    /* /ticketconfig — guild-scoped */
-    struct discord_application_command_option main_server  = {
-        .type = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-        .name = "main_server", .description = "Main server ID (where users are)", .required = true
-    };
-    struct discord_application_command_option staff_server = {
-        .type = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-        .name = "staff_server", .description = "Staff server ID (where tickets are created)", .required = true
-    };
-    struct discord_application_command_option category = {
-        .type = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-        .name = "category", .description = "Category ID for ticket channels", .required = true
-    };
-    struct discord_application_command_option log_channel = {
-        .type = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-        .name = "log_channel", .description = "Channel ID for ticket logs", .required = true
-    };
-    struct discord_application_command_option *config_opts[] = {
-        &main_server, &staff_server, &category, &log_channel, NULL
-    };
-    struct discord_create_guild_application_command_params config_params = {
-        .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
-        .name        = "ticketconfig",
-        .description = "Configure ticket system (Admin only)",
-        .options     = config_opts,
-    };
-    discord_create_guild_application_command(client, application_id, guild_id, &config_params, NULL);
+        struct discord_application_command_option open_sub = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+            .name        = "open",
+            .description = "Open a new support ticket",
+            .options     = open_opts,
+        };
+        struct discord_application_command_option close_sub = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+            .name        = "close",
+            .description = "Close this ticket",
+        };
+        struct discord_application_command_option *ticket_opts[] = {
+            &open_sub, &close_sub, NULL,
+        };
+        struct discord_create_guild_application_command_params ticket_cmd = {
+            .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+            .name        = "ticket",
+            .description = "Manage support tickets",
+            .options     = ticket_opts,
+        };
+        REG(&ticket_cmd, "ticket");
+    }
 
-    printf("[ticket] Ticket commands registered\n");
+    /* ── /ticketnote ──────────────────────────────────────────────────────── */
+    {
+        struct discord_application_command_option add_text_opt = {
+            .type = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+            .name = "text", .description = "Note content", .required = true,
+        };
+        struct discord_application_command_option *add_opts[] = { &add_text_opt, NULL };
+
+        struct discord_application_command_option note_id_opt = {
+            .type = DISCORD_APPLICATION_COMMAND_OPTION_INTEGER,
+            .name = "note_id", .description = "ID of the note", .required = true,
+        };
+        struct discord_application_command_option *nid_opts[] = { &note_id_opt, NULL };
+
+        struct discord_application_command_option add_sub = {
+            .type = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+            .name = "add", .description = "Add a private staff note", .options = add_opts,
+        };
+        struct discord_application_command_option list_sub = {
+            .type = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+            .name = "list", .description = "List all notes on this ticket",
+        };
+        struct discord_application_command_option pin_sub = {
+            .type = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+            .name = "pin", .description = "Pin a note", .options = nid_opts,
+        };
+        struct discord_application_command_option del_sub = {
+            .type = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+            .name = "delete", .description = "Delete one of your notes", .options = nid_opts,
+        };
+        struct discord_application_command_option *note_opts[] = {
+            &add_sub, &list_sub, &pin_sub, &del_sub, NULL,
+        };
+        struct discord_create_guild_application_command_params note_cmd = {
+            .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+            .name        = "ticketnote",
+            .description = "(Staff) Manage private notes on this ticket",
+            .options     = note_opts,
+        };
+        REG(&note_cmd, "ticketnote");
+    }
+
+    /* ── /ticketoutcome ───────────────────────────────────────────────────── */
+    {
+        struct discord_application_command_option_choice outcome_choices[] = {
+            { .name = "Resolved",    .value = "resolved"    },
+            { .name = "Duplicate",   .value = "duplicate"   },
+            { .name = "Invalid",     .value = "invalid"     },
+            { .name = "No Response", .value = "no_response" },
+            { .name = "Escalated",   .value = "escalated"   },
+            { .name = "Other",       .value = "other"       },
+            { 0 },
+        };
+        struct discord_application_command_option_choice *oc_ptrs[] = {
+            &outcome_choices[0], &outcome_choices[1], &outcome_choices[2],
+            &outcome_choices[3], &outcome_choices[4], &outcome_choices[5], NULL,
+        };
+
+        struct discord_application_command_option set_outcome_opt = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+            .name        = "outcome",
+            .description = "Outcome type",
+            .required    = true,
+            .choices     = oc_ptrs,
+        };
+        struct discord_application_command_option set_notes_opt = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+            .name        = "notes",
+            .description = "Additional notes (optional)",
+            .required    = false,
+        };
+        struct discord_application_command_option *set_opts[] = {
+            &set_outcome_opt, &set_notes_opt, NULL,
+        };
+        struct discord_application_command_option set_sub = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+            .name        = "set",
+            .description = "Record the ticket outcome",
+            .options     = set_opts,
+        };
+        struct discord_application_command_option clear_sub = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+            .name        = "clear",
+            .description = "Clear the current outcome",
+        };
+        struct discord_application_command_option *outcome_opts[] = {
+            &set_sub, &clear_sub, NULL,
+        };
+        struct discord_create_guild_application_command_params outcome_cmd = {
+            .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+            .name        = "ticketoutcome",
+            .description = "(Staff) Set or clear the resolution outcome",
+            .options     = outcome_opts,
+        };
+        REG(&outcome_cmd, "ticketoutcome");
+    }
+
+    /* ── /ticketassign ────────────────────────────────────────────────────── */
+    {
+        struct discord_application_command_option staff_opt = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_USER,
+            .name        = "staff_member",
+            .description = "Staff member to assign",
+            .required    = true,
+        };
+        struct discord_application_command_option *assign_opts[] = { &staff_opt, NULL };
+        struct discord_create_guild_application_command_params assign_cmd = {
+            .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+            .name        = "ticketassign",
+            .description = "(Staff) Assign this ticket to a staff member",
+            .options     = assign_opts,
+        };
+        REG(&assign_cmd, "ticketassign");
+    }
+
+    /* ── /ticketpriority ──────────────────────────────────────────────────── */
+    {
+        struct discord_application_command_option_choice pri_choices[] = {
+            { .name = "Low",    .value = "low"    },
+            { .name = "Medium", .value = "medium" },
+            { .name = "High",   .value = "high"   },
+            { .name = "Urgent", .value = "urgent" },
+            { 0 },
+        };
+        struct discord_application_command_option_choice *pri_ptrs[] = {
+            &pri_choices[0], &pri_choices[1], &pri_choices[2], &pri_choices[3], NULL,
+        };
+        struct discord_application_command_option level_opt = {
+            .type     = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+            .name     = "level",
+            .description = "Priority level",
+            .required = true,
+            .choices  = pri_ptrs,
+        };
+        struct discord_application_command_option *pri_opts[] = { &level_opt, NULL };
+        struct discord_create_guild_application_command_params pri_cmd = {
+            .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+            .name        = "ticketpriority",
+            .description = "(Staff) Set the ticket priority",
+            .options     = pri_opts,
+        };
+        REG(&pri_cmd, "ticketpriority");
+    }
+
+    /* ── /ticketstatus ────────────────────────────────────────────────────── */
+    {
+        struct discord_application_command_option_choice status_choices[] = {
+            { .name = "Open",          .value = "open"         },
+            { .name = "In Progress",   .value = "in_progress"  },
+            { .name = "Pending User",  .value = "pending_user" },
+            { .name = "Resolved",      .value = "resolved"     },
+            { 0 },
+        };
+        struct discord_application_command_option_choice *st_ptrs[] = {
+            &status_choices[0], &status_choices[1],
+            &status_choices[2], &status_choices[3], NULL,
+        };
+        struct discord_application_command_option status_opt = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+            .name        = "status",
+            .description = "New status",
+            .required    = true,
+            .choices     = st_ptrs,
+        };
+        struct discord_application_command_option *st_opts[] = { &status_opt, NULL };
+        struct discord_create_guild_application_command_params st_cmd = {
+            .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+            .name        = "ticketstatus",
+            .description = "(Staff) Update the workflow status of this ticket",
+            .options     = st_opts,
+        };
+        REG(&st_cmd, "ticketstatus");
+    }
+
+    /* ── /ticketsummary ───────────────────────────────────────────────────── */
+    {
+        struct discord_create_guild_application_command_params summary_cmd = {
+            .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+            .name        = "ticketsummary",
+            .description = "(Staff) View full ticket details: notes, outcome, history",
+        };
+        REG(&summary_cmd, "ticketsummary");
+    }
+
+#undef REG
 }
 
-/* -------------------------------------------------------------------------
- * Module init / cleanup
- * ---------------------------------------------------------------------- */
+/* ============================================================================
+ * Module init
+ * ========================================================================= */
 
 void ticket_module_init(struct discord *client, Database *db) {
-    g_db     = db;
     g_client = client;
+    g_db     = db;
 
-    curl_global_init(CURL_GLOBAL_ALL);
-    ensure_dir(TICKET_IMAGES_DIR);
-    init_ticket_tables(db);
+    if (ticket_db_init_tables(db) != 0)
+        fprintf(stderr, "[ticket] Warning: DB table initialisation failed.\n");
 
-    printf("[ticket] Ticket module initialised with embedded media support\n");
-}
-
-void ticket_module_cleanup(void) {
-    curl_global_cleanup();
+    printf("[ticket] Module initialised.\n");
 }
