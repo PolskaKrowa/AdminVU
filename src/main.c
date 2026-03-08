@@ -11,6 +11,7 @@
 #include "modules/moderation.h"
 #include "modules/ticket.h"
 #include "modules/factcheck.h"
+#include "modules/propagation.h"   /* ← NEW */
 
 // Global client pointer for signal handling
 static struct discord *g_client = NULL;
@@ -38,7 +39,7 @@ void signal_handler(int signum) {
 /* ---------------------------------------------------------------------------
  * register_slash_commands
  *
- * Registers guild-scoped slash commands for ping, moderation, and ticket modules.
+ * Registers guild-scoped slash commands for all modules.
  * --------------------------------------------------------------------------- */
 void register_slash_commands(struct discord *client,
                              u64_snowflake_t application_id,
@@ -72,12 +73,15 @@ void register_slash_commands(struct discord *client,
                guild_id);
     else
         printf("[ping] Failed to register /ping (ORCAcode %d)\n", code);
-    
+
     // Register moderation commands
     register_moderation_commands(client, application_id, guild_id);
-    
+
     // Register ticket commands (guild-specific ones)
     register_ticket_commands(client, application_id, guild_id);
+
+    // Register propagation commands
+    register_propagation_commands(client, application_id, guild_id);
 
     /* factcheck is triggered via plain messages, not slash commands – no
      * registration needed here. */
@@ -88,27 +92,34 @@ void on_interaction_create_combined(struct discord *client,
                                     const struct discord_interaction *event) {
     if (!event->data) return;
     if (event->type != DISCORD_INTERACTION_APPLICATION_COMMAND) return;
-    
+
     const char *cmd = event->data->name;
-    
+
     printf("[main] Received interaction: %s\n", cmd);
-    
+
     // Route to appropriate module
     if (strcmp(cmd, "ping") == 0) {
-        // Handle ping command
         on_ping_interaction(client, event);
-    } else if (strcmp(cmd, "warn") == 0 || 
+
+    } else if (strcmp(cmd, "warn")     == 0 ||
                strcmp(cmd, "warnings") == 0 ||
-               strcmp(cmd, "kick") == 0 ||
-               strcmp(cmd, "ban") == 0 ||
-               strcmp(cmd, "timeout") == 0) {
-        // Handle moderation commands
+               strcmp(cmd, "kick")     == 0 ||
+               strcmp(cmd, "ban")      == 0 ||
+               strcmp(cmd, "timeout")  == 0) {
         on_moderation_interaction(client, event);
-    } else if (strcmp(cmd, "ticket") == 0 ||
-               strcmp(cmd, "closeticket") == 0 ||
+
+    } else if (strcmp(cmd, "ticket")       == 0 ||
+               strcmp(cmd, "closeticket")  == 0 ||
                strcmp(cmd, "ticketconfig") == 0) {
-        // Handle ticket commands
         on_ticket_interaction(client, event);
+
+    } else if (strcmp(cmd, "propagate")         == 0 ||
+               strcmp(cmd, "propagate-config")  == 0 ||
+               strcmp(cmd, "propagate-opt-out") == 0 ||
+               strcmp(cmd, "propagate-history") == 0 ||
+               strcmp(cmd, "propagate-revoke")  == 0) {
+        on_propagation_interaction(client, event);
+
     } else {
         printf("[main] Unknown command: %s\n", cmd);
     }
@@ -122,6 +133,20 @@ void on_message_create(struct discord *client,
 
     // Factcheck module – handles "@bot is this true?" replies
     on_factcheck_message(client, event);
+}
+
+/*
+ * on_guild_create
+ *
+ * Fires when the bot joins a new guild (or on startup for existing ones).
+ * We register the guild in the known_guilds table so the propagation
+ * system can target it when delivering cross-server alerts.
+ */
+void on_guild_create(struct discord *client,
+                     const struct discord_guild *event) {
+    if (!event) return;
+    propagation_on_guild_register(event->id);
+    printf("[main] Guild registered: %" PRIu64 "\n", event->id);
 }
 
 // Ready event handler
@@ -202,19 +227,21 @@ int main(int argc, char *argv[]) {
         cleanup_env();
         return EXIT_FAILURE;
     }
-    
+
     g_client = client;
 
     // Set up event handlers
     discord_set_on_ready(client, (void*)&on_ready);
     discord_set_on_interaction_create(client, &on_interaction_create_combined);
     discord_set_on_message_create(client, &on_message_create);
+    discord_set_on_guild_create(client, &on_guild_create);   /* ← NEW */
 
     // Initialise modules
     printf("Initialising modules...\n");
     ping_module_init(client, g_guild_id);
     moderation_module_init(client, &g_database, g_guild_id);
     ticket_module_init(client, &g_database);
+    propagation_module_init(client, &g_database, g_guild_id);  /* ← NEW */
 
     // Factcheck module – early init so the bot ID can be captured before
     // the first message arrives.  It will be re-initialised in on_ready()

@@ -1057,6 +1057,7 @@ void on_ticket_interaction(struct discord *client,
     if (!event->data) return;
     const char *cmd = event->data->name;
 
+<<<<<<< HEAD
     /* ── /ticket ─────────────────────────────────────────────────────────── */
     if (strcmp(cmd, "ticket") == 0 || strcmp(cmd, "closeticket") == 0) {
         const struct discord_application_command_interaction_data_option *sub =
@@ -1145,6 +1146,17 @@ void on_ticket_interaction(struct discord *client,
                         "⚙️ Ticket configuration is not yet implemented.");
         return;
     }
+=======
+    /* Diagnostic: always log what Discord actually sent */
+    printf("[ticket] on_ticket_interaction: cmd='%s' guild_id=%" PRIu64 "\n",
+           cmd ? cmd : "(null)", event->guild_id);
+
+    if (!cmd) return;
+
+    if      (strcmp(cmd, "ticket")       == 0) handle_ticket_create(client, event);
+    else if (strcmp(cmd, "closeticket")  == 0) handle_ticket_close (client, event);
+    else if (strcmp(cmd, "ticketconfig") == 0) handle_config_set   (client, event);
+>>>>>>> 53ee0d3d8206cbe3d74e104cb810220a8825651b
 }
 
 /* ============================================================================

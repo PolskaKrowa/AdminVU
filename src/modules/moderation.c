@@ -270,6 +270,86 @@ static void handle_ban_command(struct discord *client,
     discord_create_interaction_response(client, event->id, event->token, &resp, NULL);
 }
 
+/* ---------------------------------------------------------------------------
+ * /timeout command handler
+ *
+ * Times out a member for a given duration (in minutes, default 10, max 40320
+ * which equals 28 days — the Discord API ceiling).
+ *
+ * Discord requires the communication_disabled_until field to be an ISO 8601
+ * timestamp.  We build one from time(NULL) + duration_seconds.
+ * --------------------------------------------------------------------------- */
+static void handle_timeout_command(struct discord *client,
+                                   const struct discord_interaction *event) {
+    if (!has_mod_permissions(event)) {
+        send_ephemeral(client, event, "❌ You don't have permission to timeout members.");
+        return;
+    }
+
+    const char *user_id_str      = get_option_value(event, "user");
+    const char *duration_str     = get_option_value(event, "duration");
+    const char *reason           = get_option_value(event, "reason");
+
+    if (!user_id_str) {
+        send_ephemeral(client, event, "❌ User not specified.");
+        return;
+    }
+
+    /* Duration: default 10 minutes, capped at 40320 (28 days in minutes). */
+    long duration_minutes = duration_str ? strtol(duration_str, NULL, 10) : 10;
+    if (duration_minutes < 1)      duration_minutes = 1;
+    if (duration_minutes > 40320)  duration_minutes = 40320;
+
+    u64_snowflake_t target_id    = (u64_snowflake_t)strtoull(user_id_str, NULL, 10);
+    u64_snowflake_t moderator_id = event->member ? event->member->user->id : 0;
+
+    /* Build ISO 8601 timestamp for when the timeout expires. */
+    time_t expires_at = time(NULL) + (time_t)(duration_minutes * 60);
+    struct tm *tm_info = gmtime(&expires_at);
+    char iso_timestamp[32];
+    strftime(iso_timestamp, sizeof(iso_timestamp), "%Y-%m-%dT%H:%M:%SZ", tm_info);
+
+    /* Modify the guild member to apply the timeout. */
+    struct discord_modify_guild_member_params mod_params = {
+        .communication_disabled_until = iso_timestamp,
+    };
+
+    ORCAcode code = discord_modify_guild_member(client, event->guild_id,
+                                                target_id, &mod_params, NULL);
+    if (code != ORCA_OK) {
+        char error[256];
+        snprintf(error, sizeof(error),
+                 "❌ Failed to timeout user (ORCAcode %d). "
+                 "Check bot permissions and that the target is below me in the role hierarchy.",
+                 code);
+        send_ephemeral(client, event, error);
+        return;
+    }
+
+    /* Log the action. */
+    db_log_action(g_db, MOD_ACTION_TIMEOUT, target_id, event->guild_id,
+                  moderator_id, reason);
+
+    char response[512];
+    snprintf(response, sizeof(response),
+             "🔇 <@%" PRIu64 "> has been timed out for **%ld minute%s**.\n"
+             "**Reason:** %s\n"
+             "**Expires:** %s",
+             target_id,
+             duration_minutes, duration_minutes == 1 ? "" : "s",
+             reason ? reason : "No reason provided",
+             iso_timestamp);
+
+    struct discord_interaction_response resp = {
+        .type = DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
+        .data = &(struct discord_interaction_callback_data){
+            .content = response,
+        },
+    };
+
+    discord_create_interaction_response(client, event->id, event->token, &resp, NULL);
+}
+
 // Main interaction router
 void on_moderation_interaction(struct discord *client,
                                const struct discord_interaction *event) {
@@ -286,6 +366,8 @@ void on_moderation_interaction(struct discord *client,
         handle_kick_command(client, event);
     } else if (strcmp(cmd, "ban") == 0) {
         handle_ban_command(client, event);
+    } else if (strcmp(cmd, "timeout") == 0) {
+        handle_timeout_command(client, event);
     }
 }
 
