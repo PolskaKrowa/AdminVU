@@ -8,10 +8,12 @@ add_executable(discord_bot
     main.c
     env_parser.c
     database.c
+    database_propagation.c
     modules/ping.c
     modules/moderation.c
     modules/ticket.c
     modules/factcheck.c
+    modules/propagation.c
 )
 
 target_link_libraries(discord_bot
