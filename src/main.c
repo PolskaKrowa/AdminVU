@@ -233,7 +233,7 @@ int main(int argc, char *argv[]) {
     ping_module_init(client, g_guild_id);
     moderation_module_init(client, &g_database, g_guild_id, token);
     ticket_module_init(client, &g_database);
-    propagation_module_init(client, &g_database, g_guild_id);  /* ← NEW */
+    propagation_module_init(client, &g_database, g_guild_id);
 
     // Factcheck module – early init so the bot ID can be captured before
     // the first message arrives.  It will be re-initialised in on_ready()
