@@ -159,6 +159,12 @@ void on_ready(struct discord *client) {
     register_slash_commands(client, application_id, g_guild_id);
 }
 
+static void on_guild_create_handler(struct discord *client,
+                                    const struct discord_guild *guild) {
+    if (guild && guild->id)
+        propagation_on_guild_register(guild->id);
+}
+
 int main(int argc, char *argv[]) {
     // Try to load .env file from parent directory
     printf("Loading environment from ../.env\n");
@@ -220,6 +226,7 @@ int main(int argc, char *argv[]) {
     discord_set_on_ready(client, (void*)&on_ready);
     discord_set_on_interaction_create(client, &on_interaction_create_combined);
     discord_set_on_message_create(client, &on_message_create);
+    discord_set_on_guild_create(client, on_guild_create_handler);
 
     // Initialise modules
     printf("Initialising modules...\n");

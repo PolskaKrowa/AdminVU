@@ -314,7 +314,7 @@ static void handle_config(struct discord                  *client,
         return;
     }
 
-    const char *channel_str = get_option(event, "channel");
+    const char *channel_str = get_option(event, "channel_id");
     if (!channel_str) {
         send_ephemeral(client, event, "❌ Please specify a channel.");
         return;
