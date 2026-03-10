@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <inttypes.h>
 #include <orca/discord.h>
+#include <pthread.h>
 
 #include "env_parser.h"
 #include "database.h"
@@ -87,6 +88,19 @@ void register_slash_commands(struct discord *client,
      * registration needed here. */
 }
 
+typedef struct {
+    struct discord  *client;
+    u64_snowflake_t  application_id;
+    u64_snowflake_t  guild_id;
+} RegisterArgs;
+
+static void *register_commands_thread(void *arg) {
+    RegisterArgs *a = arg;
+    register_slash_commands(a->client, a->application_id, a->guild_id);
+    free(a);
+    return NULL;
+}
+
 // Combined interaction handler for all modules
 void on_interaction_create_combined(struct discord *client,
                                     const struct discord_interaction *event) {
@@ -135,7 +149,6 @@ void on_message_create(struct discord *client,
     on_factcheck_message(client, event);
 }
 
-// Ready event handler
 void on_ready(struct discord *client) {
     printf("Bot is ready!\n");
 
@@ -143,20 +156,28 @@ void on_ready(struct discord *client) {
     if (bot && bot->username)
         printf("Logged in as: %s\n", bot->username);
 
-    // For bot users, the user ID *is* the application ID.
     u64_snowflake_t application_id = bot ? bot->id : 0;
     if (!application_id) {
-        fprintf(stderr, "[main] Could not obtain application_id – "
-                        "slash commands will not be registered.\n");
+        fprintf(stderr, "[main] Could not obtain application_id.\n");
         return;
     }
 
-    // Now that we know the bot's ID, (re-)initialise the factcheck module so
-    // the mention-detection logic has the correct snowflake from the start.
     factcheck_module_init(client);
 
-    // Now that we have the application_id, register slash commands.
-    register_slash_commands(client, application_id, g_guild_id);
+    /* Spin up a background thread so the WebSocket heartbeat
+     * is never starved by blocking REST calls.              */
+    RegisterArgs *args = malloc(sizeof *args);
+    args->client         = client;
+    args->application_id = application_id;
+    args->guild_id       = g_guild_id;
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, register_commands_thread, args) != 0) {
+        fprintf(stderr, "[main] Failed to spawn registration thread.\n");
+        free(args);
+        return;
+    }
+    pthread_detach(tid);   /* fire-and-forget; thread frees its own args */
 }
 
 static void on_guild_create_handler(struct discord *client,

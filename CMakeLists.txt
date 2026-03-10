@@ -14,6 +14,9 @@ enable_language(ASM_NASM)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
 
+# pthreads – required for off-thread slash-command registration
+find_package(Threads REQUIRED)
+
 # Find Orca/Discord library manually
 # Check common installation paths
 find_path(ORCA_INCLUDE_DIR 

@@ -1,11 +1,12 @@
 # AdminVU V3
 
-A modular Discord bot written in C using the Orca Discord API library, with x86_64 assembly optimisations and SQLite database for moderation.
+A modular Discord bot written in C using the Orca Discord API library, with x86_64 assembly optimisations and SQLite database for moderation and cross-server alert propagation.
 
 ## ⚡ Features
 
 - **Moderation Commands**: Warn, kick, ban, and timeout users
-- **Database Storage**: SQLite database for persistent user data and moderation logs
+- **Cross-Server Propagation**: Alert moderators across every opted-in server when a user is flagged
+- **Database Storage**: SQLite database for persistent user data, moderation logs, and propagation events
 - **Assembly Optimisations**: Fast hashing with x86_64 assembly
 - **Modular Architecture**: Easy to extend with new commands
 
@@ -14,31 +15,42 @@ A modular Discord bot written in C using the Orca Discord API library, with x86_
 ### General Commands
 - `/ping [target]` - Responds with "Pong!" and a hash of the target's username
 
-### Moderation Commands (Requires Permissions)
+### Moderation Commands (Requires Kick/Ban/Moderate Members)
 - `/warn <user> [reason]` - Issue a warning to a user
 - `/warnings <user>` - View all warnings for a user
 - `/kick <user> [reason]` - Kick a user from the server
 - `/ban <user> [reason]` - Ban a user from the server
-- `/timeout <user> [duration] [reason]` - Timeout a user (1-40320 minutes)
+- `/timeout <user> [duration] [reason]` - Timeout a user (1–40320 minutes)
+
+### Cross-Server Propagation Commands
+- `/propagate <user> <reason> <evidence> <confirm>` - Flag a user across all opted-in servers *(mod only — misuse results in a permanent ban from the system)*
+- `/propagate-config <channel_id>` - Set the channel for incoming alerts *(admin only)*
+- `/propagate-opt-out` - Stop receiving cross-server alerts *(admin only)*
+- `/propagate-history <user>` - View all cross-server alerts for a user *(mod only)*
+- `/propagate-revoke <moderator> <reason>` - Permanently blacklist a moderator from issuing alerts *(admin only)*
 
 ## Project Structure
 
 ```
 discord-bot/
-├── CMakeLists.txt          # Root build configuration
+├── CMakeLists.txt                  # Root build configuration
 ├── src/
-│   ├── main.c              # Main entry point with database integration
-│   ├── env_parser.c/h      # Environment variable parser
-│   ├── database.c/h        # SQLite database operations
-│   ├── CMakeLists.txt      # Source build configuration
+│   ├── main.c                      # Main entry point
+│   ├── env_parser.c/h              # Environment variable parser
+│   ├── database.c/h                # SQLite database operations
+│   ├── database_propagation.c/h    # Propagation-specific DB layer
+│   ├── CMakeLists.txt              # Source build configuration
 │   └── modules/
-│       ├── ping.c/h        # Ping command module
-│       └── moderation.c/h  # Moderation commands module
+│       ├── ping.c/h                # Ping command module
+│       ├── moderation.c/h          # Moderation commands module
+│       ├── ticket.c/h              # Ticket system module
+│       ├── factcheck.c/h           # Fact-check module
+│       └── propagation.c/h         # Cross-server propagation module
 ├── asm/
-│   ├── fast_hash.asm       # x86_64 assembly functions
-│   └── CMakeLists.txt      # Assembly build configuration
-├── bot_data.db             # SQLite database (created on first run)
-└── .env.example            # Example environment variables
+│   ├── fast_hash.asm               # x86_64 assembly functions
+│   └── CMakeLists.txt              # Assembly build configuration
+├── bot_data.db                     # SQLite database (created on first run)
+└── .env.example                    # Example environment variables
 ```
 
 ## Prerequisites
@@ -49,6 +61,8 @@ sudo apt-get update
 sudo apt-get install -y build-essential cmake nasm pkg-config \
     libcurl4-openssl-dev libsqlite3-dev git
 ```
+
+pthreads is part of glibc on Linux and requires no separate installation.
 
 ### Install Orca Library
 
@@ -64,7 +78,7 @@ sudo ldconfig
 
 **Verify installation:**
 ```bash
-ls /usr/local/lib/libdiscord* 
+ls /usr/local/lib/libdiscord*
 ls /usr/local/include/orca/discord.h
 ```
 
@@ -133,7 +147,7 @@ On first run, the bot will create `bot_data.db` in the project root directory.
 
 ## Database Schema
 
-The bot creates three tables automatically:
+The bot creates tables automatically on first run.
 
 ### `users` table
 - `user_id` - Discord user snowflake ID
@@ -157,6 +171,48 @@ The bot creates three tables automatically:
 - `reason` - Action reason text
 - `timestamp` - Unix timestamp
 
+### `propagation_events` table
+- `id` - Auto-incrementing primary key
+- `target_user_id` - Flagged user's snowflake ID
+- `source_guild_id` - Guild the alert originated from
+- `moderator_id` - Moderator who issued the alert
+- `reason` - Plain-text reason
+- `evidence_url` - URL to evidence (screenshot, video, etc.)
+- `timestamp` - Unix timestamp
+
+### `propagation_notifications` table
+- `id` - Auto-incrementing primary key
+- `propagation_id` - Foreign key to `propagation_events`
+- `guild_id` - Guild that was notified
+- `notified_at` - Unix timestamp
+
+### `propagation_guild_config` table
+- `guild_id` - Primary key
+- `notification_channel` - Channel ID for incoming alerts
+- `opted_in` - 1 = receiving alerts, 0 = opted out
+
+### `propagation_blacklist` table
+- `moderator_id` - Primary key
+- `banned_by` - Admin who issued the blacklist
+- `reason` - Reason for removal
+- `banned_at` - Unix timestamp
+
+### `known_guilds` table
+- `guild_id` - Primary key
+- `registered_at` - Unix timestamp
+
+## Architecture Notes
+
+### Off-thread command registration
+
+Slash commands are registered via blocking REST calls to Discord's API. Performing these inside the `on_ready` callback — which runs on the same thread as the WebSocket heartbeat — will starve the connection and cause the bot to disconnect, typically right as the largest command batch (propagation) is being sent.
+
+To avoid this, `on_ready` spawns a detached `pthread` that registers all commands in the background whilst the event loop continues uninterrupted.
+
+### Propagation delivery
+
+When `/propagate` is fired, the bot iterates every opted-in guild, calls `discord_get_guild_member` to confirm the target is present, and posts a rich alert embed to that guild's configured channel. No automatic action is taken against the user in any receiving guild — moderators there make their own decisions. Every alert is persisted to the database with a unique ID so it can be referenced, queried, or disputed later.
+
 ## Usage Examples
 
 ### Moderation Workflow
@@ -166,7 +222,7 @@ The bot creates three tables automatically:
    /warn user:@BadUser reason:Spamming in general chat
    ```
 
-2. **Check user's warning history:**
+2. **Check a user's warning history:**
    ```
    /warnings user:@BadUser
    ```
@@ -186,16 +242,44 @@ The bot creates three tables automatically:
    /ban user:@BadUser reason:Severe ToS violation
    ```
 
+### Propagation Workflow
+
+1. **Configure your server to receive alerts** *(admin, run once)*:
+   ```
+   /propagate-config channel_id:123456789012345678
+   ```
+
+2. **Flag a user across the network** *(mod)*:
+   ```
+   /propagate user:@BadUser reason:Doxxing members evidence:https://imgur.com/... confirm:I UNDERSTAND THE CONSEQUENCES
+   ```
+   The bot will only send the alert to guilds where the target is actually a member.
+
+3. **Check a user's alert history**:
+   ```
+   /propagate-history user:@BadUser
+   ```
+
+4. **Remove a moderator from the system** *(admin)*:
+   ```
+   /propagate-revoke moderator:@BadMod reason:Issuing false alerts
+   ```
+
+5. **Opt your server out of the network** *(admin)*:
+   ```
+   /propagate-opt-out
+   ```
+
 ## Permissions
 
-The moderation commands require specific Discord permissions:
-
-- `/warn`, `/warnings` - Requires **Kick Members** or **Moderate Members**
-- `/kick` - Requires **Kick Members** permission
-- `/ban` - Requires **Ban Members** permission
-- `/timeout` - Requires **Moderate Members** permission
-
-The bot checks these permissions before executing commands and will respond with an error if the user lacks the required permissions.
+| Command | Required permission |
+|---|---|
+| `/warn`, `/warnings` | Kick Members or Moderate Members |
+| `/kick` | Kick Members |
+| `/ban` | Ban Members |
+| `/timeout` | Moderate Members |
+| `/propagate`, `/propagate-history` | Kick Members, Ban Members, or Moderate Members |
+| `/propagate-config`, `/propagate-opt-out`, `/propagate-revoke` | Administrator or Manage Server |
 
 ## Adding New Modules
 
@@ -229,33 +313,17 @@ void on_interaction_create_combined(struct discord *client,
                                     const struct discord_interaction *event) {
     // ... existing code ...
     
-    else if (strcmp(cmd, "your_command") == 0) {
+    } else if (strcmp(cmd, "your_command") == 0) {
         your_command_handler(client, event);
     }
 }
 ```
 
-## Database Operations
-
-To add custom database operations, extend `database.c` and `database.h`:
-
-```c
-// In database.h
-int db_custom_operation(Database *db, /* parameters */);
-
-// In database.c
-int db_custom_operation(Database *db, /* parameters */) {
-    const char *sql = "YOUR SQL HERE";
-    sqlite3_stmt *stmt;
-    
-    int rc = sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL);
-    // ... implementation ...
-    
-    return 0;
-}
-```
-
 ## Troubleshooting
+
+### Bot disconnects after registering propagation commands
+
+Slash-command registration makes blocking HTTP calls. If these run on the WebSocket thread the heartbeat stalls and Discord drops the connection. The fix is already in place — command registration runs on a detached `pthread` spawned from `on_ready`. If you see this happen again, ensure nothing else is making blocking calls inside an event callback.
 
 ### Database Issues
 
@@ -273,12 +341,11 @@ rm bot_data.db
 
 **Bot can't kick/ban/timeout users:**
 - Ensure the bot role is above the target user's highest role in the server hierarchy
-- Check that the bot has the required permissions
-- Verify the bot has been invited with the correct permission scope
+- Check that the bot has the required permissions in the server settings
+- Verify the bot was invited with the correct permission scope
 
 ### SQLite Not Found
 
-If you get "sqlite3.h not found" during compilation:
 ```bash
 sudo apt-get install libsqlite3-dev
 ```
@@ -287,15 +354,16 @@ sudo apt-get install libsqlite3-dev
 
 - First 6 integer/pointer arguments: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`
 - Return value: `rax`
-- Caller-saved: `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8-r11`
-- Callee-saved: `rbx`, `rbp`, `r12-r15`
+- Caller-saved: `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8–r11`
+- Callee-saved: `rbx`, `rbp`, `r12–r15`
 
 ## Security Considerations
 
 1. **Token Security**: Never commit your `.env` file or expose your bot token
-2. **SQL Injection**: The database module uses prepared statements to prevent SQL injection
-3. **Permission Checks**: All moderation commands verify user permissions before execution
-4. **Rate Limiting**: Consider implementing rate limits for commands to prevent abuse
+2. **SQL Injection**: The database module uses prepared statements throughout
+3. **Permission Checks**: All commands verify Discord permissions before executing
+4. **Propagation Abuse**: Every alert is permanently logged with the issuing moderator's ID and guild. Admins can blacklist abusive moderators with `/propagate-revoke`
+5. **No Automatic Action**: Propagation alerts are informational only — receiving guilds decide what action, if any, to take
 
 ## Licence
 
@@ -304,9 +372,9 @@ This project is provided as-is for educational purposes.
 ## Contributing
 
 Contributions are welcome! Areas for improvement:
-- Add more moderation commands (unban, warnings purge, etc.)
+- Move propagation delivery into its own thread to avoid blocking the event loop during large alert batches
+- Add more moderation commands (unban, clear warnings, etc.)
 - Implement auto-moderation features (spam detection, etc.)
-- Add logging channel configuration
-- Create web dashboard for viewing mod logs
-
-- Implement appeal system for warnings/bans
+- Add a logging channel configuration per guild
+- Create a web dashboard for viewing mod logs and propagation history
+- Implement an appeal system for warnings and bans
