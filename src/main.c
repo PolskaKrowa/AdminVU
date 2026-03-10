@@ -11,7 +11,7 @@
 #include "modules/moderation.h"
 #include "modules/ticket.h"
 #include "modules/factcheck.h"
-#include "modules/propagation.h"   /* ← NEW */
+#include "modules/propagation.h"
 
 // Global client pointer for signal handling
 static struct discord *g_client = NULL;
