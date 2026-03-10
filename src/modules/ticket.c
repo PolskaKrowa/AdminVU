@@ -591,20 +591,13 @@ static void log_to_staff_channel(const char *message) {
 
 static void handle_ticket_open(struct discord *client,
                                 const struct discord_interaction *event) {
-    /*
-     * We were already dispatched here because options[0]->name == "open".
-     * The subject is options[0]->options[0].  Use get_active_subcommand()
-     * rather than calling find_option() again (which was the original bug).
-     */
-    const struct discord_application_command_interaction_data_option *sub =
-        get_active_subcommand(event);
-    if (!sub) { reply_ephemeral(client, event, "Missing sub-command data."); return; }
-
+    const struct discord_application_command_interaction_data_option *server_opt =
+        find_option(event, "server");
     const struct discord_application_command_interaction_data_option *subject_opt =
-        find_sub_option(sub, "subject");
-    const char *subject = subject_opt ? subject_opt->value : "No subject provided";
+        find_option(event, "subject");
 
-    /* TODO: create a private channel for the ticket, set permissions, etc. */
+    const char *server_id = server_opt ? server_opt->value : NULL;
+    const char *subject   = subject_opt ? subject_opt->value : "No subject provided";
 
     Ticket t = {
         .channel_id = event->channel_id,   /* Replace with newly created channel */
@@ -1055,23 +1048,24 @@ static void handle_summary(struct discord *client,
 void on_ticket_interaction(struct discord *client,
                             const struct discord_interaction *event) {
     if (!event->data) return;
+
+    /* Ticket commands are guild-only. DMs have no member, no guild channel. */
+    if (!event->guild_id || !event->member) {
+        reply_ephemeral(client, event,
+                        "❌ Tickets can only be used inside a server.");
+        return;
+    }
+
     const char *cmd = event->data->name;
 
     /* ── /ticket ─────────────────────────────────────────────────────────── */
-    if (strcmp(cmd, "ticket") == 0 || strcmp(cmd, "closeticket") == 0) {
-        const struct discord_application_command_interaction_data_option *sub =
-            get_active_subcommand(event);
-        /*
-         * Check the sub-command name directly.  Previously this used
-         * find_option(event, "open") which returned NULL in Orca builds that
-         * don't NULL-terminate options arrays, causing every /ticket invocation
-         * to fall through to handle_ticket_close.
-         */
-        if (sub && strcmp(sub->name, "open") == 0) {
-            handle_ticket_open(client, event);
-        } else {
-            handle_ticket_close(client, event);
-        }
+    if (strcmp(cmd, "ticket") == 0) {
+        handle_ticket_open(client, event);
+        return;
+    }
+
+    if (strcmp(cmd, "closeticket") == 0) {
+        handle_ticket_close(client, event);
         return;
     }
 
@@ -1178,32 +1172,25 @@ void register_ticket_commands(struct discord *client,
 
     /* ── /ticket ──────────────────────────────────────────────────────────── */
     {
-        struct discord_application_command_option open_subject = {
+        struct discord_application_command_option server_opt = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+            .name        = "server",
+            .description = "Server ID to open the ticket in",
+            .required    = true,
+        };
+        struct discord_application_command_option subject_opt = {
             .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
             .name        = "subject",
             .description = "Brief description of your issue",
-            .required    = true,
-        };
-        struct discord_application_command_option *open_opts[] = { &open_subject, NULL };
-
-        struct discord_application_command_option open_sub = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
-            .name        = "open",
-            .description = "Open a new support ticket",
-            .options     = open_opts,
-        };
-        struct discord_application_command_option close_sub = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
-            .name        = "close",
-            .description = "Close this ticket",
+            .required    = false,
         };
         struct discord_application_command_option *ticket_opts[] = {
-            &open_sub, &close_sub, NULL,
+            &server_opt, &subject_opt, NULL,
         };
         struct discord_create_guild_application_command_params ticket_cmd = {
             .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
             .name        = "ticket",
-            .description = "Manage support tickets",
+            .description = "Open a support ticket in a server",
             .options     = ticket_opts,
         };
         REG(&ticket_cmd, "ticket");
