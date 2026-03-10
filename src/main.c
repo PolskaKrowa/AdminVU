@@ -3,8 +3,8 @@
 #include <string.h>
 #include <signal.h>
 #include <inttypes.h>
-#include <orca/discord.h>
 #include <pthread.h>
+#include <orca/discord.h>
 
 #include "env_parser.h"
 #include "database.h"
@@ -14,51 +14,86 @@
 #include "modules/factcheck.h"
 #include "modules/propagation.h"
 
-// Global client pointer for signal handling
-static struct discord *g_client = NULL;
-static Database g_database = { 0 };
+/* ── Global state ─────────────────────────────────────────────────────────── */
 
-// Guild ID read from the environment at startup; used to register
-// guild-scoped slash commands (instant propagation vs. up to 1 h for global).
-static u64_snowflake_t g_guild_id = 0;
+static struct discord *g_client   = NULL;
+static Database        g_database = { 0 };
 
-// Tiny helper: turn a decimal snowflake string into a u64
+/* Parsed guild IDs from DISCORD_GUILD_ID (comma-separated). */
+#define MAX_GUILDS 64
+static u64_snowflake_t g_guild_ids[MAX_GUILDS];
+static int             g_guild_count = 0;
+
+/* ── Helpers ──────────────────────────────────────────────────────────────── */
+
 static u64_snowflake_t parse_snowflake(const char *str) {
-    if (!str)
-        return 0;
+    if (!str) return 0;
     return (u64_snowflake_t)strtoull(str, NULL, 10);
 }
 
-// Signal handler for graceful shutdown
-void signal_handler(int signum) {
-    printf("\nReceived signal %d, shutting down...\n", signum);
-    if (g_client) {
-        discord_shutdown(g_client);
+/*
+ * parse_guild_ids
+ *
+ * Accepts a comma-separated string such as "123456,789012,345678" and
+ * populates g_guild_ids / g_guild_count.  Whitespace around commas is
+ * trimmed so "123, 456 , 789" works too.
+ */
+static int parse_guild_ids(const char *raw) {
+    if (!raw || raw[0] == '\0') return 0;
+
+    /* Work on a mutable copy. */
+    char *buf = strdup(raw);
+    if (!buf) return 0;
+
+    int count = 0;
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, ",", &saveptr);
+
+    while (tok && count < MAX_GUILDS) {
+        /* Trim leading whitespace. */
+        while (*tok == ' ' || *tok == '\t') tok++;
+        /* Trim trailing whitespace. */
+        char *end = tok + strlen(tok) - 1;
+        while (end > tok && (*end == ' ' || *end == '\t')) *end-- = '\0';
+
+        if (*tok != '\0') {
+            u64_snowflake_t id = parse_snowflake(tok);
+            if (id != 0) {
+                g_guild_ids[count++] = id;
+            } else {
+                fprintf(stderr, "[main] Ignoring invalid guild ID: \"%s\"\n", tok);
+            }
+        }
+        tok = strtok_r(NULL, ",", &saveptr);
     }
+
+    free(buf);
+    return count;
 }
 
-/* ---------------------------------------------------------------------------
- * register_slash_commands
- *
- * Registers guild-scoped slash commands for all modules.
- * --------------------------------------------------------------------------- */
+/* ── Signal handling ─────────────────────────────────────────────────────── */
+
+void signal_handler(int signum) {
+    printf("\nReceived signal %d, shutting down...\n", signum);
+    if (g_client)
+        discord_shutdown(g_client);
+}
+
+/* ── Slash-command registration ──────────────────────────────────────────── */
+
 void register_slash_commands(struct discord *client,
                              u64_snowflake_t application_id,
                              u64_snowflake_t guild_id) {
-    /* The "target" option – a USER picker, not required. */
     static struct discord_application_command_option target_option = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_USER,
         .name        = "target",
         .description = "Member to hash (defaults to you)",
         .required    = false,
     };
-
-    /* Orca expects a NULL-terminated array of pointers. */
     static struct discord_application_command_option *options[] = {
         &target_option,
         NULL,
     };
-
     static struct discord_create_guild_application_command_params params = {
         .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
         .name        = "ping",
@@ -70,48 +105,94 @@ void register_slash_commands(struct discord *client,
         client, application_id, guild_id, &params, NULL);
 
     if (code == ORCA_OK)
-        printf("[ping] /ping slash command registered in guild %" PRIu64 "\n",
-               guild_id);
+        printf("[ping] /ping registered in guild %" PRIu64 "\n", guild_id);
     else
-        printf("[ping] Failed to register /ping (ORCAcode %d)\n", code);
+        printf("[ping] Failed to register /ping in guild %" PRIu64
+               " (ORCAcode %d)\n", guild_id, code);
 
-    // Register moderation commands
     register_moderation_commands(client, application_id, guild_id);
-
-    // Register ticket commands (guild-specific ones)
     register_ticket_commands(client, application_id, guild_id);
-
-    // Register propagation commands
     register_propagation_commands(client, application_id, guild_id);
-
-    /* factcheck is triggered via plain messages, not slash commands – no
-     * registration needed here. */
 }
+
+/* ── Background registration thread ─────────────────────────────────────── */
 
 typedef struct {
     struct discord  *client;
     u64_snowflake_t  application_id;
-    u64_snowflake_t  guild_id;
+    /* Snapshot of the guild list at the moment on_ready fires. */
+    u64_snowflake_t  guild_ids[MAX_GUILDS];
+    int              guild_count;
 } RegisterArgs;
 
 static void *register_commands_thread(void *arg) {
     RegisterArgs *a = arg;
-    register_slash_commands(a->client, a->application_id, a->guild_id);
+
+    for (int i = 0; i < a->guild_count; i++) {
+        printf("[main] Registering commands in guild %" PRIu64
+               " (%d/%d)…\n", a->guild_ids[i], i + 1, a->guild_count);
+        register_slash_commands(a->client, a->application_id, a->guild_ids[i]);
+    }
+
+    printf("[main] Command registration complete for %d guild(s).\n",
+           a->guild_count);
     free(a);
     return NULL;
 }
 
-// Combined interaction handler for all modules
+/* ── Event handlers ──────────────────────────────────────────────────────── */
+
+void on_ready(struct discord *client) {
+    printf("Bot is ready!\n");
+
+    struct discord_user *bot = discord_get_self(client);
+    if (bot && bot->username)
+        printf("Logged in as: %s\n", bot->username);
+
+    u64_snowflake_t application_id = bot ? bot->id : 0;
+    if (!application_id) {
+        fprintf(stderr, "[main] Could not obtain application_id – "
+                        "slash commands will not be registered.\n");
+        return;
+    }
+
+    factcheck_module_init(client);
+
+    if (g_guild_count == 0) {
+        fprintf(stderr, "[main] No valid guild IDs – "
+                        "skipping command registration.\n");
+        return;
+    }
+
+    /* Copy state into heap-allocated args so the thread owns its data. */
+    RegisterArgs *args = malloc(sizeof *args);
+    if (!args) {
+        fprintf(stderr, "[main] OOM allocating RegisterArgs.\n");
+        return;
+    }
+    args->client         = client;
+    args->application_id = application_id;
+    args->guild_count    = g_guild_count;
+    memcpy(args->guild_ids, g_guild_ids,
+           (size_t)g_guild_count * sizeof(u64_snowflake_t));
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, register_commands_thread, args) != 0) {
+        fprintf(stderr, "[main] Failed to spawn registration thread.\n");
+        free(args);
+        return;
+    }
+    pthread_detach(tid);
+}
+
 void on_interaction_create_combined(struct discord *client,
                                     const struct discord_interaction *event) {
     if (!event->data) return;
     if (event->type != DISCORD_INTERACTION_APPLICATION_COMMAND) return;
 
     const char *cmd = event->data->name;
-
     printf("[main] Received interaction: %s\n", cmd);
 
-    // Route to appropriate module
     if (strcmp(cmd, "ping") == 0) {
         on_ping_interaction(client, event);
 
@@ -139,45 +220,10 @@ void on_interaction_create_combined(struct discord *client,
     }
 }
 
-// Message handler – routes to all message-driven modules
 void on_message_create(struct discord *client,
                        const struct discord_message *event) {
-    // Ticket module – handles ticket channel messages
     on_ticket_message(client, event);
-
-    // Factcheck module – handles "@bot is this true?" replies
     on_factcheck_message(client, event);
-}
-
-void on_ready(struct discord *client) {
-    printf("Bot is ready!\n");
-
-    struct discord_user *bot = discord_get_self(client);
-    if (bot && bot->username)
-        printf("Logged in as: %s\n", bot->username);
-
-    u64_snowflake_t application_id = bot ? bot->id : 0;
-    if (!application_id) {
-        fprintf(stderr, "[main] Could not obtain application_id.\n");
-        return;
-    }
-
-    factcheck_module_init(client);
-
-    /* Spin up a background thread so the WebSocket heartbeat
-     * is never starved by blocking REST calls.              */
-    RegisterArgs *args = malloc(sizeof *args);
-    args->client         = client;
-    args->application_id = application_id;
-    args->guild_id       = g_guild_id;
-
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, register_commands_thread, args) != 0) {
-        fprintf(stderr, "[main] Failed to spawn registration thread.\n");
-        free(args);
-        return;
-    }
-    pthread_detach(tid);   /* fire-and-forget; thread frees its own args */
 }
 
 static void on_guild_create_handler(struct discord *client,
@@ -186,41 +232,47 @@ static void on_guild_create_handler(struct discord *client,
         propagation_on_guild_register(guild->id);
 }
 
-int main(int argc, char *argv[]) {
-    // Try to load .env file from parent directory
-    printf("Loading environment from ../.env\n");
-    if (load_env_file("../.env") == 0) {
-        printf("Successfully loaded .env file\n");
-    } else {
-        printf("No .env file found, will use environment variables\n");
-    }
+/* ── Entry point ─────────────────────────────────────────────────────────── */
 
-    // Get token from environment (checks both actual env and .env file)
+int main(int argc, char *argv[]) {
+    printf("Loading environment from ../.env\n");
+    if (load_env_file("../.env") == 0)
+        printf("Successfully loaded .env file\n");
+    else
+        printf("No .env file found, will use environment variables\n");
+
+    /* Token */
     const char *token = get_env("DISCORD_BOT_TOKEN");
     if (!token) {
         fprintf(stderr, "Error: DISCORD_BOT_TOKEN not found\n");
-        fprintf(stderr, "Please either:\n");
-        fprintf(stderr, "  1. Create a .env file in the parent directory with DISCORD_BOT_TOKEN=your_token\n");
-        fprintf(stderr, "  2. Set the DISCORD_BOT_TOKEN environment variable\n");
+        fprintf(stderr, "  1. Create a .env file with DISCORD_BOT_TOKEN=your_token\n");
+        fprintf(stderr, "  2. Or set the DISCORD_BOT_TOKEN environment variable\n");
         cleanup_env();
         return EXIT_FAILURE;
     }
 
-    // Get guild ID
+    /* Guild IDs – comma-separated, e.g. "123456789,987654321" */
     const char *guild_id_str = get_env("DISCORD_GUILD_ID");
     if (!guild_id_str) {
         fprintf(stderr, "Error: DISCORD_GUILD_ID not found\n");
-        fprintf(stderr, "Guild-scoped slash commands need a guild ID.  Please either:\n");
-        fprintf(stderr, "  1. Add DISCORD_GUILD_ID=<id> to your .env file\n");
-        fprintf(stderr, "  2. Set the DISCORD_GUILD_ID environment variable\n");
-        fprintf(stderr, "  (Enable Developer Mode in Discord to copy your server ID)\n");
+        fprintf(stderr, "  Set one or more comma-separated guild IDs, e.g.:\n");
+        fprintf(stderr, "  DISCORD_GUILD_ID=123456789,987654321\n");
         cleanup_env();
         return EXIT_FAILURE;
     }
-    g_guild_id = parse_snowflake(guild_id_str);
-    printf("Target guild ID: %" PRIu64 "\n", g_guild_id);
 
-    // Initialise database
+    g_guild_count = parse_guild_ids(guild_id_str);
+    if (g_guild_count == 0) {
+        fprintf(stderr, "Error: DISCORD_GUILD_ID contained no valid IDs\n");
+        cleanup_env();
+        return EXIT_FAILURE;
+    }
+
+    printf("Registering commands in %d guild(s):\n", g_guild_count);
+    for (int i = 0; i < g_guild_count; i++)
+        printf("  [%d] %" PRIu64 "\n", i + 1, g_guild_ids[i]);
+
+    /* Database */
     printf("Initialising database...\n");
     if (db_init(&g_database, "bot_data.db") != 0) {
         fprintf(stderr, "Error: Failed to initialise database\n");
@@ -228,11 +280,11 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Set up signal handlers
-    signal(SIGINT, signal_handler);
+    /* Signals */
+    signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
-    // Create Discord client with the simplest API
+    /* Discord client */
     struct discord *client = discord_init(token);
     if (!client) {
         fprintf(stderr, "Error: Failed to initialise Discord client\n");
@@ -240,32 +292,28 @@ int main(int argc, char *argv[]) {
         cleanup_env();
         return EXIT_FAILURE;
     }
-
     g_client = client;
 
-    // Set up event handlers
-    discord_set_on_ready(client, (void*)&on_ready);
+    /* Event hooks */
+    discord_set_on_ready(client, (void *)&on_ready);
     discord_set_on_interaction_create(client, &on_interaction_create_combined);
     discord_set_on_message_create(client, &on_message_create);
     discord_set_on_guild_create(client, on_guild_create_handler);
 
-    // Initialise modules
+    /* Module init – pass the first guild ID where a single value is needed;
+     * command registration handles all guilds inside on_ready().          */
     printf("Initialising modules...\n");
-    ping_module_init(client, g_guild_id);
-    moderation_module_init(client, &g_database, g_guild_id, token);
+    ping_module_init(client, g_guild_ids[0]);
+    moderation_module_init(client, &g_database, g_guild_ids[0], token);
     ticket_module_init(client, &g_database);
-    propagation_module_init(client, &g_database, g_guild_id);
-
-    // Factcheck module – early init so the bot ID can be captured before
-    // the first message arrives.  It will be re-initialised in on_ready()
-    // once the bot is properly connected and the ID is guaranteed valid.
+    propagation_module_init(client, &g_database, g_guild_ids[0]);
     factcheck_module_init(client);
 
-    // Start the bot
+    /* Run */
     printf("Starting bot...\n");
     discord_run(client);
 
-    // Cleanup
+    /* Cleanup */
     discord_cleanup(client);
     db_cleanup(&g_database);
     cleanup_env();
