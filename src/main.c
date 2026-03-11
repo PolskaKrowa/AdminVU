@@ -204,7 +204,6 @@ void on_interaction_create_combined(struct discord *client,
         on_moderation_interaction(client, event);
 
     } else if (strcmp(cmd, "ticket")       == 0 ||
-               strcmp(cmd, "closeticket")  == 0 ||
                strcmp(cmd, "ticketconfig") == 0) {
         on_ticket_interaction(client, event);
 
