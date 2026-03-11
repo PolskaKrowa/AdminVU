@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <div class="scanline"></div>
+
+    <header class="site-header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-bracket">[</span>
+                <span class="logo-text">BOT</span>
+                <span class="logo-bracket">]</span>
+            </div>
+            <nav class="site-nav">
+                <a href="index.html" class="nav-link active">Dashboard</a>
+                <!-- Add more nav links here as you add pages -->
+            </nav>
+            <div class="status-badge">
+                <span class="status-dot" id="status-dot"></span>
+                <span class="status-label" id="status-label">connecting…</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-content">
+
+        <section class="hero">
+            <p class="hero-eyebrow">// system overview</p>
+            <h1 class="hero-title">Dashboard</h1>
+            <p class="hero-sub">Local admin panel &mdash; accessible only from this machine.</p>
+        </section>
+
+        <div class="card-grid">
+
+            <div class="card" id="card-uptime">
+                <div class="card-label">Uptime</div>
+                <div class="card-value mono" id="uptime-value">--:--:--</div>
+                <div class="card-sub">since process start</div>
+            </div>
+
+            <div class="card" id="card-guilds">
+                <div class="card-label">Guilds</div>
+                <div class="card-value mono" id="guilds-value">&mdash;</div>
+                <div class="card-sub">registered servers</div>
+            </div>
+
+            <div class="card" id="card-commands">
+                <div class="card-label">Commands</div>
+                <div class="card-value mono" id="commands-value">&mdash;</div>
+                <div class="card-sub">slash commands active</div>
+            </div>
+
+            <div class="card" id="card-warnings">
+                <div class="card-label">Warnings Logged</div>
+                <div class="card-value mono" id="warnings-value">&mdash;</div>
+                <div class="card-sub">all time, all guilds</div>
+            </div>
+
+        </div>
+
+        <section class="log-section">
+            <div class="log-header">
+                <span class="log-title">// recent activity</span>
+                <button class="log-clear-btn" id="log-clear">clear</button>
+            </div>
+            <div class="log-body" id="log-body">
+                <div class="log-line log-info">
+                    <span class="log-time" id="init-time"></span>
+                    <span class="log-msg">Dashboard initialised. Waiting for data&hellip;</span>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <footer class="site-footer">
+        <span>running on <span class="mono">127.0.0.1:8080</span></span>
+        <span class="footer-sep">&middot;</span>
+        <span id="footer-time" class="mono"></span>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>

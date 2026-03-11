@@ -9,6 +9,7 @@ add_executable(discord_bot
     env_parser.c
     database.c
     database_propagation.c
+    http_server.c
     modules/ping.c
     modules/moderation.c
     modules/ticket.c
