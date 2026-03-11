@@ -340,10 +340,10 @@ static void cmd_roll(struct discord *client,
     long max_val = 100; /* default */
 
     if (event->data->options) {
-        for (int i = 0; event->data->options->array &&
-                        i < event->data->options->size; i++) {
+        for (int i = 0; event->data->options[i] &&
+                        i < (int)(sizeof(event->data->options) / sizeof(*event->data->options)); i++) {
             struct discord_application_command_interaction_data_option *opt =
-                &event->data->options->array[i];
+                event->data->options[i];
             if (strcmp(opt->name, "max") == 0 && opt->value)
                 max_val = atol(opt->value);
         }
@@ -366,10 +366,10 @@ static void cmd_8ball(struct discord *client,
     char question[512] = "(your question)";
 
     if (event->data->options) {
-        for (int i = 0; event->data->options->array &&
-                        i < event->data->options->size; i++) {
+        for (int i = 0; event->data->options[i] &&
+                        i < (int)(sizeof(event->data->options) / sizeof(*event->data->options)); i++) {
             struct discord_application_command_interaction_data_option *opt =
-                &event->data->options->array[i];
+                event->data->options[i];
             if (strcmp(opt->name, "question") == 0 && opt->value)
                 strncpy(question, opt->value, sizeof question - 1);
         }
@@ -389,10 +389,9 @@ static void cmd_choose(struct discord *client,
     char list[2048] = "";
 
     if (event->data->options) {
-        for (int i = 0; event->data->options->array &&
-                        i < event->data->options->size; i++) {
+        for (int i = 0; event->data->options[i]; i++) {
             struct discord_application_command_interaction_data_option *opt =
-                &event->data->options->array[i];
+                event->data->options[i];
             if (strcmp(opt->name, "options") == 0 && opt->value)
                 strncpy(list, opt->value, sizeof list - 1);
         }
@@ -442,10 +441,9 @@ static void cmd_rps(struct discord *client,
     char choice_str[32] = "";
 
     if (event->data->options) {
-        for (int i = 0; event->data->options->array &&
-                        i < event->data->options->size; i++) {
+        for (int i = 0; event->data->options[i]; i++) {
             struct discord_application_command_interaction_data_option *opt =
-                &event->data->options->array[i];
+                event->data->options[i];
             if (strcmp(opt->name, "choice") == 0 && opt->value)
                 strncpy(choice_str, opt->value, sizeof choice_str - 1);
         }

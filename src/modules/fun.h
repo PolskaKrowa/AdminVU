@@ -11,4 +11,6 @@ void register_fun_commands(struct discord *client,
 void on_fun_interaction(struct discord *client,
                         const struct discord_interaction *event);
 
+void fun_track_message(u64_snowflake_t channel_id, const char *channel_name);
+
 #endif /* FUN_H */
