@@ -16,6 +16,7 @@ add_executable(discord_bot
     modules/ticket.c
     modules/factcheck.c
     modules/propagation.c
+    modules/fun.c
 )
 
 target_link_libraries(discord_bot

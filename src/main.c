@@ -13,6 +13,7 @@
 #include "modules/ticket.h"
 #include "modules/factcheck.h"
 #include "modules/propagation.h"
+#include "modules/fun.h"
 
 /* ── Global state ─────────────────────────────────────────────────────────── */
 
@@ -113,6 +114,7 @@ void register_slash_commands(struct discord *client,
     register_moderation_commands(client, application_id, guild_id);
     register_ticket_commands(client, application_id, guild_id);
     register_propagation_commands(client, application_id, guild_id);
+    register_fun_commands(client, application_id, guild_id);
 }
 
 /* ── Background registration thread ─────────────────────────────────────── */
@@ -188,6 +190,17 @@ void on_ready(struct discord *client) {
 void on_interaction_create_combined(struct discord *client,
                                     const struct discord_interaction *event) {
     if (!event->data) return;
+
+    /* Component interactions (e.g. trivia buttons) don't have a name –
+     * route them to the fun module directly. */
+    if (event->type == DISCORD_INTERACTION_MESSAGE_COMPONENT) {
+        if (event->data->custom_id &&
+            strncmp(event->data->custom_id, "trivia:", 7) == 0) {
+            on_fun_interaction(client, event);
+        }
+        return;
+    }
+
     if (event->type != DISCORD_INTERACTION_APPLICATION_COMMAND) return;
 
     const char *cmd = event->data->name;
@@ -214,6 +227,16 @@ void on_interaction_create_combined(struct discord *client,
                strcmp(cmd, "propagate-revoke")  == 0) {
         on_propagation_interaction(client, event);
 
+    } else if (strcmp(cmd, "joke")     == 0 ||
+               strcmp(cmd, "roll")     == 0 ||
+               strcmp(cmd, "8ball")    == 0 ||
+               strcmp(cmd, "choose")   == 0 ||
+               strcmp(cmd, "coinflip") == 0 ||
+               strcmp(cmd, "rps")      == 0 ||
+               strcmp(cmd, "trivia")   == 0 ||
+               strcmp(cmd, "activity") == 0) {
+        on_fun_interaction(client, event);
+
     } else {
         printf("[main] Unknown command: %s\n", cmd);
     }
@@ -223,6 +246,11 @@ void on_message_create(struct discord *client,
                        const struct discord_message *event) {
     on_ticket_message(client, event);
     on_factcheck_message(client, event);
+
+    /* Track channel activity for /activity */
+    if (event->channel_id)
+        fun_track_message(event->channel_id,
+                          event->channel_id ? NULL : NULL);
 }
 
 static void on_guild_create_handler(struct discord *client,
@@ -307,6 +335,7 @@ int main(int argc, char *argv[]) {
     ticket_module_init(client, &g_database);
     propagation_module_init(client, &g_database, g_guild_ids[0]);
     factcheck_module_init(client);
+    fun_module_init(client, &g_database);
 
     /* Run */
     printf("Starting bot...\n");
