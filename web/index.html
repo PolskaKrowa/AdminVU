@@ -18,8 +18,10 @@
                 <span class="logo-bracket">]</span>
             </div>
             <nav class="site-nav">
-                <a href="index.html" class="nav-link active">Dashboard</a>
-                <!-- Add more nav links here as you add pages -->
+                <a href="index.html"       class="nav-link active">Dashboard</a>
+                <a href="moderation.html"  class="nav-link">Moderation</a>
+                <a href="propagation.html" class="nav-link">Propagation</a>
+                <a href="tickets.html"     class="nav-link">Tickets</a>
             </nav>
             <div class="status-badge">
                 <span class="status-dot" id="status-dot"></span>
@@ -37,31 +39,31 @@
         </section>
 
         <div class="card-grid">
-
             <div class="card" id="card-uptime">
                 <div class="card-label">Uptime</div>
                 <div class="card-value mono" id="uptime-value">--:--:--</div>
                 <div class="card-sub">since process start</div>
             </div>
-
             <div class="card" id="card-guilds">
                 <div class="card-label">Guilds</div>
                 <div class="card-value mono" id="guilds-value">&mdash;</div>
                 <div class="card-sub">registered servers</div>
             </div>
-
-            <div class="card" id="card-commands">
-                <div class="card-label">Commands</div>
-                <div class="card-value mono" id="commands-value">&mdash;</div>
-                <div class="card-sub">slash commands active</div>
-            </div>
-
             <div class="card" id="card-warnings">
                 <div class="card-label">Warnings Logged</div>
                 <div class="card-value mono" id="warnings-value">&mdash;</div>
                 <div class="card-sub">all time, all guilds</div>
             </div>
-
+            <div class="card" id="card-tickets">
+                <div class="card-label">Open Tickets</div>
+                <div class="card-value mono" id="tickets-value">&mdash;</div>
+                <div class="card-sub">unresolved</div>
+            </div>
+            <div class="card" id="card-propagation">
+                <div class="card-label">Propagation Alerts</div>
+                <div class="card-value mono" id="prop-value">&mdash;</div>
+                <div class="card-sub">cross-server events total</div>
+            </div>
         </div>
 
         <section class="log-section">
@@ -86,5 +88,24 @@
     </footer>
 
     <script src="script.js"></script>
+    <script>
+    async function refreshStatus() {
+        const data = await apiGet('/api/status');
+        if (!data) { setStatus('offline'); return; }
+        setStatus('online');
+        setCardValue('card-guilds',      data.guild_count);
+        setCardValue('card-warnings',    data.warning_count);
+        setCardValue('card-tickets',     data.open_tickets);
+        setCardValue('card-propagation', data.propagation_events);
+        appendLog('Status refreshed.', LogLevel.OK);
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        startFooterClock();
+        startUptimeClock();
+        refreshStatus();
+        setInterval(refreshStatus, 15000);
+    });
+    </script>
 </body>
 </html>

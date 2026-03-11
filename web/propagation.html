@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Propagation — Bot Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="scanline"></div>
+
+    <header class="site-header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-bracket">[</span>
+                <span class="logo-text">BOT</span>
+                <span class="logo-bracket">]</span>
+            </div>
+            <nav class="site-nav">
+                <a href="index.html"       class="nav-link">Dashboard</a>
+                <a href="moderation.html"  class="nav-link">Moderation</a>
+                <a href="propagation.html" class="nav-link active">Propagation</a>
+                <a href="tickets.html"     class="nav-link">Tickets</a>
+            </nav>
+            <div class="status-badge">
+                <span class="status-dot" id="status-dot"></span>
+                <span class="status-label" id="status-label">connecting…</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-content">
+
+        <section class="hero">
+            <p class="hero-eyebrow">// propagation</p>
+            <h1 class="hero-title">Cross-Server Alerts</h1>
+            <p class="hero-sub">Manage opt-in servers, review propagated warnings, and block bad actors.</p>
+        </section>
+
+        <!-- Two-column layout: guilds list + events log -->
+        <div class="split-layout">
+
+            <!-- Left: Opted-in guilds -->
+            <div class="split-pane" id="pane-guilds">
+                <div class="pane-header">
+                    <span class="pane-title">// opted-in servers</span>
+                    <button class="btn-refresh small" id="guilds-refresh">↺</button>
+                </div>
+                <div id="guilds-list">
+                    <div class="pane-loading">Loading servers…</div>
+                </div>
+
+                <!-- Block a server manually -->
+                <div class="pane-divider"></div>
+                <div class="pane-header">
+                    <span class="pane-title">// block a server</span>
+                </div>
+                <div class="block-form">
+                    <input class="filter-input" id="block-guild-id"
+                           placeholder="Server ID to block" type="text" />
+                    <input class="filter-input" id="block-reason"
+                           placeholder="Reason (optional)" type="text" />
+                    <button class="btn-danger" id="block-btn">Block Server</button>
+                </div>
+                <div id="block-feedback" class="feedback-msg" style="display:none"></div>
+            </div>
+
+            <!-- Right: Events log -->
+            <div class="split-pane split-pane-wide" id="pane-events">
+                <div class="pane-header">
+                    <span class="pane-title">// alert history</span>
+                    <div class="pane-actions">
+                        <input class="filter-input small" id="event-user-filter"
+                               placeholder="Filter by user ID…" type="text" />
+                        <button class="btn-refresh small" id="events-refresh">↺</button>
+                    </div>
+                </div>
+
+                <div id="events-status" class="table-status">Loading…</div>
+                <table class="data-table" id="events-table" style="display:none">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Time</th>
+                            <th>Target</th>
+                            <th>Source Server</th>
+                            <th>Moderator</th>
+                            <th>Notified</th>
+                            <th>Reason / Evidence</th>
+                        </tr>
+                    </thead>
+                    <tbody id="events-tbody"></tbody>
+                </table>
+
+                <div class="pagination" id="events-pagination">
+                    <button class="btn-page" id="ev-prev" disabled>← Prev</button>
+                    <span class="page-info" id="ev-page-info">—</span>
+                    <button class="btn-page" id="ev-next" disabled>Next →</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Blocked servers panel -->
+        <div class="section-header">
+            <span class="section-title">// blocked servers</span>
+            <button class="btn-refresh small" id="blocked-refresh">↺</button>
+        </div>
+        <div id="blocked-status" class="table-status" style="display:none">Loading…</div>
+        <table class="data-table" id="blocked-table">
+            <thead>
+                <tr>
+                    <th>Server ID</th>
+                    <th>Blocked At</th>
+                    <th>Reason</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="blocked-tbody">
+                <tr><td colspan="4" class="empty-row">No servers are currently blocked.</td></tr>
+            </tbody>
+        </table>
+
+    </main>
+
+    <footer class="site-footer">
+        <span>running on <span class="mono">127.0.0.1:8080</span></span>
+        <span class="footer-sep">&middot;</span>
+        <span id="footer-time" class="mono"></span>
+    </footer>
+
+    <script src="script.js"></script>
+    <script>
+    /* ── Propagation page logic ──────────────────────────────────────── */
+
+    const EV_PAGE_SIZE = 50;
+    let evOffset = 0;
+    let evUserFilter = '';
+
+    /* ── Load opted-in guilds ─────────────────────────────────────────── */
+    async function loadGuilds() {
+        const container = document.getElementById('guilds-list');
+        container.innerHTML = '<div class="pane-loading">Loading…</div>';
+
+        const guilds = await apiGet('/api/propagation/guilds');
+        if (!guilds) {
+            container.innerHTML = '<div class="pane-error">Failed to load.</div>';
+            return;
+        }
+        if (guilds.length === 0) {
+            container.innerHTML = '<div class="pane-empty">No servers have configured propagation yet.</div>';
+            return;
+        }
+
+        let html = '';
+        guilds.forEach(g => {
+            const blocked = g.is_blocked;
+            html += `
+            <div class="guild-row ${blocked ? 'guild-blocked' : ''}">
+                <div class="guild-info">
+                    <span class="guild-id mono">${shortId(g.guild_id)}</span>
+                    <span class="guild-full mono muted" title="${g.guild_id}">${g.guild_id}</span>
+                    <span class="guild-channel muted">ch: ${shortId(g.channel_id)}</span>
+                </div>
+                <div class="guild-badges">
+                    <span class="badge ${g.opted_in ? 'badge-ok' : 'badge-muted'}">
+                        ${g.opted_in ? '✓ opted in' : '✗ opted out'}
+                    </span>
+                    ${blocked ? `<span class="badge badge-danger">⛔ blocked</span>` : ''}
+                </div>
+                <div class="guild-actions">
+                    ${blocked
+                        ? `<button class="btn-sm btn-ok" onclick="unblockGuild('${g.guild_id}')">Unblock</button>`
+                        : `<button class="btn-sm btn-danger-sm" onclick="blockGuild('${g.guild_id}')">Block</button>`
+                    }
+                </div>
+            </div>`;
+        });
+        container.innerHTML = html;
+    }
+
+    /* ── Load events ──────────────────────────────────────────────────── */
+    async function loadEvents() {
+        const tbody  = document.getElementById('events-tbody');
+        const table  = document.getElementById('events-table');
+        const status = document.getElementById('events-status');
+
+        status.textContent = 'Loading…';
+        status.style.display = 'block';
+        table.style.display  = 'none';
+
+        const params = new URLSearchParams({ limit: EV_PAGE_SIZE, offset: evOffset });
+        if (evUserFilter) params.set('user_id', evUserFilter);
+
+        const data = await apiGet('/api/propagation/events?' + params.toString());
+        if (!data) { status.textContent = 'Failed to load.'; return; }
+
+        const rows = data.items || [];
+        if (rows.length === 0) {
+            status.textContent = 'No propagation events found.';
+            return;
+        }
+
+        tbody.innerHTML = '';
+        rows.forEach(ev => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td class="mono muted">#${ev.id}</td>
+                <td class="mono muted">${fmtTs(ev.timestamp)}</td>
+                <td class="mono copyable" title="${ev.target_user_id}">${shortId(ev.target_user_id)}</td>
+                <td class="mono muted" title="${ev.source_guild_id}">${shortId(ev.source_guild_id)}</td>
+                <td class="mono muted" title="${ev.moderator_id}">${shortId(ev.moderator_id)}</td>
+                <td class="mono">${ev.notified_count}</td>
+                <td class="reason-cell">
+                    <span>${esc(ev.reason || '—')}</span>
+                    ${ev.evidence_url
+                        ? `<a class="evidence-link" href="${esc(ev.evidence_url)}" target="_blank" rel="noopener">🔗 evidence</a>`
+                        : ''}
+                </td>
+            `;
+            tbody.appendChild(tr);
+        });
+
+        status.style.display = 'none';
+        table.style.display  = 'table';
+
+        const prev = document.getElementById('ev-prev');
+        const next = document.getElementById('ev-next');
+        const info = document.getElementById('ev-page-info');
+        prev.disabled = evOffset === 0;
+        next.disabled = rows.length < EV_PAGE_SIZE;
+        info.textContent = `page ${Math.floor(evOffset / EV_PAGE_SIZE) + 1}`;
+    }
+
+    /* ── Load blocked guilds ──────────────────────────────────────────── */
+    async function loadBlocked() {
+        const tbody = document.getElementById('blocked-tbody');
+        const data  = await apiGet('/api/propagation/blocked');
+        if (!data || data.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" class="empty-row">No servers are currently blocked.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = '';
+        data.forEach(b => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td class="mono copyable" title="${b.guild_id}">${b.guild_id}</td>
+                <td class="mono muted">${fmtTs(b.blocked_at)}</td>
+                <td class="reason-cell">${esc(b.reason || '—')}</td>
+                <td><button class="btn-sm btn-ok"
+                    onclick="unblockGuild('${b.guild_id}')">Unblock</button></td>
+            `;
+            tbody.appendChild(tr);
+        });
+    }
+
+    /* ── Block / unblock ──────────────────────────────────────────────── */
+    async function blockGuild(guildId, reason) {
+        reason = reason || '';
+        const body = `guild_id=${encodeURIComponent(guildId)}&reason=${encodeURIComponent(reason)}`;
+        const res  = await apiPost('/api/propagation/block', body);
+        if (res && res.ok) {
+            appendLog(`Blocked server ${shortId(guildId)}.`, LogLevel.WARN);
+            loadGuilds();
+            loadBlocked();
+        } else {
+            appendLog(`Failed to block ${shortId(guildId)}.`, LogLevel.ERROR);
+        }
+    }
+
+    async function unblockGuild(guildId) {
+        const body = `guild_id=${encodeURIComponent(guildId)}`;
+        const res  = await apiPost('/api/propagation/unblock', body);
+        if (res && res.ok) {
+            appendLog(`Unblocked server ${shortId(guildId)}.`, LogLevel.OK);
+            loadGuilds();
+            loadBlocked();
+        } else {
+            appendLog(`Failed to unblock ${shortId(guildId)}.`, LogLevel.ERROR);
+        }
+    }
+
+    /* ── Event bindings ───────────────────────────────────────────────── */
+    document.getElementById('guilds-refresh').addEventListener('click', loadGuilds);
+    document.getElementById('events-refresh').addEventListener('click', () => { evOffset = 0; loadEvents(); });
+    document.getElementById('blocked-refresh').addEventListener('click', loadBlocked);
+
+    document.getElementById('event-user-filter').addEventListener('keydown', e => {
+        if (e.key === 'Enter') {
+            evUserFilter = e.target.value.trim();
+            evOffset = 0;
+            loadEvents();
+        }
+    });
+
+    document.getElementById('block-btn').addEventListener('click', () => {
+        const guildId = document.getElementById('block-guild-id').value.trim();
+        const reason  = document.getElementById('block-reason').value.trim();
+        const fb      = document.getElementById('block-feedback');
+        if (!guildId) {
+            fb.textContent = 'Please enter a server ID.';
+            fb.className   = 'feedback-msg feedback-error';
+            fb.style.display = 'block';
+            return;
+        }
+        fb.style.display = 'none';
+        blockGuild(guildId, reason);
+        document.getElementById('block-guild-id').value = '';
+        document.getElementById('block-reason').value   = '';
+    });
+
+    document.getElementById('ev-prev').addEventListener('click', () => {
+        if (evOffset >= EV_PAGE_SIZE) { evOffset -= EV_PAGE_SIZE; loadEvents(); }
+    });
+    document.getElementById('ev-next').addEventListener('click', () => {
+        evOffset += EV_PAGE_SIZE; loadEvents();
+    });
+
+    /* ── Boot ──────────────────────────────────────────────────────────── */
+    document.addEventListener('DOMContentLoaded', () => {
+        startFooterClock();
+        setStatus('online');
+        loadGuilds();
+        loadEvents();
+        loadBlocked();
+    });
+    </script>
+</body>
+</html>

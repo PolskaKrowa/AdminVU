@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tickets — Bot Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="scanline"></div>
+
+    <header class="site-header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-bracket">[</span>
+                <span class="logo-text">BOT</span>
+                <span class="logo-bracket">]</span>
+            </div>
+            <nav class="site-nav">
+                <a href="index.html"       class="nav-link">Dashboard</a>
+                <a href="moderation.html"  class="nav-link">Moderation</a>
+                <a href="propagation.html" class="nav-link">Propagation</a>
+                <a href="tickets.html"     class="nav-link active">Tickets</a>
+            </nav>
+            <div class="status-badge">
+                <span class="status-dot" id="status-dot"></span>
+                <span class="status-label" id="status-label">connecting…</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-content">
+
+        <section class="hero">
+            <p class="hero-eyebrow">// support tickets</p>
+            <h1 class="hero-title">Tickets</h1>
+            <p class="hero-sub">Live view of all support tickets across every server.</p>
+        </section>
+
+        <!-- Filters -->
+        <div class="filter-bar">
+            <div class="filter-group">
+                <label class="filter-label">Server</label>
+                <select class="filter-select" id="guild-select">
+                    <option value="">All servers</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label class="filter-label">Status</label>
+                <div class="tab-bar" id="status-tabs">
+                    <button class="tab active" data-status="all">All</button>
+                    <button class="tab" data-status="0">Open</button>
+                    <button class="tab" data-status="1">In Progress</button>
+                    <button class="tab" data-status="2">Pending</button>
+                    <button class="tab" data-status="3">Resolved</button>
+                    <button class="tab" data-status="4">Closed</button>
+                </div>
+            </div>
+            <button class="btn-refresh" id="refresh-btn">↺ Refresh</button>
+        </div>
+
+        <!-- Ticket table -->
+        <div class="table-container">
+            <div class="table-status" id="table-status">Loading…</div>
+            <table class="data-table" id="ticket-table" style="display:none">
+                <thead>
+                    <tr>
+                        <th class="col-id-sm">#</th>
+                        <th>Subject</th>
+                        <th class="col-id">Server</th>
+                        <th class="col-id">Opener</th>
+                        <th class="col-id">Assigned</th>
+                        <th>Status</th>
+                        <th>Priority</th>
+                        <th class="col-time">Created</th>
+                    </tr>
+                </thead>
+                <tbody id="ticket-tbody"></tbody>
+            </table>
+        </div>
+
+        <!-- Ticket detail drawer -->
+        <div class="detail-drawer" id="detail-drawer" style="display:none">
+            <div class="drawer-header">
+                <span class="drawer-title" id="drawer-title">Ticket #—</span>
+                <button class="drawer-close" id="drawer-close">✕</button>
+            </div>
+            <div class="drawer-body" id="drawer-body">
+                <!-- Populated by JS -->
+            </div>
+        </div>
+
+    </main>
+
+    <footer class="site-footer">
+        <span>running on <span class="mono">127.0.0.1:8080</span></span>
+        <span class="footer-sep">&middot;</span>
+        <span id="footer-time" class="mono"></span>
+    </footer>
+
+    <script src="script.js"></script>
+    <script>
+    /* ── Tickets page logic ──────────────────────────────────────────── */
+
+    let currentStatus = 'all';
+    let currentGuild  = '';
+
+    const STATUS_CLASS = ['status-open','status-progress','status-pending',
+                          'status-resolved','status-closed'];
+    const PRIORITY_CLASS = ['pri-low','pri-medium','pri-high','pri-urgent'];
+
+    async function loadGuilds() {
+        const guilds = await apiGet('/api/guilds');
+        if (!guilds) return;
+        const sel = document.getElementById('guild-select');
+        guilds.forEach(g => {
+            const opt = document.createElement('option');
+            opt.value = g.guild_id;
+            opt.textContent = `Server ${shortId(g.guild_id)}  (${g.ticket_count} tickets)`;
+            sel.appendChild(opt);
+        });
+    }
+
+    async function loadTickets() {
+        const tbody  = document.getElementById('ticket-tbody');
+        const table  = document.getElementById('ticket-table');
+        const status = document.getElementById('table-status');
+
+        status.textContent = 'Loading…';
+        status.style.display = 'block';
+        table.style.display  = 'none';
+        hideDrawer();
+
+        const params = new URLSearchParams();
+        if (currentGuild)              params.set('guild_id', currentGuild);
+        if (currentStatus !== 'all')   params.set('status',   currentStatus);
+
+        const data = await apiGet('/api/tickets?' + params.toString());
+        if (!data) { status.textContent = 'Failed to load data.'; return; }
+
+        if (data.length === 0) {
+            status.textContent = 'No tickets found.';
+            return;
+        }
+
+        tbody.innerHTML = '';
+        data.forEach(t => {
+            const tr = document.createElement('tr');
+            tr.className = 'clickable-row';
+            tr.dataset.ticketId = t.id;
+            const sc = STATUS_CLASS[t.status]   || '';
+            const pc = PRIORITY_CLASS[t.priority] || '';
+            tr.innerHTML = `
+                <td class="mono muted">${t.id}</td>
+                <td class="subject-cell">${esc(t.subject || '—')}</td>
+                <td class="mono muted" title="${t.guild_id}">${shortId(t.guild_id)}</td>
+                <td class="mono copyable" title="${t.opener_id}">${shortId(t.opener_id)}</td>
+                <td class="mono muted" title="${t.assigned_to}">
+                    ${t.assigned_to && t.assigned_to !== '0'
+                        ? shortId(t.assigned_to)
+                        : '<span class="unassigned">—</span>'}
+                </td>
+                <td><span class="badge ${sc}">${t.status_name}</span></td>
+                <td><span class="badge ${pc}">${t.priority_name}</span></td>
+                <td class="mono muted">${fmtTs(t.created_at)}</td>
+            `;
+            tr.addEventListener('click', () => openTicket(t.id));
+            tbody.appendChild(tr);
+        });
+
+        status.style.display = 'none';
+        table.style.display  = 'table';
+        appendLog(`Loaded ${data.length} tickets.`, LogLevel.OK);
+    }
+
+    /* ── Ticket detail drawer ──────────────────────────────────────────── */
+    async function openTicket(id) {
+        const drawer = document.getElementById('detail-drawer');
+        const title  = document.getElementById('drawer-title');
+        const body   = document.getElementById('drawer-body');
+
+        title.textContent = `Ticket #${id}`;
+        body.innerHTML    = '<div class="drawer-loading">Loading…</div>';
+        drawer.style.display = 'block';
+
+        const t = await apiGet(`/api/tickets/${id}`);
+        if (!t || t.error) {
+            body.innerHTML = '<div class="drawer-error">Failed to load ticket details.</div>';
+            return;
+        }
+
+        const sc = STATUS_CLASS[t.status]    || '';
+        const pc = PRIORITY_CLASS[t.priority] || '';
+
+        let html = `
+        <div class="detail-grid">
+            <div class="detail-row">
+                <span class="detail-label">Subject</span>
+                <span class="detail-value">${esc(t.subject || '—')}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Server</span>
+                <span class="detail-value mono">${t.guild_id}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Opened by</span>
+                <span class="detail-value mono">${t.opener_id}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Assigned to</span>
+                <span class="detail-value mono">
+                    ${t.assigned_to && t.assigned_to !== '0' ? t.assigned_to : '—'}
+                </span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Status</span>
+                <span class="detail-value"><span class="badge ${sc}">${t.status_name}</span></span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Priority</span>
+                <span class="detail-value"><span class="badge ${pc}">${t.priority_name}</span></span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Outcome</span>
+                <span class="detail-value">${esc(t.outcome_name)}</span>
+            </div>
+            ${t.outcome_notes ? `
+            <div class="detail-row">
+                <span class="detail-label">Outcome notes</span>
+                <span class="detail-value">${esc(t.outcome_notes)}</span>
+            </div>` : ''}
+            <div class="detail-row">
+                <span class="detail-label">Created</span>
+                <span class="detail-value mono">${fmtTs(t.created_at)}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">Updated</span>
+                <span class="detail-value mono">${fmtTs(t.updated_at)}</span>
+            </div>
+        </div>`;
+
+        /* Notes */
+        const notes = t.notes || [];
+        if (notes.length > 0) {
+            html += `<div class="notes-section">
+                <div class="notes-title">// staff notes (${notes.length})</div>`;
+            notes.forEach(n => {
+                html += `
+                <div class="note-card ${n.is_pinned ? 'note-pinned' : ''}">
+                    <div class="note-meta">
+                        ${n.is_pinned ? '<span class="note-pin">📌</span>' : ''}
+                        <span class="note-author mono">${n.author_id}</span>
+                        <span class="note-time muted">${fmtTs(n.created_at)}</span>
+                    </div>
+                    <div class="note-content">${esc(n.content)}</div>
+                </div>`;
+            });
+            html += '</div>';
+        } else {
+            html += '<div class="notes-section"><div class="notes-empty">No staff notes.</div></div>';
+        }
+
+        body.innerHTML = html;
+    }
+
+    function hideDrawer() {
+        document.getElementById('detail-drawer').style.display = 'none';
+    }
+
+    /* ── Event bindings ───────────────────────────────────────────────── */
+    document.getElementById('guild-select').addEventListener('change', e => {
+        currentGuild = e.target.value;
+        loadTickets();
+    });
+
+    document.getElementById('status-tabs').addEventListener('click', e => {
+        const btn = e.target.closest('.tab');
+        if (!btn) return;
+        document.querySelectorAll('#status-tabs .tab').forEach(t => t.classList.remove('active'));
+        btn.classList.add('active');
+        currentStatus = btn.dataset.status;
+        loadTickets();
+    });
+
+    document.getElementById('refresh-btn').addEventListener('click', loadTickets);
+    document.getElementById('drawer-close').addEventListener('click', hideDrawer);
+
+    /* ── Boot ──────────────────────────────────────────────────────────── */
+    document.addEventListener('DOMContentLoaded', () => {
+        startFooterClock();
+        setStatus('online');
+        loadGuilds();
+        loadTickets();
+    });
+    </script>
+</body>
+</html>

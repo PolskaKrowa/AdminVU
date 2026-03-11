@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moderation — Bot Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="scanline"></div>
+
+    <header class="site-header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-bracket">[</span>
+                <span class="logo-text">BOT</span>
+                <span class="logo-bracket">]</span>
+            </div>
+            <nav class="site-nav">
+                <a href="index.html"      class="nav-link">Dashboard</a>
+                <a href="moderation.html" class="nav-link active">Moderation</a>
+                <a href="propagation.html"class="nav-link">Propagation</a>
+                <a href="tickets.html"    class="nav-link">Tickets</a>
+            </nav>
+            <div class="status-badge">
+                <span class="status-dot" id="status-dot"></span>
+                <span class="status-label" id="status-label">connecting…</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-content">
+
+        <section class="hero">
+            <p class="hero-eyebrow">// moderation</p>
+            <h1 class="hero-title">Mod Logs</h1>
+            <p class="hero-sub">All moderation actions recorded across every server.</p>
+        </section>
+
+        <!-- Filters -->
+        <div class="filter-bar">
+            <div class="filter-group">
+                <label class="filter-label">Server</label>
+                <select class="filter-select" id="guild-select">
+                    <option value="">All servers</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label class="filter-label">Action</label>
+                <div class="tab-bar" id="action-tabs">
+                    <button class="tab active" data-action="all">All</button>
+                    <button class="tab" data-action="0">
+                        <span class="tab-emoji">⚠️</span> Warn
+                    </button>
+                    <button class="tab" data-action="1">
+                        <span class="tab-emoji">👢</span> Kick
+                    </button>
+                    <button class="tab" data-action="2">
+                        <span class="tab-emoji">🔨</span> Ban
+                    </button>
+                    <button class="tab" data-action="3">
+                        <span class="tab-emoji">🔇</span> Timeout
+                    </button>
+                </div>
+            </div>
+            <button class="btn-refresh" id="refresh-btn">↺ Refresh</button>
+        </div>
+
+        <!-- Warnings sub-section: user lookup -->
+        <div class="sub-section" id="warning-lookup">
+            <div class="sub-section-header">
+                <span class="sub-section-title">// user warning lookup</span>
+            </div>
+            <div class="lookup-row">
+                <input class="filter-input" id="user-id-input"
+                       placeholder="Paste a user ID…" type="text" />
+                <button class="btn-primary" id="lookup-btn">Lookup</button>
+            </div>
+            <div id="warning-results"></div>
+        </div>
+
+        <!-- Mod log table -->
+        <div class="table-container" id="log-table-container">
+            <div class="table-status" id="table-status">Loading…</div>
+            <table class="data-table" id="log-table" style="display:none">
+                <thead>
+                    <tr>
+                        <th class="col-time">Time</th>
+                        <th class="col-action">Action</th>
+                        <th class="col-id">Target</th>
+                        <th class="col-id">Moderator</th>
+                        <th class="col-id">Server</th>
+                        <th class="col-reason">Reason</th>
+                    </tr>
+                </thead>
+                <tbody id="log-tbody"></tbody>
+            </table>
+        </div>
+
+        <div class="pagination" id="pagination">
+            <button class="btn-page" id="prev-btn" disabled>← Prev</button>
+            <span class="page-info" id="page-info">—</span>
+            <button class="btn-page" id="next-btn" disabled>Next →</button>
+        </div>
+
+    </main>
+
+    <footer class="site-footer">
+        <span>running on <span class="mono">127.0.0.1:8080</span></span>
+        <span class="footer-sep">&middot;</span>
+        <span id="footer-time" class="mono"></span>
+    </footer>
+
+    <script src="script.js"></script>
+    <script>
+    /* ── Page-specific logic ─────────────────────────────────────────── */
+
+    const PAGE_SIZE = 50;
+    let currentOffset = 0;
+    let currentAction = 'all';
+    let currentGuild  = '';
+
+    async function loadGuilds() {
+        const guilds = await apiGet('/api/guilds');
+        if (!guilds) return;
+        const sel = document.getElementById('guild-select');
+        guilds.forEach(g => {
+            const opt = document.createElement('option');
+            opt.value = g.guild_id;
+            opt.textContent = `Server ${shortId(g.guild_id)}  (${g.warning_count} warns)`;
+            sel.appendChild(opt);
+        });
+    }
+
+    async function loadLogs() {
+        const tbody  = document.getElementById('log-tbody');
+        const table  = document.getElementById('log-table');
+        const status = document.getElementById('table-status');
+
+        status.textContent = 'Loading…';
+        status.style.display = 'block';
+        table.style.display  = 'none';
+
+        const params = new URLSearchParams({
+            limit:  PAGE_SIZE,
+            offset: currentOffset,
+        });
+        if (currentGuild)              params.set('guild_id', currentGuild);
+        if (currentAction !== 'all')   params.set('action',   currentAction);
+
+        const data = await apiGet('/api/mod-logs?' + params.toString());
+        if (!data) {
+            status.textContent = 'Failed to load data.';
+            return;
+        }
+
+        const rows = data.items || [];
+        if (rows.length === 0) {
+            status.textContent = 'No records found.';
+            return;
+        }
+
+        tbody.innerHTML = '';
+        rows.forEach(row => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td class="mono muted">${fmtTs(row.timestamp)}</td>
+                <td><span class="badge badge-action badge-action-${row.action_type}">
+                    ${row.action_emoji} ${row.action_name}
+                </span></td>
+                <td class="mono copyable" title="${row.user_id}">${shortId(row.user_id)}</td>
+                <td class="mono copyable muted" title="${row.moderator_id}">${shortId(row.moderator_id)}</td>
+                <td class="mono muted" title="${row.guild_id}">${shortId(row.guild_id)}</td>
+                <td class="reason-cell">${esc(row.reason || '—') }</td>
+            `;
+            tbody.appendChild(tr);
+        });
+
+        status.style.display = 'none';
+        table.style.display  = 'table';
+
+        // Pagination controls
+        const prevBtn  = document.getElementById('prev-btn');
+        const nextBtn  = document.getElementById('next-btn');
+        const pageInfo = document.getElementById('page-info');
+        prevBtn.disabled = currentOffset === 0;
+        nextBtn.disabled = rows.length < PAGE_SIZE;
+        const page = Math.floor(currentOffset / PAGE_SIZE) + 1;
+        pageInfo.textContent = `page ${page}`;
+
+        appendLog(`Loaded ${rows.length} mod log entries.`, LogLevel.OK);
+    }
+
+    async function lookupWarnings() {
+        const userId  = document.getElementById('user-id-input').value.trim();
+        const results = document.getElementById('warning-results');
+        if (!userId) return;
+
+        results.innerHTML = '<div class="lookup-loading">Searching…</div>';
+
+        const params = new URLSearchParams({ user_id: userId });
+        if (currentGuild) params.set('guild_id', currentGuild);
+
+        const data = await apiGet('/api/warnings?' + params.toString());
+        if (!data) {
+            results.innerHTML = '<div class="lookup-error">Request failed.</div>';
+            return;
+        }
+        if (data.length === 0) {
+            results.innerHTML = `<div class="lookup-empty">No warnings found for ${esc(userId)}.</div>`;
+            return;
+        }
+
+        let html = `<div class="lookup-count">${data.length} warning${data.length !== 1 ? 's' : ''} found</div>`;
+        html += '<table class="data-table"><thead><tr>'
+              + '<th>Time</th><th>Server</th><th>Moderator</th><th>Reason</th>'
+              + '</tr></thead><tbody>';
+        data.forEach(w => {
+            html += `<tr>
+                <td class="mono muted">${fmtTs(w.timestamp)}</td>
+                <td class="mono muted" title="${w.guild_id}">${shortId(w.guild_id)}</td>
+                <td class="mono copyable" title="${w.moderator_id}">${shortId(w.moderator_id)}</td>
+                <td class="reason-cell">${esc(w.reason || '—')}</td>
+            </tr>`;
+        });
+        html += '</tbody></table>';
+        results.innerHTML = html;
+    }
+
+    /* ── Event bindings ──────────────────────────────────────────────── */
+    document.getElementById('guild-select').addEventListener('change', e => {
+        currentGuild  = e.target.value;
+        currentOffset = 0;
+        loadLogs();
+    });
+
+    document.getElementById('action-tabs').addEventListener('click', e => {
+        const btn = e.target.closest('.tab');
+        if (!btn) return;
+        document.querySelectorAll('#action-tabs .tab').forEach(t => t.classList.remove('active'));
+        btn.classList.add('active');
+        currentAction = btn.dataset.action;
+        currentOffset = 0;
+        loadLogs();
+    });
+
+    document.getElementById('refresh-btn').addEventListener('click', () => {
+        currentOffset = 0;
+        loadLogs();
+    });
+
+    document.getElementById('lookup-btn').addEventListener('click', lookupWarnings);
+    document.getElementById('user-id-input').addEventListener('keydown', e => {
+        if (e.key === 'Enter') lookupWarnings();
+    });
+
+    document.getElementById('prev-btn').addEventListener('click', () => {
+        if (currentOffset >= PAGE_SIZE) { currentOffset -= PAGE_SIZE; loadLogs(); }
+    });
+    document.getElementById('next-btn').addEventListener('click', () => {
+        currentOffset += PAGE_SIZE; loadLogs();
+    });
+
+    /* ── Boot ─────────────────────────────────────────────────────────── */
+    document.addEventListener('DOMContentLoaded', () => {
+        startFooterClock();
+        setStatus('online');
+        loadGuilds();
+        loadLogs();
+    });
+    </script>
+</body>
+</html>

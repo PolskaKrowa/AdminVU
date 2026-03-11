@@ -1,64 +1,66 @@
 /*
  * http_server.c
  *
- * Minimal HTTP/1.0 static-file server.
- *
- * Only GET requests are handled.  Everything else receives 405.
- * Path traversal ("../") is blocked; the server will return 403.
- * Unknown extensions get "application/octet-stream".
+ * Minimal HTTP/1.0 server.
+ * - GET  requests to /api/* are dispatched to api_handle().
+ * - POST requests to /api/* are dispatched with the request body.
+ * - All other requests are served as static files from web_root.
  */
 
 #include "http_server.h"
+#include "api.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
+#include <stdarg.h>
 
 /* ── MIME types ─────────────────────────────────────────────────────────── */
 
 static const struct { const char *ext; const char *mime; } MIME_TABLE[] = {
-    { ".html", "text/html; charset=utf-8"       },
-    { ".css",  "text/css; charset=utf-8"         },
-    { ".js",   "application/javascript"          },
-    { ".json", "application/json"                },
-    { ".png",  "image/png"                       },
-    { ".jpg",  "image/jpeg"                      },
-    { ".jpeg", "image/jpeg"                      },
-    { ".gif",  "image/gif"                       },
-    { ".svg",  "image/svg+xml"                   },
-    { ".ico",  "image/x-icon"                    },
-    { ".txt",  "text/plain; charset=utf-8"       },
+    { ".html", "text/html; charset=utf-8"  },
+    { ".css",  "text/css; charset=utf-8"   },
+    { ".js",   "application/javascript"    },
+    { ".json", "application/json"          },
+    { ".png",  "image/png"                 },
+    { ".jpg",  "image/jpeg"                },
+    { ".jpeg", "image/jpeg"                },
+    { ".gif",  "image/gif"                 },
+    { ".svg",  "image/svg+xml"             },
+    { ".ico",  "image/x-icon"              },
+    { ".txt",  "text/plain; charset=utf-8" },
     { NULL, NULL }
 };
 
 static const char *mime_for_path(const char *path) {
     const char *dot = strrchr(path, '.');
     if (!dot) return "application/octet-stream";
-    for (int i = 0; MIME_TABLE[i].ext; i++) {
+    for (int i = 0; MIME_TABLE[i].ext; i++)
         if (strcasecmp(dot, MIME_TABLE[i].ext) == 0)
             return MIME_TABLE[i].mime;
-    }
     return "application/octet-stream";
 }
 
-/* ── Response helpers ───────────────────────────────────────────────────── */
+/* ── Low-level write ────────────────────────────────────────────────────── */
 
-static void send_str(int fd, const char *s) {
-    size_t len = strlen(s);
+static void send_all(int fd, const char *buf, size_t len) {
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = write(fd, s + sent, len - sent);
+        ssize_t n = write(fd, buf + sent, len - sent);
         if (n <= 0) break;
         sent += (size_t)n;
     }
 }
+
+static void send_str(int fd, const char *s) {
+    send_all(fd, s, strlen(s));
+}
+
+/* ── Response builders ──────────────────────────────────────────────────── */
 
 static void send_response(int fd, int status, const char *status_text,
                            const char *mime, const char *body, size_t body_len) {
@@ -67,20 +69,14 @@ static void send_response(int fd, int status, const char *status_text,
              "HTTP/1.0 %d %s\r\n"
              "Content-Type: %s\r\n"
              "Content-Length: %zu\r\n"
+             "Access-Control-Allow-Origin: *\r\n"
              "Connection: close\r\n"
              "Cache-Control: no-cache\r\n"
              "\r\n",
              status, status_text, mime, body_len);
     send_str(fd, header);
-
-    if (body && body_len > 0) {
-        size_t sent = 0;
-        while (sent < body_len) {
-            ssize_t n = write(fd, body + sent, body_len - sent);
-            if (n <= 0) break;
-            sent += (size_t)n;
-        }
-    }
+    if (body && body_len > 0)
+        send_all(fd, body, body_len);
 }
 
 static void send_error(int fd, int status, const char *text) {
@@ -90,81 +86,123 @@ static void send_error(int fd, int status, const char *text) {
     send_response(fd, status, text, "text/html", body, strlen(body));
 }
 
-/* ── File serving ───────────────────────────────────────────────────────── */
+/* ── Static file serving ────────────────────────────────────────────────── */
 
 static void serve_file(int fd, const char *filepath) {
-    /* Block path traversal */
     if (strstr(filepath, "..")) {
         send_error(fd, 403, "Forbidden");
         return;
     }
-
     FILE *f = fopen(filepath, "rb");
-    if (!f) {
-        send_error(fd, 404, "Not Found");
-        return;
-    }
+    if (!f) { send_error(fd, 404, "Not Found"); return; }
 
-    /* Get file size */
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    if (size < 0 || size > 10 * 1024 * 1024 /* 10 MB cap */) {
+    if (size < 0 || size > 10 * 1024 * 1024) {
         fclose(f);
         send_error(fd, 500, "Internal Server Error");
         return;
     }
 
     char *buf = malloc((size_t)size);
-    if (!buf) {
-        fclose(f);
-        send_error(fd, 500, "Internal Server Error");
-        return;
-    }
+    if (!buf) { fclose(f); send_error(fd, 500, "Internal Server Error"); return; }
 
     size_t nread = fread(buf, 1, (size_t)size, f);
     fclose(f);
-
-    const char *mime = mime_for_path(filepath);
-    send_response(fd, 200, "OK", mime, buf, nread);
+    send_response(fd, 200, "OK", mime_for_path(filepath), buf, nread);
     free(buf);
 }
 
 /* ── Request handling ───────────────────────────────────────────────────── */
 
-static void handle_client(int client_fd, const char *web_root) {
-    /* Read the request line (we only need the first line). */
-    char req[2048] = { 0 };
-    ssize_t n = recv(client_fd, req, sizeof(req) - 1, 0);
-    if (n <= 0) return;
-    req[n] = '\0';
+static void handle_client(int client_fd, HttpServer *srv) {
+    /* Read the full request into a buffer. */
+    char req[8192] = { 0 };
+    size_t total = 0;
+    while (total < sizeof(req) - 1) {
+        ssize_t n = recv(client_fd, req + total, sizeof(req) - 1 - total, 0);
+        if (n <= 0) break;
+        total += (size_t)n;
+        /* Stop once we have the header separator */
+        if (memmem(req, total, "\r\n\r\n", 4)) break;
+    }
+    req[total] = '\0';
+    if (total == 0) return;
 
-    /* Parse method and URL path from the first line. */
+    /* Parse request line: METHOD URL HTTP/x.x */
     char method[16] = { 0 };
-    char url[HTTP_SERVER_MAX_PATH] = { 0 };
-    if (sscanf(req, "%15s %511s", method, url) != 2) {
+    char raw_url[HTTP_SERVER_MAX_PATH] = { 0 };
+    if (sscanf(req, "%15s %511s", method, raw_url) != 2) {
         send_error(client_fd, 400, "Bad Request");
         return;
     }
 
+    /* Split path and query string */
+    char url_path[HTTP_SERVER_MAX_PATH] = { 0 };
+    char url_query[512] = { 0 };
+    {
+        char *q = strchr(raw_url, '?');
+        if (q) {
+            size_t plen = (size_t)(q - raw_url);
+            if (plen >= sizeof(url_path)) plen = sizeof(url_path) - 1;
+            memcpy(url_path, raw_url, plen);
+            url_path[plen] = '\0';
+            strncpy(url_query, q + 1, sizeof(url_query) - 1);
+        } else {
+            strncpy(url_path, raw_url, sizeof(url_path) - 1);
+        }
+    }
+
+    /* Extract POST body (after \r\n\r\n header separator) */
+    const char *body     = NULL;
+    size_t      body_len = 0;
+    {
+        char *sep = memmem(req, total, "\r\n\r\n", 4);
+        if (sep) {
+            body     = sep + 4;
+            body_len = total - (size_t)(body - req);
+        }
+    }
+
+    /* ── Route: /api/* ────────────────────────────────────────────────── */
+    if (strncmp(url_path, "/api/", 5) == 0 || strcmp(url_path, "/api") == 0) {
+        if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0) {
+            send_error(client_fd, 405, "Method Not Allowed");
+            return;
+        }
+
+        static char api_buf[131072]; /* 128 KB shared buffer (single-threaded server) */
+        api_buf[0] = '\0';
+
+        int status = api_handle(srv->db, method, url_path,
+                                url_query[0] ? url_query : NULL,
+                                body, body_len,
+                                api_buf, sizeof(api_buf));
+
+        const char *status_text = "OK";
+        if      (status == 400) status_text = "Bad Request";
+        else if (status == 404) status_text = "Not Found";
+        else if (status == 500) status_text = "Internal Server Error";
+
+        send_response(client_fd, status, status_text,
+                      "application/json",
+                      api_buf, strlen(api_buf));
+        return;
+    }
+
+    /* ── Route: static files ──────────────────────────────────────────── */
     if (strcmp(method, "GET") != 0) {
         send_error(client_fd, 405, "Method Not Allowed");
         return;
     }
 
-    /* Strip query string */
-    char *q = strchr(url, '?');
-    if (q) *q = '\0';
+    if (strcmp(url_path, "/") == 0)
+        strncpy(url_path, "/index.html", sizeof(url_path) - 1);
 
-    /* Default to index.html */
-    if (strcmp(url, "/") == 0)
-        strncpy(url, "/index.html", sizeof(url) - 1);
-
-    /* Build filesystem path: web_root + url */
     char filepath[HTTP_SERVER_MAX_PATH * 2];
-    snprintf(filepath, sizeof(filepath), "%s%s", web_root, url);
-
+    snprintf(filepath, sizeof(filepath), "%s%s", srv->web_root, url_path);
     serve_file(client_fd, filepath);
 }
 
@@ -173,26 +211,23 @@ static void handle_client(int client_fd, const char *web_root) {
 static void *server_thread(void *arg) {
     HttpServer *srv = (HttpServer *)arg;
 
-    printf("[http] Server listening on http://127.0.0.1:%d/ (root: %s)\n",
+    printf("[http] Listening on http://127.0.0.1:%d/  (root: %s)\n",
            srv->port, srv->web_root);
 
     while (srv->running) {
         struct sockaddr_in client_addr;
         socklen_t addrlen = sizeof(client_addr);
-
         int client_fd = accept(srv->listen_fd,
                                (struct sockaddr *)&client_addr, &addrlen);
         if (client_fd < 0) {
-            if (srv->running)
-                perror("[http] accept");
+            if (srv->running) perror("[http] accept");
             break;
         }
 
-        /* Set a short receive timeout so a slow client can't stall the loop. */
         struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
         setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        handle_client(client_fd, srv->web_root);
+        handle_client(client_fd, srv);
         close(client_fd);
     }
 
@@ -202,39 +237,35 @@ static void *server_thread(void *arg) {
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
 
-int http_server_init(HttpServer *srv, int port, const char *web_root) {
+int http_server_init(HttpServer *srv, int port,
+                     const char *web_root, Database *db) {
     memset(srv, 0, sizeof *srv);
     srv->port = port;
+    srv->db   = db;
     strncpy(srv->web_root, web_root, sizeof(srv->web_root) - 1);
 
-    srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv->listen_fd < 0) {
-        perror("[http] socket");
-        return -1;
-    }
+    /* Initialize the API (creates any extra tables) */
+    if (db && api_init(db) != 0)
+        fprintf(stderr, "[http] api_init warning: some tables may be missing.\n");
 
-    /* Allow immediate reuse of the port after restart. */
+    srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv->listen_fd < 0) { perror("[http] socket"); return -1; }
+
     int opt = 1;
     setsockopt(srv->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr = {
         .sin_family      = AF_INET,
         .sin_port        = htons((uint16_t)port),
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK), /* 127.0.0.1 only */
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
     };
 
     if (bind(srv->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("[http] bind");
-        close(srv->listen_fd);
-        return -1;
+        perror("[http] bind"); close(srv->listen_fd); return -1;
     }
-
     if (listen(srv->listen_fd, HTTP_SERVER_BACKLOG) < 0) {
-        perror("[http] listen");
-        close(srv->listen_fd);
-        return -1;
+        perror("[http] listen"); close(srv->listen_fd); return -1;
     }
-
     return 0;
 }
 
@@ -252,7 +283,6 @@ int http_server_start(HttpServer *srv) {
 void http_server_stop(HttpServer *srv) {
     if (!srv->running) return;
     srv->running = false;
-    /* Closing the listening socket unblocks accept(). */
     if (srv->listen_fd >= 0) {
         close(srv->listen_fd);
         srv->listen_fd = -1;
