@@ -8,6 +8,7 @@
 
 #include "env_parser.h"
 #include "database.h"
+#include "http_server.h"
 #include "modules/ping.h"
 #include "modules/moderation.h"
 #include "modules/ticket.h"
@@ -19,6 +20,7 @@
 
 static struct discord *g_client   = NULL;
 static Database        g_database = { 0 };
+static HttpServer g_http_server = { 0 };
 
 /* Parsed guild IDs from DISCORD_GUILD_ID (comma-separated). */
 #define MAX_GUILDS 64
@@ -307,6 +309,9 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    if (http_server_init(&g_http_server, 8080, "web", &g_database) == 0)
+        http_server_start(&g_http_server);
+
     /* Signals */
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
@@ -345,6 +350,7 @@ int main(int argc, char *argv[]) {
     discord_cleanup(client);
     db_cleanup(&g_database);
     cleanup_env();
+    http_server_stop(&g_http_server);
     printf("Bot shut down successfully\n");
 
     return EXIT_SUCCESS;
