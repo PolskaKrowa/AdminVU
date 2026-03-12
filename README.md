@@ -118,7 +118,8 @@ make
 # From the parent directory containing discord-bot/
 cat > .env << EOF
 DISCORD_BOT_TOKEN=your_token_here
-DISCORD_GUILD_ID=your_guild_id_here
+DISCORD_BOT_GUILD_ID=your_central_administration_server_id
+DISCORD_DEV_GUILD_IDS=your_dev_server_ids
 EOF
 ```
 
