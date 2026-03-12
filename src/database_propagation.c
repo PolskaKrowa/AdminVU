@@ -213,6 +213,14 @@ int db_propagation_init(Database *db) {
         "CREATE TABLE IF NOT EXISTS known_guilds ("
         "  guild_id      INTEGER PRIMARY KEY,"
         "  registered_at INTEGER NOT NULL"
+        ");"
+        
+        /* Maps a community's public server to its paired staff server. */
+        "CREATE TABLE IF NOT EXISTS propagation_guild_pairs ("
+        "  main_guild_id  INTEGER PRIMARY KEY,"
+        "  staff_guild_id INTEGER NOT NULL,"
+        "  registered_by  INTEGER NOT NULL,"
+        "  registered_at  INTEGER NOT NULL"
         ");";
 
     char *err = NULL;
@@ -831,4 +839,73 @@ int db_register_known_guild(Database *db, uint64_t guild_id) {
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+/* Register or update a main↔staff server pair. */
+int db_register_guild_pair(Database *db,
+                            uint64_t  main_guild_id,
+                            uint64_t  staff_guild_id,
+                            uint64_t  registered_by) {
+    const char *sql =
+        "INSERT INTO propagation_guild_pairs "
+        "(main_guild_id, staff_guild_id, registered_by, registered_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(main_guild_id) DO UPDATE SET "
+        "  staff_guild_id = excluded.staff_guild_id,"
+        "  registered_by  = excluded.registered_by,"
+        "  registered_at  = excluded.registered_at;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(DB(db), sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_int64(stmt, 1, (int64_t)main_guild_id);
+    sqlite3_bind_int64(stmt, 2, (int64_t)staff_guild_id);
+    sqlite3_bind_int64(stmt, 3, (int64_t)registered_by);
+    sqlite3_bind_int64(stmt, 4, (int64_t)time(NULL));
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+/*
+ * Given a community's main guild, return its paired staff guild ID.
+ * Returns 0 if no pair is registered.
+ */
+uint64_t db_get_staff_guild_for(Database *db, uint64_t main_guild_id) {
+    const char *sql =
+        "SELECT staff_guild_id FROM propagation_guild_pairs "
+        "WHERE main_guild_id = ? LIMIT 1;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(DB(db), sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int64(stmt, 1, (int64_t)main_guild_id);
+    uint64_t staff_id = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        staff_id = (uint64_t)sqlite3_column_int64(stmt, 0);
+
+    sqlite3_finalize(stmt);
+    return staff_id;
+}
+
+/*
+ * Returns true if the given guild is registered as a staff server
+ * in any community pair.  Used for permission checks.
+ */
+bool db_is_staff_guild(Database *db, uint64_t guild_id) {
+    const char *sql =
+        "SELECT 1 FROM propagation_guild_pairs "
+        "WHERE staff_guild_id = ? LIMIT 1;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(DB(db), sql, -1, &stmt, NULL) != SQLITE_OK)
+        return false;
+
+    sqlite3_bind_int64(stmt, 1, (int64_t)guild_id);
+    bool found = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
 }

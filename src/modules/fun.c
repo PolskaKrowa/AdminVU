@@ -25,14 +25,14 @@
 #include <curl/curl.h>
 #include <orca/discord.h>
 
-/* ── Compile-time knobs ───────────────────────────────────────────────────── */
+/* Compile-time knobs */
 
 #define TRIVIA_TIMEOUT_SECS  60
 #define MAX_ANSWERS          4
 #define MAX_CHOOSE_ITEMS     20
 #define ACTIVITY_TRACK_MAX   512   /* max channels tracked */
 
-/* ── Tiny HTTP helper (libcurl) ───────────────────────────────────────────── */
+/* Tiny HTTP helper (libcurl) */
 
 typedef struct {
     char  *data;
@@ -84,7 +84,7 @@ static char *http_get(const char *url, const char *accept_header) {
     return buf.data; /* caller frees */
 }
 
-/* ── Minimal JSON string extractor ───────────────────────────────────────── */
+/* Minimal JSON string extractor */
 
 /*
  * json_str – finds the value of `key` in a flat JSON object and copies it
@@ -166,7 +166,7 @@ static int json_array_strings(const char *json, const char *key,
     return count;
 }
 
-/* ── HTML entity decoder (Open Trivia DB encodes entities) ───────────────── */
+/* HTML entity decoder (Open Trivia DB encodes entities) */
 
 static void decode_html_entities(char *s) {
     static const struct { const char *ent; char ch; } table[] = {
@@ -193,7 +193,7 @@ static void decode_html_entities(char *s) {
     strncpy(s, buf, bi + 1);
 }
 
-/* ── Activity tracking ────────────────────────────────────────────────────── */
+/* Activity tracking */
 
 typedef struct {
     u64_snowflake_t channel_id;
@@ -227,7 +227,7 @@ void fun_track_message(u64_snowflake_t channel_id, const char *channel_name) {
     pthread_mutex_unlock(&s_activity_mutex);
 }
 
-/* ── Pending trivia state ─────────────────────────────────────────────────── */
+/* Pending trivia state */
 
 typedef struct {
     u64_snowflake_t  user_id;
@@ -257,7 +257,7 @@ static TriviaSession *trivia_find_or_create(u64_snowflake_t user_id) {
     return NULL;
 }
 
-/* ── 8-Ball responses ─────────────────────────────────────────────────────── */
+/* 8-Ball responses */
 
 static const char *EIGHTBALL[] = {
     "It is certain.",
@@ -283,7 +283,7 @@ static const char *EIGHTBALL[] = {
 };
 #define EIGHTBALL_COUNT  (int)(sizeof EIGHTBALL / sizeof *EIGHTBALL)
 
-/* ── RPS ──────────────────────────────────────────────────────────────────── */
+/* RPS */
 
 static const char *RPS_CHOICES[] = { "rock", "paper", "scissors" };
 #define RPS_COUNT 3
@@ -296,7 +296,7 @@ static int rps_result(int player, int bot) {
     return 1;
 }
 
-/* ── Helpers: ephemeral reply ─────────────────────────────────────────────── */
+/* Helpers: ephemeral reply */
 
 /* Discord's ephemeral message flag (1 << 6 = 64).
  * Orca does not expose DISCORD_MESSAGE_EPHEMERAL in all versions, so we
@@ -319,7 +319,7 @@ static void reply_ephemeral(struct discord *client,
                                         event->token, &resp, NULL);
 }
 
-/* ── /joke ────────────────────────────────────────────────────────────────── */
+/* /joke */
 
 static void cmd_joke(struct discord *client,
                      const struct discord_interaction *event) {
@@ -333,11 +333,11 @@ static void cmd_joke(struct discord *client,
     reply_ephemeral(client, event, joke);
 }
 
-/* ── /roll ────────────────────────────────────────────────────────────────── */
+/* /roll */
 
 static void cmd_roll(struct discord *client,
                      const struct discord_interaction *event) {
-    long max_val = 100; /* default */
+    long max_val = 6; /* default */
 
     if (event->data->options) {
         for (int i = 0; event->data->options[i] &&
@@ -359,7 +359,7 @@ static void cmd_roll(struct discord *client,
     reply_ephemeral(client, event, msg);
 }
 
-/* ── /8ball ───────────────────────────────────────────────────────────────── */
+/* /8ball */
 
 static void cmd_8ball(struct discord *client,
                       const struct discord_interaction *event) {
@@ -382,7 +382,7 @@ static void cmd_8ball(struct discord *client,
     reply_ephemeral(client, event, msg);
 }
 
-/* ── /choose ──────────────────────────────────────────────────────────────── */
+/* /choose */
 
 static void cmd_choose(struct discord *client,
                        const struct discord_interaction *event) {
@@ -426,7 +426,7 @@ static void cmd_choose(struct discord *client,
     reply_ephemeral(client, event, msg);
 }
 
-/* ── /coinflip ────────────────────────────────────────────────────────────── */
+/* /coinflip */
 
 static void cmd_coinflip(struct discord *client,
                          const struct discord_interaction *event) {
@@ -434,7 +434,7 @@ static void cmd_coinflip(struct discord *client,
     reply_ephemeral(client, event, result);
 }
 
-/* ── /rps ─────────────────────────────────────────────────────────────────── */
+/* /rps */
 
 static void cmd_rps(struct discord *client,
                     const struct discord_interaction *event) {
@@ -481,7 +481,7 @@ static void cmd_rps(struct discord *client,
     reply_ephemeral(client, event, msg);
 }
 
-/* ── /activity ────────────────────────────────────────────────────────────── */
+/* /activity */
 
 static void cmd_activity(struct discord *client,
                           const struct discord_interaction *event) {
@@ -531,7 +531,7 @@ static void cmd_activity(struct discord *client,
     reply_ephemeral(client, event, msg);
 }
 
-/* ── /trivia ──────────────────────────────────────────────────────────────── */
+/* /trivia */
 
 /*
  * Shuffle an int array in-place (Fisher-Yates).
@@ -669,7 +669,7 @@ static void cmd_trivia(struct discord *client,
                                         event->token, &resp, NULL);
 }
 
-/* ── Trivia button handler ────────────────────────────────────────────────── */
+/* Trivia button handler */
 
 /*
  * Handle a trivia button press.  Called from on_fun_interaction() when
@@ -770,7 +770,7 @@ static void handle_trivia_button(struct discord *client,
                                         event->token, &resp, NULL);
 }
 
-/* ── Public API ───────────────────────────────────────────────────────────── */
+/* Public API */
 
 void fun_module_init(struct discord *client, Database *db) {
     (void)client;
@@ -782,7 +782,7 @@ void fun_module_init(struct discord *client, Database *db) {
 void register_fun_commands(struct discord *client,
                             u64_snowflake_t application_id,
                             u64_snowflake_t guild_id) {
-    /* ── /joke ── */
+    /* /joke */
     {
         static struct discord_create_guild_application_command_params p = {
             .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
@@ -793,7 +793,7 @@ void register_fun_commands(struct discord *client,
                                                  guild_id, &p, NULL);
     }
 
-    /* ── /roll ── */
+    /* /roll */
     {
         static struct discord_application_command_option max_opt = {
             .type        = DISCORD_APPLICATION_COMMAND_OPTION_INTEGER,
@@ -814,7 +814,7 @@ void register_fun_commands(struct discord *client,
                                                  guild_id, &p, NULL);
     }
 
-    /* ── /8ball ── */
+    /* /8ball */
     {
         static struct discord_application_command_option q_opt = {
             .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
@@ -835,7 +835,7 @@ void register_fun_commands(struct discord *client,
                                                  guild_id, &p, NULL);
     }
 
-    /* ── /choose ── */
+    /* /choose */
     {
         static struct discord_application_command_option list_opt = {
             .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
@@ -856,7 +856,7 @@ void register_fun_commands(struct discord *client,
                                                  guild_id, &p, NULL);
     }
 
-    /* ── /coinflip ── */
+    /* /coinflip */
     {
         static struct discord_create_guild_application_command_params p = {
             .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
@@ -867,7 +867,7 @@ void register_fun_commands(struct discord *client,
                                                  guild_id, &p, NULL);
     }
 
-    /* ── /rps ── */
+    /* /rps */
     {
         static struct discord_application_command_option choice_opt = {
             .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
@@ -888,7 +888,7 @@ void register_fun_commands(struct discord *client,
                                                  guild_id, &p, NULL);
     }
 
-    /* ── /trivia ── */
+    /* /trivia */
     {
         static struct discord_create_guild_application_command_params p = {
             .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
@@ -899,7 +899,7 @@ void register_fun_commands(struct discord *client,
                                                  guild_id, &p, NULL);
     }
 
-    /* ── /activity ── */
+    /* /activity */
     {
         static struct discord_create_guild_application_command_params p = {
             .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,

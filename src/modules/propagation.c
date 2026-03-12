@@ -58,9 +58,9 @@
 
 /* ── Module-private state ────────────────────────────────────────────────── */
 
-static Database       *g_db         = NULL;
-static struct discord *g_client     = NULL;
-static uint64_t        g_self_guild = 0;
+static Database       *g_db          = NULL;
+static struct discord *g_client      = NULL;
+static uint64_t        g_self_guild  = 0;
 
 /* ── Permission helpers ──────────────────────────────────────────────────── */
 
@@ -85,10 +85,20 @@ static bool has_admin_permissions(const struct discord_interaction *event) {
  * restricted to members of the designated central guild.
  */
 static bool is_central_admin(const struct discord_interaction *event) {
+    if (!has_admin_permissions(event)) return false;
+
+    /*
+     * Any guild registered as a staff server for any community pair
+     * qualifies for central-admin actions (trust assignment, etc.).
+     */
+    if (db_is_staff_guild(g_db, event->guild_id)) return true;
+
+    /* Also honour the explicitly configured central oversight guild. */
     uint64_t central_guild = 0, central_channel = 0;
-    if (!db_get_central_config(g_db, &central_guild, &central_channel))
-        return false;
-    return event->guild_id == central_guild && has_admin_permissions(event);
+    if (db_get_central_config(g_db, &central_guild, &central_channel))
+        return event->guild_id == central_guild;
+
+    return false;
 }
 
 /* ── Option extraction ───────────────────────────────────────────────────── */
@@ -196,8 +206,7 @@ static void build_alert_message(char                    *buf,
              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
              "%s **CROSS-SERVER ALERT** – %s\n"
              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-             "A moderator in another server has flagged a user who is "
-             "**also a member of your server**.\n\n"
+             "A moderator in another participating server has reported behaviour that may affect other communities.\n\n"
              "**User:** <@%" PRIu64 "> (`%" PRIu64 "`)\n"
              "**Reason:** %s\n"
              "**Evidence:** %s\n"
@@ -210,7 +219,7 @@ static void build_alert_message(char                    *buf,
              "%s"
              "\n```\n"
              "No automatic action has been taken.\n"
-             "Please review the evidence and decide what — if anything —\n"
+             "Please review the evidence and decide what — if anything — "
              "is appropriate for your own community.\n"
              "```\n"
              "To verify this alert, contact the source server's admins "
@@ -407,6 +416,16 @@ static void handle_propagate(struct discord                  *client,
     }
     free(opted_guilds);
 
+    /* ── Deliver to the staff server paired with the source community,
+     *     so staff can cross-reference open tickets for this user. ──── */
+    uint64_t paired_staff = db_get_staff_guild_for(g_db, event->guild_id);
+    if (paired_staff && paired_staff != event->guild_id) {
+        if (notify_guild(client, paired_staff, &ev, source_trust)) {
+            db_record_propagation_notification(g_db, event_id, paired_staff);
+            notified++;
+        }
+    }
+
     /* Recompute severity now we know how many guilds confirmed it. */
     PropagationSeverity final_sev = db_recompute_severity(g_db, event_id);
 
@@ -455,6 +474,59 @@ static void handle_propagate(struct discord                  *client,
     }
 
     db_free_propagation_event(&ev);
+}
+
+static void handle_pair(struct discord                  *client,
+                         const struct discord_interaction *event) {
+    if (event->guild_id != g_self_guild || !has_admin_permissions(event)) {
+        send_ephemeral(client, event,
+                       "❌ This command can only be run by the bot team "
+                       "on the bot's home server.");
+        return;
+    }
+
+    const char *main_str  = get_option(event, "main_guild_id");
+    const char *staff_str = get_option(event, "staff_guild_id");
+
+    if (!main_str || !staff_str) {
+        send_ephemeral(client, event,
+                       "❌ Please provide both a main guild ID and a staff guild ID.");
+        return;
+    }
+
+    uint64_t main_id  = (uint64_t)strtoull(main_str,  NULL, 10);
+    uint64_t staff_id = (uint64_t)strtoull(staff_str, NULL, 10);
+    uint64_t admin_id = event->member ? event->member->user->id : 0;
+
+    if (main_id == staff_id) {
+        send_ephemeral(client, event,
+                       "❌ The main guild and staff guild cannot be the same server.");
+        return;
+    }
+
+    if (db_register_guild_pair(g_db, main_id, staff_id, admin_id) != 0) {
+        send_ephemeral(client, event, "❌ Database error saving guild pair.");
+        return;
+    }
+
+    /* Give the staff server PARTNER trust automatically. */
+    db_set_guild_trust(g_db, staff_id, TRUST_PARTNER, admin_id,
+                       "Automatic PARTNER trust – paired staff server");
+
+    db_register_known_guild(g_db, main_id);
+    db_register_known_guild(g_db, staff_id);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "✅ Guild pair registered.\n"
+             "Main: `%" PRIu64 "` ↔ Staff: `%" PRIu64 "`\n"
+             "The staff server has been granted ⭐ Partner trust automatically.",
+             main_id, staff_id);
+    send_ephemeral(client, event, msg);
+
+    printf("[propagation] Guild pair registered: main=%" PRIu64
+           " staff=%" PRIu64 " by %" PRIu64 "\n",
+           main_id, staff_id, admin_id);
 }
 
 /* ── /propagate-config ───────────────────────────────────────────────────── */
@@ -988,6 +1060,7 @@ void on_propagation_interaction(struct discord                  *client,
     else if (strcmp(cmd, "propagate-appeal-review") == 0) handle_appeal_review (client, event);
     else if (strcmp(cmd, "propagate-trust")         == 0) handle_trust         (client, event);
     else if (strcmp(cmd, "propagate-central")       == 0) handle_central       (client, event);
+    else if (strcmp(cmd, "propagate-pair")          == 0) handle_pair          (client, event);
 }
 
 void propagation_on_guild_register(uint64_t guild_id) {
@@ -1244,6 +1317,31 @@ void register_propagation_commands(struct discord *client,
     };
     discord_create_guild_application_command(client, application_id, guild_id,
                                               &central_params, NULL);
+    
+    /* ── /propagate-pair  (bot home guild only) ────────────────────────── */
+    static struct discord_application_command_option pair_main = {
+        .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+        .name        = "main_guild_id",
+        .description = "The community's public main server ID",
+        .required    = true,
+    };
+    static struct discord_application_command_option pair_staff = {
+        .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+        .name        = "staff_guild_id",
+        .description = "The community's internal staff server ID",
+        .required    = true,
+    };
+    static struct discord_application_command_option *pair_opts[] = {
+        &pair_main, &pair_staff, NULL
+    };
+    static struct discord_create_guild_application_command_params pair_params = {
+        .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+        .name        = "propagate-pair",
+        .description = "Pair a community's main server with its staff server (bot team only)",
+        .options     = pair_opts,
+    };
+    discord_create_guild_application_command(client, application_id,
+                                            self_guild_id, &pair_params, NULL);
 
     printf("[propagation] All propagation commands registered for guild %" PRIu64 "\n",
            guild_id);
@@ -1262,5 +1360,6 @@ void propagation_module_init(struct discord *client,
     if (self_guild_id)
         db_register_known_guild(db, self_guild_id);
 
-    printf("[propagation] Propagation module initialised.\n");
+    printf("[propagation] Propagation module initialised "
+           "(self=%" PRIu64 ").\n", self_guild_id);
 }

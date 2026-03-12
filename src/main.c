@@ -20,12 +20,13 @@
 
 static struct discord *g_client   = NULL;
 static Database        g_database = { 0 };
-static HttpServer g_http_server = { 0 };
+static HttpServer   g_http_server = { 0 };
 
-/* Parsed guild IDs from DISCORD_GUILD_ID (comma-separated). */
-#define MAX_GUILDS 64
-static u64_snowflake_t g_guild_ids[MAX_GUILDS];
-static int             g_guild_count = 0;
+static u64_snowflake_t g_bot_guild_id = 0;          /* single admin/infra guild */
+
+#define MAX_DEV_GUILDS 4
+static u64_snowflake_t g_dev_guild_ids[MAX_DEV_GUILDS];
+static int             g_dev_guild_count = 0;
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
@@ -84,39 +85,32 @@ void signal_handler(int signum) {
 
 /* ── Slash-command registration ──────────────────────────────────────────── */
 
-void register_slash_commands(struct discord *client,
-                             u64_snowflake_t application_id,
-                             u64_snowflake_t guild_id) {
-    static struct discord_application_command_option target_option = {
-        .type        = DISCORD_APPLICATION_COMMAND_OPTION_USER,
-        .name        = "target",
-        .description = "Member to hash (defaults to you)",
-        .required    = false,
-    };
-    static struct discord_application_command_option *options[] = {
-        &target_option,
-        NULL,
-    };
-    static struct discord_create_guild_application_command_params params = {
-        .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
-        .name        = "ping",
-        .description = "Pong! Optionally hash a target member's display name.",
-        .options     = options,
-    };
+/*
+ * Registers commands that should only exist in the bot's own
+ * infrastructure guild — central admin, pairing, oversight, etc.
+ */
+static void register_admin_commands(struct discord  *client,
+                                    u64_snowflake_t  application_id,
+                                    u64_snowflake_t  bot_guild_id) {
+    register_propagation_admin_commands(client, application_id, bot_guild_id);
+    /* Add any other bot-team-only commands here. */
+    printf("[main] Admin commands registered in bot guild %" PRIu64 "\n",
+           bot_guild_id);
+}
 
-    ORCAcode code = discord_create_guild_application_command(
-        client, application_id, guild_id, &params, NULL);
-
-    if (code == ORCA_OK)
-        printf("[ping] /ping registered in guild %" PRIu64 "\n", guild_id);
-    else
-        printf("[ping] Failed to register /ping in guild %" PRIu64
-               " (ORCAcode %d)\n", guild_id, code);
-
-    register_moderation_commands(client, application_id, guild_id);
-    register_ticket_commands(client, application_id, guild_id);
-    register_propagation_commands(client, application_id, guild_id);
-    register_fun_commands(client, application_id, guild_id);
+/*
+ * Registers all community-facing commands globally.
+ * Called once — applies to every guild the bot is in or ever joins.
+ * Pass guild_id = 0 to the underlying registration calls to make them global.
+ */
+static void register_global_commands(struct discord  *client,
+                                     u64_snowflake_t  application_id) {
+    register_moderation_commands(client, application_id, 0);
+    register_ticket_commands(client, application_id, 0);
+    register_propagation_commands(client, application_id, 0);
+    register_fun_commands(client, application_id, 0);
+    /* /ping etc. */
+    printf("[main] Global community commands registered.\n");
 }
 
 /* ── Background registration thread ─────────────────────────────────────── */
@@ -132,14 +126,27 @@ typedef struct {
 static void *register_commands_thread(void *arg) {
     RegisterArgs *a = arg;
 
+    /* Always register global community commands once. */
+    register_global_commands(a->client, a->application_id);
+
+    /* Register privileged admin commands only in the bot's own guild. */
+    if (g_bot_guild_id)
+        register_admin_commands(a->client, a->application_id, g_bot_guild_id);
+
+    /*
+     * Optionally re-register community commands as guild-scoped too on
+     * dev guilds — useful during development for instant propagation,
+     * since global commands can take up to an hour to update.
+     */
     for (int i = 0; i < a->guild_count; i++) {
-        printf("[main] Registering commands in guild %" PRIu64
-               " (%d/%d)…\n", a->guild_ids[i], i + 1, a->guild_count);
-        register_slash_commands(a->client, a->application_id, a->guild_ids[i]);
+        register_moderation_commands(a->client, a->application_id, a->guild_ids[i]);
+        register_ticket_commands(a->client, a->application_id, a->guild_ids[i]);
+        register_propagation_commands(a->client, a->application_id, a->guild_ids[i]);
+        register_fun_commands(a->client, a->application_id, a->guild_ids[i]);
+        printf("[main] Dev guild %" PRIu64 " commands registered.\n",
+               a->guild_ids[i]);
     }
 
-    printf("[main] Command registration complete for %d guild(s).\n",
-           a->guild_count);
     free(a);
     return NULL;
 }
@@ -150,39 +157,24 @@ void on_ready(struct discord *client) {
     printf("Bot is ready!\n");
 
     struct discord_user *bot = discord_get_self(client);
-    if (bot && bot->username)
-        printf("Logged in as: %s\n", bot->username);
-
     u64_snowflake_t application_id = bot ? bot->id : 0;
     if (!application_id) {
-        fprintf(stderr, "[main] Could not obtain application_id – "
-                        "slash commands will not be registered.\n");
+        fprintf(stderr, "[main] Could not obtain application_id.\n");
         return;
     }
 
     factcheck_module_init(client);
 
-    if (g_guild_count == 0) {
-        fprintf(stderr, "[main] No valid guild IDs – "
-                        "skipping command registration.\n");
-        return;
-    }
-
-    /* Copy state into heap-allocated args so the thread owns its data. */
     RegisterArgs *args = malloc(sizeof *args);
-    if (!args) {
-        fprintf(stderr, "[main] OOM allocating RegisterArgs.\n");
-        return;
-    }
+    if (!args) return;
     args->client         = client;
     args->application_id = application_id;
-    args->guild_count    = g_guild_count;
-    memcpy(args->guild_ids, g_guild_ids,
-           (size_t)g_guild_count * sizeof(u64_snowflake_t));
+    args->guild_count    = g_dev_guild_count;
+    memcpy(args->guild_ids, g_dev_guild_ids,
+           (size_t)g_dev_guild_count * sizeof(u64_snowflake_t));
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, register_commands_thread, args) != 0) {
-        fprintf(stderr, "[main] Failed to spawn registration thread.\n");
         free(args);
         return;
     }
@@ -222,11 +214,7 @@ void on_interaction_create_combined(struct discord *client,
                strcmp(cmd, "ticketconfig") == 0) {
         on_ticket_interaction(client, event);
 
-    } else if (strcmp(cmd, "propagate")         == 0 ||
-               strcmp(cmd, "propagate-config")  == 0 ||
-               strcmp(cmd, "propagate-opt-out") == 0 ||
-               strcmp(cmd, "propagate-history") == 0 ||
-               strcmp(cmd, "propagate-revoke")  == 0) {
+    } else if (strcmp(cmd, "propagate", 9) == 0) {
         on_propagation_interaction(client, event);
 
     } else if (strcmp(cmd, "joke")     == 0 ||
@@ -280,22 +268,22 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    /* Guild IDs – comma-separated, e.g. "123456789,987654321" */
-    const char *guild_id_str = get_env("DISCORD_GUILD_ID");
-    if (!guild_id_str) {
-        fprintf(stderr, "Error: DISCORD_GUILD_ID not found\n");
-        fprintf(stderr, "  Set one or more comma-separated guild IDs, e.g.:\n");
-        fprintf(stderr, "  DISCORD_GUILD_ID=123456789,987654321\n");
+    /* Bot's own infrastructure guild */
+    const char *bot_guild_str = get_env("DISCORD_BOT_GUILD_ID");
+    if (!bot_guild_str) {
+        fprintf(stderr, "Error: DISCORD_BOT_GUILD_ID not set\n");
         cleanup_env();
         return EXIT_FAILURE;
     }
+    g_bot_guild_id = parse_snowflake(bot_guild_str);
 
-    g_guild_count = parse_guild_ids(guild_id_str);
-    if (g_guild_count == 0) {
-        fprintf(stderr, "Error: DISCORD_GUILD_ID contained no valid IDs\n");
-        cleanup_env();
-        return EXIT_FAILURE;
-    }
+    /* Optional dev guilds for instant command updates */
+    const char *dev_guild_str = get_env("DISCORD_DEV_GUILD_IDS");
+    if (dev_guild_str)
+        g_dev_guild_count = parse_guild_ids(dev_guild_str, g_dev_guild_ids, MAX_DEV_GUILDS);
+
+    /* Module init — bot guild is the only fixed reference point */
+    propagation_module_init(client, &g_database, g_bot_guild_id);
 
     printf("Registering commands in %d guild(s):\n", g_guild_count);
     for (int i = 0; i < g_guild_count; i++)
@@ -332,13 +320,14 @@ int main(int argc, char *argv[]) {
     discord_set_on_message_create(client, &on_message_create);
     discord_set_on_guild_create(client, on_guild_create_handler);
 
-    /* Module init – pass the first guild ID where a single value is needed;
-     * command registration handles all guilds inside on_ready().          */
+    /* Module init — bot guild is the single fixed reference point.
+    * Community commands are registered globally inside on_ready()
+    * and apply automatically to every guild the bot is in. */
     printf("Initialising modules...\n");
-    ping_module_init(client, g_guild_ids[0]);
-    moderation_module_init(client, &g_database, g_guild_ids[0], token);
+    ping_module_init(client, g_bot_guild_id);
+    moderation_module_init(client, &g_database, g_bot_guild_id, token);
     ticket_module_init(client, &g_database);
-    propagation_module_init(client, &g_database, g_guild_ids[0]);
+    propagation_module_init(client, &g_database, g_bot_guild_id);
     factcheck_module_init(client);
     fun_module_init(client, &g_database);
 

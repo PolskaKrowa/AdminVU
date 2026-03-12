@@ -204,3 +204,7 @@ bool db_get_central_config(Database *db,
 
 /* ── Known guilds ────────────────────────────────────────────────────────── */
 int db_register_known_guild(Database *db, uint64_t guild_id);
+int db_register_guild_pair(Database *db, uint64_t main_guild_id,
+                           uint64_t staff_guild_id, uint64_t registered_by);
+uint64_t db_get_staff_guild_for(Database *db, uint64_t main_guild_id);
+bool db_is_staff_guild(Database *db, uint64_t guild_id);
