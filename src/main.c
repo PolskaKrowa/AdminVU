@@ -85,31 +85,20 @@ void signal_handler(int signum) {
 
 /* ── Slash-command registration ──────────────────────────────────────────── */
 
-/*
- * Registers commands that should only exist in the bot's own
- * infrastructure guild — central admin, pairing, oversight, etc.
- */
 static void register_admin_commands(struct discord  *client,
                                     u64_snowflake_t  application_id,
                                     u64_snowflake_t  bot_guild_id) {
     register_propagation_commands(client, application_id, bot_guild_id);
-    /* Add any other bot-team-only commands here. */
     printf("[main] Admin commands registered in bot guild %" PRIu64 "\n",
            bot_guild_id);
 }
 
-/*
- * Registers all community-facing commands globally.
- * Called once — applies to every guild the bot is in or ever joins.
- * Pass guild_id = 0 to the underlying registration calls to make them global.
- */
 static void register_global_commands(struct discord  *client,
                                      u64_snowflake_t  application_id) {
     register_moderation_commands(client, application_id, 0);
     register_ticket_commands(client, application_id, 0);
     register_propagation_commands(client, application_id, 0);
     register_fun_commands(client, application_id, 0);
-    /* /ping etc. */
     printf("[main] Global community commands registered.\n");
 }
 
@@ -118,21 +107,15 @@ static void register_global_commands(struct discord  *client,
 typedef struct {
     struct discord  *client;
     u64_snowflake_t  application_id;
-    /* Snapshot of the guild list at the moment on_ready fires. */
     u64_snowflake_t  guild_ids[MAX_DEV_GUILDS];
     int              guild_count;
 } RegisterArgs;
 
 static void *register_commands_thread(void *arg) {
     RegisterArgs *a = arg;
-
-    /* Always register global community commands once. */
     register_global_commands(a->client, a->application_id);
-
-    /* Register privileged admin commands only in the bot's own guild. */
     if (g_bot_guild_id)
         register_admin_commands(a->client, a->application_id, g_bot_guild_id);
-
     free(a);
     return NULL;
 }
@@ -171,13 +154,17 @@ void on_interaction_create_combined(struct discord *client,
                                     const struct discord_interaction *event) {
     if (!event->data) return;
 
-    /* Component interactions (e.g. trivia buttons) don't have a name –
-     * route them to the fun module directly. */
+    /* ── Component interactions (buttons, select menus, etc.) ── */
     if (event->type == DISCORD_INTERACTION_MESSAGE_COMPONENT) {
-        if (event->data->custom_id &&
-            strncmp(event->data->custom_id, "trivia:", 7) == 0) {
+        const char *custom_id = event->data->custom_id;
+        if (!custom_id) return;
+
+        if (strncmp(custom_id, "trivia:", 7) == 0)
             on_fun_interaction(client, event);
-        }
+        /* Ticket button interactions use the "ticket:" prefix. */
+        else if (strncmp(custom_id, "ticket:", 7) == 0)
+            on_ticket_interaction(client, event);
+
         return;
     }
 
@@ -225,8 +212,7 @@ void on_message_create(struct discord *client,
 
     /* Track channel activity for /activity */
     if (event->channel_id)
-        fun_track_message(event->channel_id,
-                          event->channel_id ? NULL : NULL);
+        fun_track_message(event->channel_id, NULL);
 }
 
 static void on_guild_create_handler(struct discord *client,
@@ -303,9 +289,7 @@ int main(int argc, char *argv[]) {
     discord_set_on_message_create(client, &on_message_create);
     discord_set_on_guild_create(client, on_guild_create_handler);
 
-    /* Module init — bot guild is the single fixed reference point.
-    * Community commands are registered globally inside on_ready()
-    * and apply automatically to every guild the bot is in. */
+    /* Module init */
     printf("Initialising modules...\n");
     ping_module_init(client, g_bot_guild_id);
     moderation_module_init(client, &g_database, g_bot_guild_id, token);
