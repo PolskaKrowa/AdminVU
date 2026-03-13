@@ -64,19 +64,19 @@ endif()
 # Using a custom target ensures the copy re-runs whenever any web file changes.
 file(GLOB_RECURSE WEB_SOURCE_FILES
     LIST_DIRECTORIES false
-    "${CMAKE_SOURCE_DIR}/web/*"
+    "${CMAKE_SOURCE_DIR}/src/web/*"
 )
 
 if(WEB_SOURCE_FILES)
     # Create the destination directory upfront so CMake doesn't complain on
     # the very first configure when the build tree is empty.
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/web")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/src/web")
 
     set(WEB_COPIED_FILES "")
     foreach(SRC_FILE ${WEB_SOURCE_FILES})
         # Preserve the path relative to web/ (handles sub-directories too).
-        file(RELATIVE_PATH REL_PATH "${CMAKE_SOURCE_DIR}/web" "${SRC_FILE}")
-        set(DEST_FILE "${CMAKE_BINARY_DIR}/web/${REL_PATH}")
+        file(RELATIVE_PATH REL_PATH "${CMAKE_SOURCE_DIR}/src/web" "${SRC_FILE}")
+        set(DEST_FILE "${CMAKE_BINARY_DIR}/src/web/${REL_PATH}")
 
         # get_filename_component ensures parent dirs exist before copying.
         get_filename_component(DEST_DIR "${DEST_FILE}" DIRECTORY)
@@ -97,9 +97,9 @@ if(WEB_SOURCE_FILES)
         COMMENT "Syncing web assets to build directory"
     )
 
-    message(STATUS "Found ${CMAKE_SOURCE_DIR}/web – will copy assets to build dir")
+    message(STATUS "Found ${CMAKE_SOURCE_DIR}/src/web – will copy assets to build dir")
 else()
-    message(STATUS "No files found in web/ – skipping web asset copy")
+    message(STATUS "No files found in src/web/ – skipping web asset copy")
 endif()
 
 # ── Subdirectories ────────────────────────────────────────────────────────────

@@ -1,9 +1,13 @@
 /*
  * ticket.c  –  Ticket system with staff management commands
  *
+ * NOTE: ticket.h requires no changes from the original.
+ * The existing `subject` field on Ticket is repurposed to hold the community
+ * server snowflake ID supplied via /ticket server:<id>.
+ *
  * User commands:
- *   /ticket open <subject>     – open a new support ticket
- *   /ticket close              – close the current ticket (opener or staff)
+ *   /ticket server:<id>    – open a ticket linked to a community server
+ *   /ticketclose           – close the current ticket (opener or staff)
  *
  * Staff commands (require MANAGE_MESSAGES permission):
  *   /ticketnote    add <text>           – add a private staff note
@@ -14,13 +18,17 @@
  *   /ticketoutcome clear                – clear the current outcome
  *   /ticketassign  <staff_member>       – assign ticket to a staff member
  *   /ticketpriority <level>             – set LOW / MEDIUM / HIGH / URGENT
- *   /ticketstatus  <status>             – set OPEN / IN_PROGRESS / PENDING_USER
+ *   /ticketstatus  <status>             – set OPEN / IN_PROGRESS / PENDING_USER / RESOLVED
  *   /ticketsummary                      – full summary (notes, outcome, history)
- *   /ticketconfig  view                 – view current guild configuration
- *   /ticketconfig  ticket_channel <ch>  – set the ticket creation channel
- *   /ticketconfig  log_channel <ch>     – set the staff log channel
- *   /ticketconfig  main_server <id>     – set the main community server ID
- *   /ticketconfig  staff_server <id>    – set the private staff server ID
+ *   /ticketconfig  [ticket_channel:#ch] [log_channel:#ch]
+ *                  [main_server:<id>]   [staff_server:<id>]
+ *                  (no arguments = view current config)
+ *
+ * Multi-server use:
+ *   All data is partitioned by guild_id, so every Discord server that adds
+ *   this bot gets a fully isolated ticket system.  Pass guild_id = 0 to
+ *   register_ticket_commands() to register global (cross-guild) slash commands,
+ *   or pass a specific guild_id for faster propagation during development.
  */
 
 #include <stdio.h>
@@ -116,19 +124,19 @@ int ticket_db_init_tables(Database *db) {
     const char *sql =
         /* Core ticket record */
         "CREATE TABLE IF NOT EXISTS tickets ("
-        "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  channel_id    INTEGER NOT NULL UNIQUE,"
-        "  guild_id      INTEGER NOT NULL,"
-        "  opener_id     INTEGER NOT NULL,"
+        "  id                 INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  channel_id         INTEGER NOT NULL UNIQUE,"
+        "  guild_id           INTEGER NOT NULL,"
+        "  opener_id          INTEGER NOT NULL,"
         "  assigned_to   INTEGER DEFAULT 0,"
         "  status        INTEGER DEFAULT 0,"
         "  priority      INTEGER DEFAULT 1,"
         "  outcome       INTEGER DEFAULT 0,"
-        "  subject       TEXT,"
+        "  subject       TEXT,"                      /* stores the community server snowflake ID */
         "  outcome_notes TEXT,"
-        "  created_at    INTEGER DEFAULT (strftime('%s','now')),"
-        "  updated_at    INTEGER DEFAULT (strftime('%s','now')),"
-        "  closed_at     INTEGER DEFAULT 0"
+        "  created_at         INTEGER DEFAULT (strftime('%s','now')),"
+        "  updated_at         INTEGER DEFAULT (strftime('%s','now')),"
+        "  closed_at          INTEGER DEFAULT 0"
         ");"
 
         /* Private staff notes */
@@ -143,8 +151,8 @@ int ticket_db_init_tables(Database *db) {
 
         /*
          * Per-guild configuration.
-         * main_server_id / staff_server_id are stored as TEXT because they
-         * are user-supplied server IDs that may not be servers the bot is in.
+         * main_server_id / staff_server_id are TEXT because they are user-supplied
+         * snowflakes that the bot may not necessarily be a member of.
          */
         "CREATE TABLE IF NOT EXISTS ticket_config ("
         "  id                INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -178,7 +186,8 @@ int ticket_db_init_tables(Database *db) {
 
 int ticket_db_create(Database *db, Ticket *t) {
     const char *sql =
-        "INSERT INTO tickets (channel_id, guild_id, opener_id, status, priority, subject) "
+        "INSERT INTO tickets "
+        "  (channel_id, guild_id, opener_id, status, priority, subject) "
         "VALUES (?, ?, ?, ?, ?, ?) RETURNING id;";
 
     sqlite3_stmt *stmt;
@@ -190,7 +199,9 @@ int ticket_db_create(Database *db, Ticket *t) {
     sqlite3_bind_int64(stmt, 3, t->opener_id);
     sqlite3_bind_int  (stmt, 4, t->status);
     sqlite3_bind_int  (stmt, 5, t->priority);
-    sqlite3_bind_text (stmt, 6, t->subject ? t->subject : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (stmt, 6,
+                       t->subject ? t->subject : "",
+                       -1, SQLITE_TRANSIENT);
 
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW)
@@ -199,7 +210,27 @@ int ticket_db_create(Database *db, Ticket *t) {
     return (rc == SQLITE_ROW) ? 0 : -1;
 }
 
-/* Shared row-to-struct helper – column order must match SELECT_TICKET_COLS */
+/*
+ * Column order for every SELECT that feeds row_to_ticket().
+ * Index  0  id
+ * Index  1  channel_id
+ * Index  2  guild_id
+ * Index  3  opener_id
+ * Index  4  assigned_to
+ * Index  5  status
+ * Index  6  priority
+ * Index  7  outcome
+ * Index  8  created_at
+ * Index  9  updated_at
+ * Index  10 closed_at
+ * Index  11 subject          (repurposed: stores community server snowflake ID)
+ * Index  12 outcome_notes
+ */
+static const char *SELECT_TICKET_COLS =
+    "SELECT id, channel_id, guild_id, opener_id, assigned_to, "
+    "       status, priority, outcome, created_at, updated_at, closed_at, "
+    "       subject, outcome_notes ";
+
 static void row_to_ticket(sqlite3_stmt *stmt, Ticket *t) {
     t->id          = (int)sqlite3_column_int64(stmt, 0);
     t->channel_id  = (u64_snowflake_t)sqlite3_column_int64(stmt, 1);
@@ -213,17 +244,12 @@ static void row_to_ticket(sqlite3_stmt *stmt, Ticket *t) {
     t->updated_at  = (long)sqlite3_column_int64(stmt, 9);
     t->closed_at   = (long)sqlite3_column_int64(stmt, 10);
 
-    const char *subj  = (const char *)sqlite3_column_text(stmt, 11);
-    t->subject        = subj ? strdup(subj) : NULL;
+    const char *rsid     = (const char *)sqlite3_column_text(stmt, 11);
+    t->subject           = (rsid && rsid[0]) ? strdup(rsid) : NULL;
 
-    const char *onotes = (const char *)sqlite3_column_text(stmt, 12);
-    t->outcome_notes   = onotes ? strdup(onotes) : NULL;
+    const char *onotes   = (const char *)sqlite3_column_text(stmt, 12);
+    t->outcome_notes     = onotes ? strdup(onotes) : NULL;
 }
-
-static const char *SELECT_TICKET_COLS =
-    "SELECT id, channel_id, guild_id, opener_id, assigned_to, "
-    "       status, priority, outcome, created_at, updated_at, closed_at, "
-    "       subject, outcome_notes ";
 
 int ticket_db_get_by_channel(Database *db, u64_snowflake_t channel_id, Ticket *out) {
     char sql[512];
@@ -258,7 +284,6 @@ int ticket_db_get_by_id(Database *db, int ticket_id, Ticket *out) {
 }
 
 int ticket_db_update_status(Database *db, int ticket_id, TicketStatus status) {
-    /* When marking closed, also stamp closed_at */
     const char *sql = (status == TICKET_STATUS_CLOSED || status == TICKET_STATUS_RESOLVED)
         ? "UPDATE tickets SET status = ?, closed_at = strftime('%s','now'), "
           "updated_at = strftime('%s','now') WHERE id = ?;"
@@ -412,7 +437,7 @@ int ticket_note_set_pinned(Database *db, int note_id, bool pinned) {
 int ticket_note_delete(Database *db, int note_id,
                        u64_snowflake_t requesting_staff_id) {
     /*
-     * Only allow deletion if the requesting staff member is the note author.
+     * Only allow deletion if the requester is the note author.
      * Pass 0 as requesting_staff_id to bypass the authorship check (admins).
      */
     const char *sql = (requesting_staff_id == 0)
@@ -443,10 +468,6 @@ void ticket_notes_free(TicketNote *notes, int count) {
  * Database – config CRUD
  * ========================================================================= */
 
-/*
- * Ensure a config row exists for the guild, then fill *out with its values.
- * Returns 0 on success, -1 on error.
- */
 int ticket_config_get(Database *db, u64_snowflake_t guild_id, TicketConfig *out) {
     /* Upsert a default row so we always have something to read back */
     const char *upsert =
@@ -476,10 +497,10 @@ int ticket_config_get(Database *db, u64_snowflake_t guild_id, TicketConfig *out)
         out->log_channel_id    = (u64_snowflake_t)sqlite3_column_int64(stmt, 3);
 
         const char *ms = (const char *)sqlite3_column_text(stmt, 4);
-        out->main_server_id    = (ms  && ms[0])  ? strdup(ms)  : NULL;
+        out->main_server_id  = (ms && ms[0]) ? strdup(ms) : NULL;
 
         const char *ss = (const char *)sqlite3_column_text(stmt, 5);
-        out->staff_server_id   = (ss  && ss[0])  ? strdup(ss)  : NULL;
+        out->staff_server_id = (ss && ss[0]) ? strdup(ss) : NULL;
     }
     sqlite3_finalize(stmt);
     return (rc == SQLITE_ROW) ? 0 : -1;
@@ -494,9 +515,8 @@ void ticket_config_free(TicketConfig *cfg) {
 }
 
 /*
- * Generic upsert helper used by all the individual setters below.
- * `col` must be a trusted compile-time literal – it is interpolated directly
- * into SQL so do not pass user input here.
+ * Generic upsert helpers.
+ * `col` must be a compile-time literal – never pass user input here.
  */
 static int config_upsert_snowflake(Database *db, u64_snowflake_t guild_id,
                                     const char *col, u64_snowflake_t value) {
@@ -563,9 +583,9 @@ int ticket_config_set_staff_server(Database *db, u64_snowflake_t guild_id,
 /* ============================================================================
  * Runtime config cache
  *
- * Rather than hitting the DB on every single interaction, we keep one cached
- * TicketConfig per guild in a small fixed-size table.  A real implementation
- * would use a hash map; 64 guilds is sufficient for most self-hosted bots.
+ * One cached TicketConfig per guild in a fixed-size table.  64 entries covers
+ * most self-hosted deployments; a hash map would be appropriate for larger
+ * public bots.
  * ========================================================================= */
 
 #define CONFIG_CACHE_SIZE 64
@@ -588,19 +608,13 @@ static void config_cache_invalidate(u64_snowflake_t guild_id) {
     }
 }
 
-/*
- * Returns a pointer to a cached TicketConfig for the guild.
- * The pointer is valid until the next call that invalidates this guild.
- * Returns NULL on DB error.
- */
 static const TicketConfig *config_for_guild(u64_snowflake_t guild_id) {
-    /* Check cache */
     for (int i = 0; i < CONFIG_CACHE_SIZE; i++) {
         if (g_config_cache[i].valid && g_config_cache[i].guild_id == guild_id)
             return &g_config_cache[i].cfg;
     }
 
-    /* Find a free slot (prefer invalid, then evict slot 0 as LRU fallback) */
+    /* Find a free slot; evict slot 0 as a simple fallback */
     int slot = 0;
     for (int i = 0; i < CONFIG_CACHE_SIZE; i++) {
         if (!g_config_cache[i].valid) { slot = i; break; }
@@ -618,7 +632,6 @@ static const TicketConfig *config_for_guild(u64_snowflake_t guild_id) {
     return &g_config_cache[slot].cfg;
 }
 
-/* Convenience: get the log channel for a guild (0 = not set) */
 static u64_snowflake_t log_channel_for_guild(u64_snowflake_t guild_id) {
     const TicketConfig *cfg = config_for_guild(guild_id);
     return cfg ? cfg->log_channel_id : 0;
@@ -640,17 +653,7 @@ static bool is_staff(const struct discord_interaction *event) {
 
 /*
  * send_to_channel – single chokepoint for all outbound messages.
- *
- * Replace the body with whichever pattern your Orca build exposes:
- *
- *   Option A (struct init, most common):
- *     struct discord_create_message params;
- *     memset(&params, 0, sizeof(params));
- *     params.content = (char *)content;
- *     discord_create_message(client, channel_id, &params, NULL);
- *
- *   Option B (simple helper):
- *     discord_send_message(client, channel_id, content);
+ * Replace the body with the correct call for your Orca build.
  */
 static void send_to_channel(struct discord *client,
                              u64_snowflake_t channel_id,
@@ -700,9 +703,7 @@ static void log_to_staff_channel(u64_snowflake_t guild_id, const char *message) 
 
 /*
  * get_active_subcommand / find_option / find_sub_option
- *
- * Using direct indexing rather than NULL-sentinel loops because some Orca
- * builds do not NULL-terminate options arrays.  25 is Discord's hard max.
+ * Direct-indexed rather than NULL-sentinel loops; 25 is Discord's hard max.
  */
 static const struct discord_application_command_interaction_data_option *
 get_active_subcommand(const struct discord_interaction *event) {
@@ -734,13 +735,16 @@ find_sub_option(const struct discord_application_command_interaction_data_option
 }
 
 /* ============================================================================
- * Command handler – /ticket open
+ * Command handler – /ticket server:<id>
+ *
+ * Opens a new ticket in the current channel, linked to the given community
+ * server ID.  The server_id is stored for staff context but is not validated
+ * against Discord's API (it may be a server the bot isn't a member of).
  * ========================================================================= */
 
 static void handle_ticket_open(struct discord *client,
-                                const struct discord_interaction *event,
-                                const struct discord_application_command_interaction_data_option *subcmd) {
-    /* Prevent opening a second ticket inside an existing ticket channel */
+                                const struct discord_interaction *event) {
+    /* Prevent opening a second ticket in an existing ticket channel */
     Ticket existing = {0};
     if (ticket_db_get_by_channel(g_db, event->channel_id, &existing) == 0) {
         ticket_db_free(&existing);
@@ -749,11 +753,21 @@ static void handle_ticket_open(struct discord *client,
         return;
     }
 
-    const struct discord_application_command_interaction_data_option *subj_opt =
-        find_sub_option(subcmd, "subject");
-    if (!subj_opt || !subj_opt->value || subj_opt->value[0] == '\0') {
-        reply_ephemeral(client, event, "❌ Please provide a subject for your ticket.");
+    const struct discord_application_command_interaction_data_option *server_opt =
+        find_option(event, "server");
+    if (!server_opt || !server_opt->value || server_opt->value[0] == '\0') {
+        reply_ephemeral(client, event,
+                        "❌ Please provide the ID of the server your ticket relates to.");
         return;
+    }
+
+    /* Validate: must be a numeric snowflake */
+    for (const char *p = server_opt->value; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            reply_ephemeral(client, event,
+                            "❌ Server ID must be a numeric Discord snowflake.");
+            return;
+        }
     }
 
     Ticket t;
@@ -763,7 +777,7 @@ static void handle_ticket_open(struct discord *client,
     t.opener_id  = event->member->user->id;
     t.status     = TICKET_STATUS_OPEN;
     t.priority   = TICKET_PRIORITY_MEDIUM;
-    t.subject    = (char *)subj_opt->value; /* not heap-allocated; not freed */
+    t.subject    = (char *)server_opt->value; /* stack – not freed */
 
     if (ticket_db_create(g_db, &t) != 0) {
         reply_ephemeral(client, event,
@@ -774,21 +788,21 @@ static void handle_ticket_open(struct discord *client,
     char msg[512];
     snprintf(msg, sizeof(msg),
              "🎫 **Ticket #%d opened**\n"
-             "**Subject:** %s\n"
+             "**Server:** `%s`\n"
              "Staff will be with you shortly.\n\n"
-             "_Use `/ticket close` to close this ticket at any time._",
-             t.id, subj_opt->value);
+             "_Use `/ticketclose` to close this ticket at any time._",
+             t.id, server_opt->value);
     reply_public(client, event, msg);
 
     char log_msg[512];
     snprintf(log_msg, sizeof(log_msg),
-             "🎫 Ticket #%d opened by <@%" PRIu64 "> — **%s**",
-             t.id, t.opener_id, subj_opt->value);
+             "🎫 Ticket #%d opened by <@%" PRIu64 "> — server `%s`",
+             t.id, t.opener_id, server_opt->value);
     log_to_staff_channel(event->guild_id, log_msg);
 }
 
 /* ============================================================================
- * Command handler – /ticket close
+ * Command handler – /ticketclose
  * ========================================================================= */
 
 static void handle_ticket_close(struct discord *client,
@@ -799,14 +813,12 @@ static void handle_ticket_close(struct discord *client,
         return;
     }
 
-    /* Already closed / resolved */
     if (t.status == TICKET_STATUS_CLOSED || t.status == TICKET_STATUS_RESOLVED) {
         reply_ephemeral(client, event, "ℹ️ This ticket is already closed.");
         ticket_db_free(&t);
         return;
     }
 
-    /* Only the opener or staff may close a ticket */
     u64_snowflake_t caller_id = event->member->user->id;
     if (caller_id != t.opener_id && !is_staff(event)) {
         reply_ephemeral(client, event,
@@ -1171,7 +1183,7 @@ static void handle_summary(struct discord *client,
         return;
     }
 
-    TicketNote *notes     = NULL;
+    TicketNote *notes      = NULL;
     int         note_count = 0;
     ticket_note_get_all(g_db, t.id, &notes, &note_count);
 
@@ -1180,7 +1192,7 @@ static void handle_summary(struct discord *client,
 
     off += snprintf(buf + off, sizeof(buf) - off,
                     "📋 **Ticket #%d Summary**\n"
-                    "**Subject:** %s\n"
+                    "**Server:** %s\n"
                     "**Opened by:** <@%" PRIu64 ">\n"
                     "**Assigned to:** %s\n"
                     "**Status:** %s\n"
@@ -1236,205 +1248,142 @@ static void handle_summary(struct discord *client,
 }
 
 /* ============================================================================
- * Command handlers – /ticketconfig (staff)
+ * Command handler – /ticketconfig (staff)
+ *
+ * Flat command: no subcommands.
+ *   • No options provided  → display current configuration (view mode).
+ *   • Any options provided → apply each supplied field and confirm.
+ *
+ * All four options are optional so the user can update any combination of
+ * fields in a single invocation.
  * ========================================================================= */
 
-static void handle_config_view(struct discord *client,
-                                const struct discord_interaction *event) {
-    TicketConfig cfg = {0};
-    if (ticket_config_get(g_db, event->guild_id, &cfg) != 0) {
-        reply_ephemeral(client, event, "❌ Failed to load configuration.");
-        return;
-    }
+static void handle_config(struct discord *client,
+                           const struct discord_interaction *event) {
 
-    char buf[1024];
-    int  off = 0;
+    typedef const struct discord_application_command_interaction_data_option opt_t;
 
-    off += snprintf(buf + off, sizeof(buf) - off,
-                    "⚙️ **Ticket Configuration**\n\n");
+    opt_t *tc_opt = find_option(event, "ticket_channel");
+    opt_t *lc_opt = find_option(event, "log_channel");
+    opt_t *ms_opt = find_option(event, "main_server");
+    opt_t *ss_opt = find_option(event, "staff_server");
 
-    /* Ticket channel */
-    if (cfg.ticket_channel_id)
-        off += snprintf(buf + off, sizeof(buf) - off,
-                        "**Ticket Channel:** <#%" PRIu64 ">\n",
-                        cfg.ticket_channel_id);
-    else
-        off += snprintf(buf + off, sizeof(buf) - off,
-                        "**Ticket Channel:** *(not set)*\n");
-
-    /* Log channel */
-    if (cfg.log_channel_id)
-        off += snprintf(buf + off, sizeof(buf) - off,
-                        "**Log Channel:** <#%" PRIu64 ">\n",
-                        cfg.log_channel_id);
-    else
-        off += snprintf(buf + off, sizeof(buf) - off,
-                        "**Log Channel:** *(not set)*\n");
-
-    /* Main server */
-    off += snprintf(buf + off, sizeof(buf) - off,
-                    "**Main Server ID:** %s\n",
-                    (cfg.main_server_id && cfg.main_server_id[0])
-                        ? cfg.main_server_id : "*(not set)*");
-
-    /* Staff server */
-    off += snprintf(buf + off, sizeof(buf) - off,
-                    "**Staff Server ID:** %s\n",
-                    (cfg.staff_server_id && cfg.staff_server_id[0])
-                        ? cfg.staff_server_id : "*(not set)*");
-
-    reply_ephemeral(client, event, buf);
-    ticket_config_free(&cfg);
-}
-
-static void handle_config_ticket_channel(
-        struct discord *client,
-        const struct discord_interaction *event,
-        const struct discord_application_command_interaction_data_option *subcmd) {
-
-    const struct discord_application_command_interaction_data_option *ch_opt =
-        find_sub_option(subcmd, "channel");
-    if (!ch_opt || !ch_opt->value) {
-        reply_ephemeral(client, event, "❌ Provide a channel.");
-        return;
-    }
-
-    u64_snowflake_t channel_id =
-        (u64_snowflake_t)strtoull(ch_opt->value, NULL, 10);
-    if (channel_id == 0) {
-        reply_ephemeral(client, event, "❌ Invalid channel ID.");
-        return;
-    }
-
-    if (ticket_config_set_ticket_channel(g_db, event->guild_id, channel_id) != 0) {
-        reply_ephemeral(client, event, "❌ Failed to save configuration.");
-        return;
-    }
-
-    /* Invalidate cache so the next interaction picks up the new value */
-    config_cache_invalidate(event->guild_id);
-
-    char msg[256];
-    snprintf(msg, sizeof(msg),
-             "✅ Ticket channel set to <#%" PRIu64 ">.", channel_id);
-    reply_ephemeral(client, event, msg);
-
-    char log_msg[256];
-    snprintf(log_msg, sizeof(log_msg),
-             "⚙️ Ticket channel set to <#%" PRIu64 "> by <@%" PRIu64 ">.",
-             channel_id, event->member->user->id);
-    log_to_staff_channel(event->guild_id, log_msg);
-}
-
-static void handle_config_log_channel(
-        struct discord *client,
-        const struct discord_interaction *event,
-        const struct discord_application_command_interaction_data_option *subcmd) {
-
-    const struct discord_application_command_interaction_data_option *ch_opt =
-        find_sub_option(subcmd, "channel");
-    if (!ch_opt || !ch_opt->value) {
-        reply_ephemeral(client, event, "❌ Provide a channel.");
-        return;
-    }
-
-    u64_snowflake_t channel_id =
-        (u64_snowflake_t)strtoull(ch_opt->value, NULL, 10);
-    if (channel_id == 0) {
-        reply_ephemeral(client, event, "❌ Invalid channel ID.");
-        return;
-    }
-
-    if (ticket_config_set_log_channel(g_db, event->guild_id, channel_id) != 0) {
-        reply_ephemeral(client, event, "❌ Failed to save configuration.");
-        return;
-    }
-
-    config_cache_invalidate(event->guild_id);
-
-    char msg[256];
-    snprintf(msg, sizeof(msg),
-             "✅ Log channel set to <#%" PRIu64 ">.", channel_id);
-    reply_ephemeral(client, event, msg);
-}
-
-static void handle_config_main_server(
-        struct discord *client,
-        const struct discord_interaction *event,
-        const struct discord_application_command_interaction_data_option *subcmd) {
-
-    const struct discord_application_command_interaction_data_option *id_opt =
-        find_sub_option(subcmd, "server_id");
-    if (!id_opt || !id_opt->value || id_opt->value[0] == '\0') {
-        reply_ephemeral(client, event, "❌ Provide a server ID.");
-        return;
-    }
-
-    /* Basic sanity: must be a numeric snowflake */
-    for (const char *p = id_opt->value; *p; p++) {
-        if (*p < '0' || *p > '9') {
-            reply_ephemeral(client, event,
-                            "❌ Server ID must be a numeric Discord snowflake.");
+    /* ── View mode: no options supplied ─────────────────────────────────── */
+    if (!tc_opt && !lc_opt && !ms_opt && !ss_opt) {
+        TicketConfig cfg = {0};
+        if (ticket_config_get(g_db, event->guild_id, &cfg) != 0) {
+            reply_ephemeral(client, event, "❌ Failed to load configuration.");
             return;
+        }
+
+        char buf[1024];
+        int  off = snprintf(buf, sizeof(buf), "⚙️ **Ticket Configuration**\n\n");
+
+        off += (cfg.ticket_channel_id)
+            ? snprintf(buf + off, sizeof(buf) - off,
+                       "**Ticket Channel:** <#%" PRIu64 ">\n", cfg.ticket_channel_id)
+            : snprintf(buf + off, sizeof(buf) - off,
+                       "**Ticket Channel:** *(not set)*\n");
+
+        off += (cfg.log_channel_id)
+            ? snprintf(buf + off, sizeof(buf) - off,
+                       "**Log Channel:** <#%" PRIu64 ">\n", cfg.log_channel_id)
+            : snprintf(buf + off, sizeof(buf) - off,
+                       "**Log Channel:** *(not set)*\n");
+
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "**Main Server ID:** %s\n",
+                        (cfg.main_server_id && cfg.main_server_id[0])
+                            ? cfg.main_server_id : "*(not set)*");
+
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "**Staff Server ID:** %s\n",
+                        (cfg.staff_server_id && cfg.staff_server_id[0])
+                            ? cfg.staff_server_id : "*(not set)*");
+
+        reply_ephemeral(client, event, buf);
+        ticket_config_free(&cfg);
+        return;
+    }
+
+    /* ── Set mode: apply whichever options were supplied ─────────────────── */
+    char  reply[1024];
+    int   roff     = snprintf(reply, sizeof(reply), "⚙️ **Configuration updated:**\n");
+    char  log_msg[512];
+    int   loff     = snprintf(log_msg, sizeof(log_msg), "⚙️ Config updated by <@%" PRIu64 ">:",
+                               event->member->user->id);
+    bool  any_ok   = false;
+
+    if (tc_opt && tc_opt->value) {
+        u64_snowflake_t ch = (u64_snowflake_t)strtoull(tc_opt->value, NULL, 10);
+        if (ch && ticket_config_set_ticket_channel(g_db, event->guild_id, ch) == 0) {
+            roff += snprintf(reply + roff, sizeof(reply) - roff,
+                             "✅ Ticket channel → <#%" PRIu64 ">\n", ch);
+            loff += snprintf(log_msg + loff, sizeof(log_msg) - loff,
+                             " ticket_channel=<#%" PRIu64 ">", ch);
+            any_ok = true;
+        } else {
+            roff += snprintf(reply + roff, sizeof(reply) - roff,
+                             "❌ Failed to set ticket channel.\n");
         }
     }
 
-    if (ticket_config_set_main_server(g_db, event->guild_id, id_opt->value) != 0) {
-        reply_ephemeral(client, event, "❌ Failed to save configuration.");
-        return;
-    }
-
-    config_cache_invalidate(event->guild_id);
-
-    char msg[256];
-    snprintf(msg, sizeof(msg),
-             "✅ Main server ID set to `%s`.", id_opt->value);
-    reply_ephemeral(client, event, msg);
-
-    char log_msg[256];
-    snprintf(log_msg, sizeof(log_msg),
-             "⚙️ Main server ID set to `%s` by <@%" PRIu64 ">.",
-             id_opt->value, event->member->user->id);
-    log_to_staff_channel(event->guild_id, log_msg);
-}
-
-static void handle_config_staff_server(
-        struct discord *client,
-        const struct discord_interaction *event,
-        const struct discord_application_command_interaction_data_option *subcmd) {
-
-    const struct discord_application_command_interaction_data_option *id_opt =
-        find_sub_option(subcmd, "server_id");
-    if (!id_opt || !id_opt->value || id_opt->value[0] == '\0') {
-        reply_ephemeral(client, event, "❌ Provide a server ID.");
-        return;
-    }
-
-    for (const char *p = id_opt->value; *p; p++) {
-        if (*p < '0' || *p > '9') {
-            reply_ephemeral(client, event,
-                            "❌ Server ID must be a numeric Discord snowflake.");
-            return;
+    if (lc_opt && lc_opt->value) {
+        u64_snowflake_t ch = (u64_snowflake_t)strtoull(lc_opt->value, NULL, 10);
+        if (ch && ticket_config_set_log_channel(g_db, event->guild_id, ch) == 0) {
+            roff += snprintf(reply + roff, sizeof(reply) - roff,
+                             "✅ Log channel → <#%" PRIu64 ">\n", ch);
+            loff += snprintf(log_msg + loff, sizeof(log_msg) - loff,
+                             " log_channel=<#%" PRIu64 ">", ch);
+            any_ok = true;
+        } else {
+            roff += snprintf(reply + roff, sizeof(reply) - roff,
+                             "❌ Failed to set log channel.\n");
         }
     }
 
-    if (ticket_config_set_staff_server(g_db, event->guild_id, id_opt->value) != 0) {
-        reply_ephemeral(client, event, "❌ Failed to save configuration.");
-        return;
+    if (ms_opt && ms_opt->value && ms_opt->value[0]) {
+        /* Snowflake digit check */
+        bool valid = true;
+        for (const char *p = ms_opt->value; *p; p++)
+            if (*p < '0' || *p > '9') { valid = false; break; }
+
+        if (valid && ticket_config_set_main_server(g_db, event->guild_id, ms_opt->value) == 0) {
+            roff += snprintf(reply + roff, sizeof(reply) - roff,
+                             "✅ Main server → `%s`\n", ms_opt->value);
+            loff += snprintf(log_msg + loff, sizeof(log_msg) - loff,
+                             " main_server=%s", ms_opt->value);
+            any_ok = true;
+        } else {
+            roff += snprintf(reply + roff, sizeof(reply) - roff,
+                             "❌ Failed to set main server (must be a numeric snowflake).\n");
+        }
     }
 
-    config_cache_invalidate(event->guild_id);
+    if (ss_opt && ss_opt->value && ss_opt->value[0]) {
+        bool valid = true;
+        for (const char *p = ss_opt->value; *p; p++)
+            if (*p < '0' || *p > '9') { valid = false; break; }
 
-    char msg[256];
-    snprintf(msg, sizeof(msg),
-             "✅ Staff server ID set to `%s`.", id_opt->value);
-    reply_ephemeral(client, event, msg);
+        if (valid && ticket_config_set_staff_server(g_db, event->guild_id, ss_opt->value) == 0) {
+            roff += snprintf(reply + roff, sizeof(reply) - roff,
+                             "✅ Staff server → `%s`\n", ss_opt->value);
+            loff += snprintf(log_msg + loff, sizeof(log_msg) - loff,
+                             " staff_server=%s", ss_opt->value);
+            any_ok = true;
+        } else {
+            roff += snprintf(reply + roff, sizeof(reply) - roff,
+                             "❌ Failed to set staff server (must be a numeric snowflake).\n");
+        }
+    }
 
-    char log_msg[256];
-    snprintf(log_msg, sizeof(log_msg),
-             "⚙️ Staff server ID set to `%s` by <@%" PRIu64 ">.",
-             id_opt->value, event->member->user->id);
-    log_to_staff_channel(event->guild_id, log_msg);
+    if (any_ok)
+        config_cache_invalidate(event->guild_id);
+
+    reply_ephemeral(client, event, reply);
+
+    if (any_ok)
+        log_to_staff_channel(event->guild_id, log_msg);
 }
 
 /* ============================================================================
@@ -1448,14 +1397,13 @@ void on_ticket_interaction(struct discord *client,
 
     /* ── /ticket ─────────────────────────────────────────────────────────── */
     if (strcmp(cmd, "ticket") == 0) {
-        const struct discord_application_command_interaction_data_option *sub =
-            get_active_subcommand(event);
-        if (!sub) { reply_ephemeral(client, event, "Missing sub-command."); return; }
+        handle_ticket_open(client, event);
+        return;
+    }
 
-        if (strcmp(sub->name, "open")  == 0) { handle_ticket_open(client, event, sub); return; }
-        if (strcmp(sub->name, "close") == 0) { handle_ticket_close(client, event);     return; }
-
-        reply_ephemeral(client, event, "Unknown sub-command.");
+    /* ── /ticketclose ────────────────────────────────────────────────────── */
+    if (strcmp(cmd, "ticketclose") == 0) {
+        handle_ticket_close(client, event);
         return;
     }
 
@@ -1497,61 +1445,36 @@ void on_ticket_interaction(struct discord *client,
 
     /* ── /ticketassign ───────────────────────────────────────────────────── */
     if (strcmp(cmd, "ticketassign") == 0) {
-        if (!is_staff(event)) {
-            reply_ephemeral(client, event, "❌ Staff only.");
-            return;
-        }
+        if (!is_staff(event)) { reply_ephemeral(client, event, "❌ Staff only."); return; }
         handle_assign(client, event);
         return;
     }
 
     /* ── /ticketpriority ─────────────────────────────────────────────────── */
     if (strcmp(cmd, "ticketpriority") == 0) {
-        if (!is_staff(event)) {
-            reply_ephemeral(client, event, "❌ Staff only.");
-            return;
-        }
+        if (!is_staff(event)) { reply_ephemeral(client, event, "❌ Staff only."); return; }
         handle_priority(client, event);
         return;
     }
 
     /* ── /ticketstatus ───────────────────────────────────────────────────── */
     if (strcmp(cmd, "ticketstatus") == 0) {
-        if (!is_staff(event)) {
-            reply_ephemeral(client, event, "❌ Staff only.");
-            return;
-        }
+        if (!is_staff(event)) { reply_ephemeral(client, event, "❌ Staff only."); return; }
         handle_status(client, event);
         return;
     }
 
     /* ── /ticketsummary ──────────────────────────────────────────────────── */
     if (strcmp(cmd, "ticketsummary") == 0) {
-        if (!is_staff(event)) {
-            reply_ephemeral(client, event, "❌ Staff only.");
-            return;
-        }
+        if (!is_staff(event)) { reply_ephemeral(client, event, "❌ Staff only."); return; }
         handle_summary(client, event);
         return;
     }
 
     /* ── /ticketconfig ───────────────────────────────────────────────────── */
     if (strcmp(cmd, "ticketconfig") == 0) {
-        if (!is_staff(event)) {
-            reply_ephemeral(client, event, "❌ Staff only.");
-            return;
-        }
-        const struct discord_application_command_interaction_data_option *sub =
-            get_active_subcommand(event);
-        if (!sub) { reply_ephemeral(client, event, "Missing sub-command."); return; }
-
-        if (strcmp(sub->name, "view")           == 0) { handle_config_view(client, event);                    return; }
-        if (strcmp(sub->name, "ticket_channel") == 0) { handle_config_ticket_channel(client, event, sub);     return; }
-        if (strcmp(sub->name, "log_channel")    == 0) { handle_config_log_channel(client, event, sub);        return; }
-        if (strcmp(sub->name, "main_server")    == 0) { handle_config_main_server(client, event, sub);        return; }
-        if (strcmp(sub->name, "staff_server")   == 0) { handle_config_staff_server(client, event, sub);       return; }
-
-        reply_ephemeral(client, event, "Unknown sub-command.");
+        if (!is_staff(event)) { reply_ephemeral(client, event, "❌ Staff only."); return; }
+        handle_config(client, event);
         return;
     }
 }
@@ -1568,56 +1491,69 @@ void on_ticket_message(struct discord *client,
 
 /* ============================================================================
  * Slash command registration
+ *
+ * Pass guild_id = 0  → register as global commands  (up to 1 hour propagation)
+ * Pass guild_id = X  → register as guild commands   (instant, dev-friendly)
+ *
+ * For a public multi-server bot, call this once at startup with guild_id = 0.
  * ========================================================================= */
 
 void register_ticket_commands(struct discord *client,
                                u64_snowflake_t application_id,
                                u64_snowflake_t guild_id) {
 
-#define REG(params_ptr, label)                                                    \
-    do {                                                                          \
-        ORCAcode _c = discord_create_guild_application_command(                   \
-            client, application_id, guild_id, (params_ptr), NULL);                \
-        if (_c == ORCA_OK)                                                        \
-            printf("[ticket] /%s registered\n", (label));                         \
-        else                                                                      \
-            printf("[ticket] Failed to register /%s (code %d)\n", (label), _c);  \
+/*
+ * REG dispatches to the guild or global endpoint depending on guild_id.
+ * Adjust discord_create_global_application_command's signature to match
+ * your Orca build if needed (some builds omit the application_id param).
+ */
+#define REG(params_ptr, label)                                                       \
+    do {                                                                             \
+        ORCAcode _c;                                                                 \
+        if (guild_id)                                                                \
+            _c = discord_create_guild_application_command(                           \
+                     client, application_id, guild_id, (params_ptr), NULL);          \
+        else                                                                         \
+            _c = discord_create_global_application_command(                          \
+                     client, application_id,                                         \
+                     (struct discord_create_global_application_command_params *)      \
+                         (params_ptr),                                               \
+                     NULL);                                                          \
+        if (_c == ORCA_OK)                                                           \
+            printf("[ticket] /%s registered (%s)\n", (label),                        \
+                   guild_id ? "guild" : "global");                                   \
+        else                                                                         \
+            printf("[ticket] Failed to register /%s (code %d)\n", (label), _c);     \
     } while (0)
 
-    /* ── /ticket ──────────────────────────────────────────────────────────── */
+    /* ── /ticket server:<id> ──────────────────────────────────────────────── */
     {
-        struct discord_application_command_option open_subject_opt = {
+        struct discord_application_command_option server_opt = {
             .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-            .name        = "subject",
-            .description = "Brief description of your issue",
+            .name        = "server",
+            .description = "Snowflake ID of the server your ticket relates to",
             .required    = true,
         };
-        struct discord_application_command_option *open_opts[] = {
-            &open_subject_opt, NULL,
-        };
-
-        struct discord_application_command_option open_sub = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
-            .name        = "open",
-            .description = "Open a new support ticket",
-            .options     = open_opts,
-        };
-        struct discord_application_command_option close_sub = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
-            .name        = "close",
-            .description = "Close this ticket",
-        };
-
         struct discord_application_command_option *ticket_opts[] = {
-            &open_sub, &close_sub, NULL,
+            &server_opt, NULL,
         };
         struct discord_create_guild_application_command_params ticket_cmd = {
             .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
             .name        = "ticket",
-            .description = "Open or close a support ticket",
+            .description = "Open a support ticket for your server",
             .options     = ticket_opts,
         };
         REG(&ticket_cmd, "ticket");
+    }
+
+    /* ── /ticketclose ─────────────────────────────────────────────────────── */
+    {
+        struct discord_create_guild_application_command_params close_cmd = {
+            .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
+            .name        = "ticketclose",
+            .description = "Close this support ticket",
+        };
+        REG(&close_cmd, "ticketclose");
     }
 
     /* ── /ticketnote ──────────────────────────────────────────────────────── */
@@ -1693,8 +1629,7 @@ void register_ticket_commands(struct discord *client,
         };
         struct discord_application_command_option set_sub = {
             .type = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
-            .name = "set", .description = "Record the ticket outcome",
-            .options = set_opts,
+            .name = "set", .description = "Record the ticket outcome", .options = set_opts,
         };
         struct discord_application_command_option clear_sub = {
             .type = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
@@ -1795,62 +1730,42 @@ void register_ticket_commands(struct discord *client,
     }
 
     /* ── /ticketconfig ────────────────────────────────────────────────────── */
+    /*
+     * Flat command – no subcommands.  All options are optional.
+     * Omitting all options shows the current config; supplying any option sets it.
+     */
     {
-        /* Shared channel option reused by ticket_channel and log_channel */
-        struct discord_application_command_option channel_opt = {
+        struct discord_application_command_option tc_opt = {
             .type        = DISCORD_APPLICATION_COMMAND_OPTION_CHANNEL,
-            .name        = "channel",
-            .description = "The channel to set",
-            .required    = true,
-        };
-        struct discord_application_command_option *ch_opts[] = { &channel_opt, NULL };
-
-        /* Shared server_id string option reused by main_server and staff_server */
-        struct discord_application_command_option server_id_opt = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-            .name        = "server_id",
-            .description = "Discord server (guild) snowflake ID",
-            .required    = true,
-        };
-        struct discord_application_command_option *sid_opts[] = { &server_id_opt, NULL };
-
-        struct discord_application_command_option view_sub = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
-            .name        = "view",
-            .description = "View current ticket configuration",
-        };
-        struct discord_application_command_option tc_sub = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
             .name        = "ticket_channel",
-            .description = "Set the channel where tickets are created",
-            .options     = ch_opts,
+            .description = "Channel where tickets are created",
+            .required    = false,
         };
-        struct discord_application_command_option lc_sub = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+        struct discord_application_command_option lc_opt = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_CHANNEL,
             .name        = "log_channel",
-            .description = "Set the staff log channel for ticket events",
-            .options     = ch_opts,
+            .description = "Staff log channel for ticket events",
+            .required    = false,
         };
-        struct discord_application_command_option ms_sub = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+        struct discord_application_command_option ms_opt = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
             .name        = "main_server",
-            .description = "Set the main community server ID this support server serves",
-            .options     = sid_opts,
+            .description = "Snowflake ID of the main community server",
+            .required    = false,
         };
-        struct discord_application_command_option ss_sub = {
-            .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
+        struct discord_application_command_option ss_opt = {
+            .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
             .name        = "staff_server",
-            .description = "Set the private staff server ID",
-            .options     = sid_opts,
+            .description = "Snowflake ID of the private staff server",
+            .required    = false,
         };
-
         struct discord_application_command_option *cfg_opts[] = {
-            &view_sub, &tc_sub, &lc_sub, &ms_sub, &ss_sub, NULL,
+            &tc_opt, &lc_opt, &ms_opt, &ss_opt, NULL,
         };
         struct discord_create_guild_application_command_params cfg_cmd = {
             .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
             .name        = "ticketconfig",
-            .description = "(Staff) Configure the ticket system for this server",
+            .description = "(Staff) View or update ticket system configuration",
             .options     = cfg_opts,
         };
         REG(&cfg_cmd, "ticketconfig");

@@ -42,7 +42,7 @@ static u64_snowflake_t parse_snowflake(const char *str) {
  * populates g_guild_ids / g_guild_count.  Whitespace around commas is
  * trimmed so "123, 456 , 789" works too.
  */
-static int parse_guild_ids(const char *raw) {
+static int parse_guild_ids(const char *raw, u64_snowflake_t *out, int max) {
     if (!raw || raw[0] == '\0') return 0;
 
     /* Work on a mutable copy. */
@@ -53,7 +53,7 @@ static int parse_guild_ids(const char *raw) {
     char *saveptr = NULL;
     char *tok = strtok_r(buf, ",", &saveptr);
 
-    while (tok && count < MAX_GUILDS) {
+    while (tok && count < max) {
         /* Trim leading whitespace. */
         while (*tok == ' ' || *tok == '\t') tok++;
         /* Trim trailing whitespace. */
@@ -63,7 +63,7 @@ static int parse_guild_ids(const char *raw) {
         if (*tok != '\0') {
             u64_snowflake_t id = parse_snowflake(tok);
             if (id != 0) {
-                g_guild_ids[count++] = id;
+                out[count++] = id;
             } else {
                 fprintf(stderr, "[main] Ignoring invalid guild ID: \"%s\"\n", tok);
             }
@@ -92,7 +92,7 @@ void signal_handler(int signum) {
 static void register_admin_commands(struct discord  *client,
                                     u64_snowflake_t  application_id,
                                     u64_snowflake_t  bot_guild_id) {
-    register_propagation_admin_commands(client, application_id, bot_guild_id);
+    register_propagation_commands(client, application_id, bot_guild_id);
     /* Add any other bot-team-only commands here. */
     printf("[main] Admin commands registered in bot guild %" PRIu64 "\n",
            bot_guild_id);
@@ -119,7 +119,7 @@ typedef struct {
     struct discord  *client;
     u64_snowflake_t  application_id;
     /* Snapshot of the guild list at the moment on_ready fires. */
-    u64_snowflake_t  guild_ids[MAX_GUILDS];
+    u64_snowflake_t  guild_ids[MAX_DEV_GUILDS];
     int              guild_count;
 } RegisterArgs;
 
@@ -132,20 +132,6 @@ static void *register_commands_thread(void *arg) {
     /* Register privileged admin commands only in the bot's own guild. */
     if (g_bot_guild_id)
         register_admin_commands(a->client, a->application_id, g_bot_guild_id);
-
-    /*
-     * Optionally re-register community commands as guild-scoped too on
-     * dev guilds — useful during development for instant propagation,
-     * since global commands can take up to an hour to update.
-     */
-    for (int i = 0; i < a->guild_count; i++) {
-        register_moderation_commands(a->client, a->application_id, a->guild_ids[i]);
-        register_ticket_commands(a->client, a->application_id, a->guild_ids[i]);
-        register_propagation_commands(a->client, a->application_id, a->guild_ids[i]);
-        register_fun_commands(a->client, a->application_id, a->guild_ids[i]);
-        printf("[main] Dev guild %" PRIu64 " commands registered.\n",
-               a->guild_ids[i]);
-    }
 
     free(a);
     return NULL;
@@ -214,7 +200,7 @@ void on_interaction_create_combined(struct discord *client,
                strcmp(cmd, "ticketconfig") == 0) {
         on_ticket_interaction(client, event);
 
-    } else if (strcmp(cmd, "propagate", 9) == 0) {
+    } else if (strncmp(cmd, "propagate", 9) == 0) {
         on_propagation_interaction(client, event);
 
     } else if (strcmp(cmd, "joke")     == 0 ||
@@ -282,12 +268,9 @@ int main(int argc, char *argv[]) {
     if (dev_guild_str)
         g_dev_guild_count = parse_guild_ids(dev_guild_str, g_dev_guild_ids, MAX_DEV_GUILDS);
 
-    /* Module init — bot guild is the only fixed reference point */
-    propagation_module_init(client, &g_database, g_bot_guild_id);
-
-    printf("Registering commands in %d guild(s):\n", g_guild_count);
-    for (int i = 0; i < g_guild_count; i++)
-        printf("  [%d] %" PRIu64 "\n", i + 1, g_guild_ids[i]);
+    printf("Registering commands in %d dev guild(s):\n", g_dev_guild_count);
+    for (int i = 0; i < g_dev_guild_count; i++)
+        printf("  [%d] %" PRIu64 "\n", i + 1, g_dev_guild_ids[i]);
 
     /* Database */
     printf("Initialising database...\n");

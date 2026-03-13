@@ -1341,7 +1341,7 @@ void register_propagation_commands(struct discord *client,
         .options     = pair_opts,
     };
     discord_create_guild_application_command(client, application_id,
-                                            self_guild_id, &pair_params, NULL);
+                                            g_self_guild, &pair_params, NULL);
 
     printf("[propagation] All propagation commands registered for guild %" PRIu64 "\n",
            guild_id);
