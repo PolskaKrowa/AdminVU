@@ -86,10 +86,10 @@ typedef struct {
 typedef struct {
     int               id;
     u64_snowflake_t   guild_id;
-    u64_snowflake_t   ticket_channel_id;
+    char             *ticket_category_id;
     u64_snowflake_t   log_channel_id;
-    char             *main_server_id;   /* free()-able string, may be NULL */
-    char             *staff_server_id;  /* free()-able string, may be NULL */
+    char             *main_server_id;
+    char             *staff_server_id;
 } TicketConfig;
 
 /* ============================================================================
@@ -129,7 +129,8 @@ void ticket_notes_free(TicketNote *notes, int count);
  * ========================================================================= */
 
 int  ticket_config_get(Database *db, u64_snowflake_t guild_id, TicketConfig *out);
-int  ticket_config_set_ticket_channel(Database *db, u64_snowflake_t guild_id, u64_snowflake_t channel_id);
+int  ticket_config_set_ticket_category(Database *db, u64_snowflake_t guild_id,
+                                       char *category_id);
 int  ticket_config_set_log_channel(Database *db, u64_snowflake_t guild_id, u64_snowflake_t channel_id);
 int  ticket_config_set_main_server(Database *db, u64_snowflake_t guild_id, const char *server_id);
 int  ticket_config_set_staff_server(Database *db, u64_snowflake_t guild_id, const char *server_id);
