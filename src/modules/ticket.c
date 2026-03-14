@@ -897,7 +897,7 @@ static void open_ticket(struct discord *client,
             "**Subject:** %.200s\n\n"
             "A member of staff will be with you shortly.\n"
             "**Reply to this DM to communicate with staff.**\n"
-            "Staff cannot see your name in their replies — communication is anonymous.",
+            "You cannot see the staff member's name.",
             t.id, subject);
         post_to_channel(dm_ch.id, dm_msg);
         dm_map_set(opener_id, dm_ch.id, new_channel.id, t.id);
