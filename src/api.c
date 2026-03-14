@@ -5,6 +5,7 @@
  * All snowflake IDs are serialised as strings to preserve JS precision.
  */
 
+#include "http_server.h"
 #include "api.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -757,6 +758,15 @@ static int handle_ticket_detail(Database *db, const char *path, JB *j) {
     return 200;
 }
 
+/* ── GET /api/tickets/events?since=<unix_ts> ──────────────────────────── */
+static int handle_ticket_events(const char *query, JB *j) {
+    long long since = get_param_i64(query, "since", 0);
+    /* http_sse_poll writes directly into the JB buffer. */
+    http_sse_poll(since, j->buf + j->pos, j->cap - j->pos);
+    j->pos += strlen(j->buf + j->pos);
+    return 200;
+}
+
 /* ── Router ─────────────────────────────────────────────────────────────── */
 
 int api_handle(Database *db,
@@ -802,6 +812,9 @@ int api_handle(Database *db,
     /* /api/tickets/<id> */
     if (is_get && strncmp(path, "/api/tickets/", 13) == 0)
         return handle_ticket_detail(db, path, &j);
+    
+    if (is_get && strcmp(path, "/api/tickets/events") == 0)
+        return handle_ticket_events(query, &j);
 
     jb_raw(&j, "{\"error\":\"not found\"}");
     return 404;

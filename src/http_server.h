@@ -45,4 +45,7 @@ int  http_server_start(HttpServer *srv);
  */
 void http_server_stop(HttpServer *srv);
 
+int http_sse_poll(long long since, char *out, size_t out_sz);
+void http_sse_push(const char *json);
+
 #endif /* HTTP_SERVER_H */

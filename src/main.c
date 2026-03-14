@@ -113,13 +113,30 @@ typedef struct {
 
 static void *register_commands_thread(void *arg) {
     RegisterArgs *a = arg;
+
+    /* Register global commands (guild_id = 0) */
     register_global_commands(a->client, a->application_id);
+
+    /* Also register into each dev guild for instant updates */
+    for (int i = 0; i < a->guild_count; ++i) {
+        u64_snowflake_t gid = a->guild_ids[i];
+        if (!gid) continue;
+
+        register_moderation_commands(a->client, a->application_id, gid);
+        register_ticket_commands(a->client, a->application_id, gid);
+        register_propagation_commands(a->client, a->application_id, gid);
+        register_fun_commands(a->client, a->application_id, gid);
+
+        printf("[main] Registered commands in dev guild %" PRIu64 "\n", gid);
+    }
+
+    /* Admin-only commands for the infra/bot guild */
     if (g_bot_guild_id)
         register_admin_commands(a->client, a->application_id, g_bot_guild_id);
+
     free(a);
     return NULL;
 }
-
 /* ── Event handlers ──────────────────────────────────────────────────────── */
 
 void on_ready(struct discord *client) {

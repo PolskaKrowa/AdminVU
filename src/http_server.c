@@ -18,6 +18,48 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <stdarg.h>
+#include <pthread.h>
+#include <time.h>
+
+/* ── Event ring buffer ──────────────────────────────────────────────────── */
+#define SSE_MAX_EVENTS 128
+#define SSE_MAX_JSON   512
+
+typedef struct { char json[SSE_MAX_JSON]; long long ts; } SseEvent;
+static SseEvent          g_sse_buf[SSE_MAX_EVENTS];
+static int               g_sse_head  = 0;
+static int               g_sse_count = 0;
+static pthread_mutex_t   g_sse_mu    = PTHREAD_MUTEX_INITIALIZER;
+
+void http_sse_push(const char *json) {
+    if (!json) return;
+    pthread_mutex_lock(&g_sse_mu);
+    SseEvent *e = &g_sse_buf[g_sse_head % SSE_MAX_EVENTS];
+    strncpy(e->json, json, SSE_MAX_JSON - 1);
+    e->json[SSE_MAX_JSON - 1] = '\0';
+    e->ts = (long long)time(NULL);
+    g_sse_head++;
+    if (g_sse_count < SSE_MAX_EVENTS) g_sse_count++;
+    pthread_mutex_unlock(&g_sse_mu);
+}
+
+int http_sse_poll(long long since, char *out, size_t out_sz) {
+    pthread_mutex_lock(&g_sse_mu);
+    int n = 0;
+    size_t p = 0;
+    p += snprintf(out + p, out_sz - p, "[");
+    int start = (g_sse_head > g_sse_count) ? g_sse_head - g_sse_count : 0;
+    for (int i = start; i < g_sse_head && p + 32 < out_sz; i++) {
+        SseEvent *e = &g_sse_buf[i % SSE_MAX_EVENTS];
+        if (e->ts <= since) continue;
+        if (n++ > 0) p += snprintf(out + p, out_sz - p, ",");
+        p += snprintf(out + p, out_sz - p,
+                      "{\"ts\":%lld,\"data\":%s}", e->ts, e->json);
+    }
+    snprintf(out + p, out_sz - p, "]");
+    pthread_mutex_unlock(&g_sse_mu);
+    return n;
+}
 
 /* ── MIME types ─────────────────────────────────────────────────────────── */
 
@@ -181,8 +223,11 @@ static void handle_client(int client_fd, HttpServer *srv) {
                                 body, body_len,
                                 api_buf, sizeof(api_buf));
 
+        const char *mime = "application/json";
+
         const char *status_text = "OK";
-        if      (status == 400) status_text = "Bad Request";
+        if      (status == 299) { status = 200; mime = "text/html; charset=utf-8"; }
+        else if (status == 400) status_text = "Bad Request";
         else if (status == 404) status_text = "Not Found";
         else if (status == 500) status_text = "Internal Server Error";
 

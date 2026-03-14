@@ -414,6 +414,30 @@ int ticket_config_get(Database *db, u64_snowflake_t guild_id, TicketConfig *out)
     return -1;
 }
 
+/*
+ * Look up the config row where main_server_id matches the given community
+ * guild ID.  This is how open_ticket and log_event resolve config — the
+ * user supplies the community server ID, not the staff guild ID.
+ */
+static int ticket_config_get_by_main_server(Database *db,
+                                             u64_snowflake_t community_guild_id,
+                                             TicketConfig *out) {
+    char id_str[24];
+    snprintf(id_str, sizeof id_str, "%" PRIu64, community_guild_id);
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db,
+            "SELECT id,guild_id,ticket_category_id,log_channel_id,"
+            "main_server_id,staff_server_id"
+            " FROM ticket_config WHERE main_server_id=? LIMIT 1;",
+            -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, id_str, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) { config_from_stmt(stmt, out); sqlite3_finalize(stmt); return 0; }
+    sqlite3_finalize(stmt);
+    return -1;
+}
+
 static int cfg_upsert_text(Database *db, u64_snowflake_t guild_id,
                             const char *field, const char *value) {
     char sql[320];
@@ -694,10 +718,15 @@ static void refresh_channel_topic(u64_snowflake_t channel_id, const Ticket *t) {
  * Log helper
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/*
+ * guild_id here is the community server ID stored on the ticket row.
+ * We look up config by main_server_id so the right log channel is found
+ * regardless of which staff server is handling this community.
+ */
 static void log_event(u64_snowflake_t guild_id, const char *message) {
     if (!g_db) return;
     TicketConfig cfg = {0};
-    if (ticket_config_get(g_db, guild_id, &cfg) != 0) return;
+    if (ticket_config_get_by_main_server(g_db, guild_id, &cfg) != 0) return;
     if (cfg.log_channel_id)
         post_to_channel(cfg.log_channel_id, message);
     ticket_config_free(&cfg);
@@ -736,10 +765,10 @@ static void open_ticket(struct discord *client,
 
     /* ── Validate configuration ── */
     TicketConfig cfg = {0};
-    if (ticket_config_get(g_db, target_guild_id, &cfg) != 0) {
+    if (ticket_config_get_by_main_server(g_db, target_guild_id, &cfg) != 0) {
         reply_ephemeral(client, event,
             "❌ That server hasn't configured its ticket system yet. "
-            "An admin must run `/ticketconfig` first.");
+            "An admin must run `/ticketconfig` in the staff server first.");
         return;
     }
 
@@ -747,7 +776,7 @@ static void open_ticket(struct discord *client,
         ticket_config_free(&cfg);
         reply_ephemeral(client, event,
             "❌ That server's ticket category hasn't been set. "
-            "An admin must run `/ticketconfig category`.");
+            "An admin must supply the `category` argument to `/ticketconfig`.");
         return;
     }
 
@@ -755,7 +784,7 @@ static void open_ticket(struct discord *client,
         ticket_config_free(&cfg);
         reply_ephemeral(client, event,
             "❌ That server's staff server hasn't been configured. "
-            "An admin must run `/ticketconfig staffserver`.");
+            "An admin must supply the `staffserver` argument to `/ticketconfig`.");
         return;
     }
 
@@ -1162,12 +1191,23 @@ static void handle_assign(struct discord *client,
     reply_ephemeral(client, event, "✅ Ticket assigned.");
 }
 
-/* ── /ticketconfig ── */
+/* ── /ticketconfig ──
+ *
+ * Flat command with four optional arguments; at least one must be supplied.
+ * Run inside the *staff* server.  Each argument updates only that field,
+ * so staff can change a single value without re-specifying everything.
+ *
+ *   mainserver  – community server ID this staff server serves
+ *   staffserver – this staff server's own ID (where channels are created)
+ *   category    – ticket category channel ID in the staff server
+ *   logchannel  – staff-only log channel ID in the staff server
+ */
 static void handle_config(struct discord *client,
                            const struct discord_interaction *event) {
     u64_snowflake_t guild_id = event->guild_id;
     if (!guild_id) {
-        reply_ephemeral(client, event, "❌ This command must be used inside a server.");
+        reply_ephemeral(client, event,
+            "❌ Run `/ticketconfig` inside the staff server.");
         return;
     }
 
@@ -1181,41 +1221,60 @@ static void handle_config(struct discord *client,
         }
     }
 
+    /* At least one argument must be provided. */
     if (!event->data || !event->data->options || !event->data->options[0]) {
-        reply_ephemeral(client, event, "❌ Please specify a subcommand.");
+        reply_ephemeral(client, event,
+            "❌ Provide at least one argument. "
+            "Usage: `/ticketconfig [mainserver:<id>] [staffserver:<id>] "
+            "[category:<id>] [logchannel:<id>]`");
         return;
     }
 
-    const char *sub = event->data->options[0]->name;
+    const char *mainserver  = get_option(event, "mainserver");
+    const char *staffserver = get_option(event, "staffserver");
+    const char *category    = get_option(event, "category");
+    const char *logchannel  = get_option(event, "logchannel");
 
-    if (strcmp(sub, "category") == 0) {
-        const char *v = get_suboption(event, "channel_id");
-        if (!v) { reply_ephemeral(client, event, "❌ Missing `channel_id`."); return; }
-        ticket_config_set_ticket_category(g_db, guild_id, (char *)v);
-        reply_ephemeral(client, event, "✅ Ticket category set.");
+    int changed = 0;
+    char reply[512];
+    int  pos = 0;
+    pos += snprintf(reply + pos, sizeof reply - (size_t)pos,
+                    "✅ Configuration updated:\n");
 
-    } else if (strcmp(sub, "logchannel") == 0) {
-        const char *v = get_suboption(event, "channel_id");
-        if (!v) { reply_ephemeral(client, event, "❌ Missing `channel_id`."); return; }
-        ticket_config_set_log_channel(g_db, guild_id,
-                                       (u64_snowflake_t)strtoull(v, NULL, 10));
-        reply_ephemeral(client, event, "✅ Log channel set.");
-
-    } else if (strcmp(sub, "mainserver") == 0) {
-        const char *v = get_suboption(event, "server_id");
-        if (!v) { reply_ephemeral(client, event, "❌ Missing `server_id`."); return; }
-        ticket_config_set_main_server(g_db, guild_id, v);
-        reply_ephemeral(client, event, "✅ Main community server set.");
-
-    } else if (strcmp(sub, "staffserver") == 0) {
-        const char *v = get_suboption(event, "server_id");
-        if (!v) { reply_ephemeral(client, event, "❌ Missing `server_id`."); return; }
-        ticket_config_set_staff_server(g_db, guild_id, v);
-        reply_ephemeral(client, event, "✅ Staff server set.");
-
-    } else {
-        reply_ephemeral(client, event, "❌ Unknown `/ticketconfig` subcommand.");
+    if (mainserver) {
+        ticket_config_set_main_server(g_db, guild_id, mainserver);
+        pos += snprintf(reply + pos, sizeof reply - (size_t)pos,
+                        "• Main community server → `%s`\n", mainserver);
+        changed++;
     }
+    if (staffserver) {
+        ticket_config_set_staff_server(g_db, guild_id, staffserver);
+        pos += snprintf(reply + pos, sizeof reply - (size_t)pos,
+                        "• Staff server → `%s`\n", staffserver);
+        changed++;
+    }
+    if (category) {
+        ticket_config_set_ticket_category(g_db, guild_id, (char *)category);
+        pos += snprintf(reply + pos, sizeof reply - (size_t)pos,
+                        "• Ticket category → `%s`\n", category);
+        changed++;
+    }
+    if (logchannel) {
+        ticket_config_set_log_channel(g_db, guild_id,
+                                       (u64_snowflake_t)strtoull(logchannel, NULL, 10));
+        pos += snprintf(reply + pos, sizeof reply - (size_t)pos,
+                        "• Log channel → `%s`\n", logchannel);
+        changed++;
+    }
+
+    if (!changed) {
+        reply_ephemeral(client, event,
+            "❌ No recognised arguments were provided. "
+            "Use `mainserver`, `staffserver`, `category`, or `logchannel`.");
+        return;
+    }
+
+    reply_ephemeral(client, event, reply);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1259,11 +1318,11 @@ void on_ticket_interaction(struct discord *client,
  * │   → mentions stripped, forward to ticket channel     │
  * │   → ack in DM                                        │
  * ├──────────────────────────────────────────────────────┤
- * │ Path B – message in a ticket channel (staff reply)  │
+ * │ Path B – message in a ticket channel (staff reply)   │
  * │   channel maps to a ticket in the DB                 │
- * │   → delete original (MANAGE_MESSAGES required)      │
- * │   → re-post as "[Staff]: …" (anonymous)             │
- * │   → relay to user DM, also stripped of mentions     │
+ * │   → delete original (MANAGE_MESSAGES required)       │
+ * │   → re-post as "[Staff]: …" (anonymous)              │
+ * │   → relay to user DM, also stripped of mentions      │
  * └──────────────────────────────────────────────────────┘
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1474,74 +1533,34 @@ void register_ticket_commands(struct discord *client,
                                                    &ticket_params, NULL);
     }
 
-    /* ── /ticketconfig subcommand options ─────────────────────────────────── */
+    /* ── /ticketconfig – flat command, all args optional ─────────────────── */
 
-    static struct discord_application_command_option cfg_cat_channel = {
+    static struct discord_application_command_option cfg_mainserver = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-        .name        = "channel_id",
-        .description = "ID of the category channel where ticket channels will be created",
-        .required    = true,
-    };
-    static struct discord_application_command_option *cfg_cat_opts[] = {
-        &cfg_cat_channel, NULL
-    };
-    static struct discord_application_command_option cfg_cat_sub = {
-        .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
-        .name        = "category",
-        .description = "Set the ticket category channel",
-        .options     = cfg_cat_opts,
-    };
-
-    static struct discord_application_command_option cfg_log_channel = {
-        .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-        .name        = "channel_id",
-        .description = "ID of the staff-only channel where ticket events are logged",
-        .required    = true,
-    };
-    static struct discord_application_command_option *cfg_log_opts[] = {
-        &cfg_log_channel, NULL
-    };
-    static struct discord_application_command_option cfg_log_sub = {
-        .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
-        .name        = "logchannel",
-        .description = "Set the ticket event log channel",
-        .options     = cfg_log_opts,
-    };
-
-    static struct discord_application_command_option cfg_main_server = {
-        .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-        .name        = "server_id",
-        .description = "Snowflake ID of the main community server",
-        .required    = true,
-    };
-    static struct discord_application_command_option *cfg_main_opts[] = {
-        &cfg_main_server, NULL
-    };
-    static struct discord_application_command_option cfg_main_sub = {
-        .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
         .name        = "mainserver",
-        .description = "Set the community server ID",
-        .options     = cfg_main_opts,
+        .description = "Snowflake ID of the community server this staff server handles",
+        .required    = false,
     };
-
-    static struct discord_application_command_option cfg_staff_server = {
+    static struct discord_application_command_option cfg_staffserver = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
-        .name        = "server_id",
-        .description = "Snowflake ID of the private staff server",
-        .required    = true,
-    };
-    static struct discord_application_command_option *cfg_staff_opts[] = {
-        &cfg_staff_server, NULL
-    };
-    static struct discord_application_command_option cfg_staff_sub = {
-        .type        = DISCORD_APPLICATION_COMMAND_OPTION_SUB_COMMAND,
         .name        = "staffserver",
-        .description = "Set the staff server ID (where ticket channels are created)",
-        .options     = cfg_staff_opts,
+        .description = "Snowflake ID of this staff server (where ticket channels are created)",
+        .required    = false,
     };
-
-    static struct discord_application_command_option *cfg_subs[] = {
-        &cfg_cat_sub, &cfg_log_sub, &cfg_main_sub, &cfg_staff_sub, NULL
+    static struct discord_application_command_option cfg_category = {
+        .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+        .name        = "category",
+        .description = "ID of the category channel where ticket channels will be created",
+        .required    = false,
+    };
+    static struct discord_application_command_option cfg_logchannel = {
+        .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+        .name        = "logchannel",
+        .description = "ID of the staff-only channel where ticket events are logged",
+        .required    = false,
+    };
+    static struct discord_application_command_option *cfg_opts[] = {
+        &cfg_mainserver, &cfg_staffserver, &cfg_category, &cfg_logchannel, NULL
     };
 
     /* ── /ticketconfig registration ──────────────────────────────────────── */
@@ -1551,7 +1570,7 @@ void register_ticket_commands(struct discord *client,
             .name        = "ticketconfig",
             .description = "Configure the ticket system for this server (admin only)",
         };
-        cfg_params.options = cfg_subs;
+        cfg_params.options = cfg_opts;
         discord_create_guild_application_command(client, application_id, guild_id,
                                                   &cfg_params, NULL);
     } else {
@@ -1560,7 +1579,7 @@ void register_ticket_commands(struct discord *client,
             .name        = "ticketconfig",
             .description = "Configure the ticket system for this server (admin only)",
         };
-        cfg_params.options = cfg_subs;
+        cfg_params.options = cfg_opts;
         discord_create_global_application_command(client, application_id,
                                                    &cfg_params, NULL);
     }
