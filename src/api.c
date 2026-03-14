@@ -478,6 +478,7 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
     const char *sql_base =
         "SELECT pe.id, pe.target_user_id, pe.source_guild_id,"
         "       pe.moderator_id, pe.reason, pe.evidence_url, pe.timestamp,"
+        "       pe.severity, pe.report_count, pe.weighted_confirmation_score,"
         "       COUNT(pn.guild_id) AS notified_count"
         " FROM propagation_events pe"
         " LEFT JOIN propagation_notifications pn ON pn.event_id = pe.id";
@@ -507,14 +508,18 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
     while (sqlite3_step(s) == SQLITE_ROW) {
         if (!first) jb_raw(j, ",");
         first = 0;
+        int sev = sqlite3_column_int(s, 7);
         jb_printf(j, "{\"id\":%lld", (long long)sqlite3_column_int64(s, 0));
-        jb_raw(j, ",\"target_user_id\":"); jb_u64str(j, sqlite3_column_int64(s, 1));
+        jb_raw(j, ",\"target_user_id\":");  jb_u64str(j, sqlite3_column_int64(s, 1));
         jb_raw(j, ",\"source_guild_id\":"); jb_u64str(j, sqlite3_column_int64(s, 2));
-        jb_raw(j, ",\"moderator_id\":"); jb_u64str(j, sqlite3_column_int64(s, 3));
-        jb_raw(j, ",\"reason\":"); jb_str(j, (const char*)sqlite3_column_text(s, 4));
-        jb_raw(j, ",\"evidence_url\":"); jb_str(j, (const char*)sqlite3_column_text(s, 5));
-        jb_printf(j, ",\"timestamp\":%lld", (long long)sqlite3_column_int64(s, 6));
-        jb_printf(j, ",\"notified_count\":%d}", sqlite3_column_int(s, 7));
+        jb_raw(j, ",\"moderator_id\":");    jb_u64str(j, sqlite3_column_int64(s, 3));
+        jb_raw(j, ",\"reason\":");          jb_str(j, (const char*)sqlite3_column_text(s, 4));
+        jb_raw(j, ",\"evidence_url\":");    jb_str(j, (const char*)sqlite3_column_text(s, 5));
+        jb_printf(j, ",\"timestamp\":%lld",                  (long long)sqlite3_column_int64(s, 6));
+        jb_printf(j, ",\"severity\":%d",                     sev);
+        jb_printf(j, ",\"report_count\":%d",                 sqlite3_column_int(s, 8));
+        jb_printf(j, ",\"weighted_confirmation_score\":%d",  sqlite3_column_int(s, 9));
+        jb_printf(j, ",\"notified_count\":%d}",              sqlite3_column_int(s, 10));
     }
     sqlite3_finalize(s);
     jb_raw(j, "]}");
@@ -809,12 +814,13 @@ int api_handle(Database *db,
     if (is_get && strcmp(path, "/api/tickets") == 0)
         return handle_tickets(db, query, &j);
 
+    /* Exact sub-routes must come before the numeric wildcard. */
+    if (is_get && strcmp(path, "/api/tickets/events") == 0)
+        return handle_ticket_events(query, &j);
+
     /* /api/tickets/<id> */
     if (is_get && strncmp(path, "/api/tickets/", 13) == 0)
         return handle_ticket_detail(db, path, &j);
-    
-    if (is_get && strcmp(path, "/api/tickets/events") == 0)
-        return handle_ticket_events(query, &j);
 
     jb_raw(&j, "{\"error\":\"not found\"}");
     return 404;

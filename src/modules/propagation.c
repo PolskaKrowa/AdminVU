@@ -80,6 +80,20 @@ static bool has_admin_permissions(const struct discord_interaction *event) {
         || (perms & DISCORD_PERMISSION_MANAGE_GUILD)  != 0;
 }
 
+/* Returns true if the dashboard has blocked this guild from receiving alerts. */
+static bool is_guild_prop_blocked(uint64_t guild_id) {
+    if (!g_db || !g_db->db) return false;
+    sqlite3_stmt *st;
+    const char *sql =
+        "SELECT 1 FROM propagation_blocked_guilds WHERE guild_id = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) != SQLITE_OK)
+        return false;
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)guild_id);
+    bool blocked = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    return blocked;
+}
+
 /*
  * Central-admin-only actions (trust assignment, central config) are
  * restricted to members of the designated central guild.
@@ -408,6 +422,11 @@ static void handle_propagate(struct discord                  *client,
     int notified = 0;
     for (int i = 0; i < guild_count; i++) {
         if (opted_guilds[i] == event->guild_id) continue;
+        if (is_guild_prop_blocked(opted_guilds[i])) {
+            printf("[propagation] Skipping guild %" PRIu64
+                   " — blocked via dashboard\n", opted_guilds[i]);
+            continue;
+        }
 
         if (notify_guild(client, opted_guilds[i], &ev, source_trust)) {
             db_record_propagation_notification(g_db, event_id, opted_guilds[i]);
@@ -419,7 +438,8 @@ static void handle_propagate(struct discord                  *client,
     /* ── Deliver to the staff server paired with the source community,
      *     so staff can cross-reference open tickets for this user. ──── */
     uint64_t paired_staff = db_get_staff_guild_for(g_db, event->guild_id);
-    if (paired_staff && paired_staff != event->guild_id) {
+    if (paired_staff && paired_staff != event->guild_id
+            && !is_guild_prop_blocked(paired_staff)) {
         if (notify_guild(client, paired_staff, &ev, source_trust)) {
             db_record_propagation_notification(g_db, event_id, paired_staff);
             notified++;
