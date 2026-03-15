@@ -81,11 +81,13 @@
                     <thead>
                         <tr>
                             <th>ID</th>
+                            <th>Severity</th>
                             <th>Time</th>
                             <th>Target</th>
                             <th>Source Server</th>
                             <th>Moderator</th>
                             <th>Notified</th>
+                            <th>Reports</th>
                             <th>Reason / Evidence</th>
                         </tr>
                     </thead>
@@ -130,13 +132,39 @@
 
     <script src="script.js"></script>
     <script>
-    /* ── Propagation page logic ──────────────────────────────────────── */
+    /* ── Propagation page ──────────────────────────────────────────── */
 
     const EV_PAGE_SIZE = 50;
-    let evOffset = 0;
+    let evOffset     = 0;
     let evUserFilter = '';
 
-    /* ── Load opted-in guilds ─────────────────────────────────────────── */
+    /* ── Helpers ───────────────────────────────────────────────────── */
+
+    function severityBadge(sev) {
+        const rows = [
+            ['sev-none', '—'],
+            ['sev-low',  '⚠️ Low'],
+            ['sev-med',  '🔶 Med'],
+            ['sev-high', '🔴 High'],
+            ['sev-crit', '💀 Crit'],
+        ];
+        const [cls, label] = rows[Math.max(0, Math.min(4, sev || 0))];
+        return `<span class="sev-badge ${cls}">${label}</span>`;
+    }
+
+    /* Show an inline message inside #block-feedback (auto-hides after 4 s). */
+    function showFeedback(msg, isError) {
+        const el = document.getElementById('block-feedback');
+        if (!el) return;
+        el.textContent   = msg;
+        el.className     = `feedback-msg ${isError ? 'feedback-error' : 'feedback-ok'}`;
+        el.style.display = 'block';
+        clearTimeout(el._timer);
+        el._timer = setTimeout(() => { el.style.display = 'none'; }, 4000);
+    }
+
+    /* ── Opted-in guilds ───────────────────────────────────────────── */
+
     async function loadGuilds() {
         const container = document.getElementById('guilds-list');
         container.innerHTML = '<div class="pane-loading">Loading…</div>';
@@ -147,14 +175,14 @@
             return;
         }
         if (guilds.length === 0) {
-            container.innerHTML = '<div class="pane-empty">No servers have configured propagation yet.</div>';
+            container.innerHTML =
+                '<div class="pane-empty">No servers have configured propagation yet.</div>';
             return;
         }
 
-        let html = '';
-        guilds.forEach(g => {
+        container.innerHTML = guilds.map(g => {
             const blocked = g.is_blocked;
-            html += `
+            return `
             <div class="guild-row ${blocked ? 'guild-blocked' : ''}">
                 <div class="guild-info">
                     <span class="guild-id mono">${shortId(g.guild_id)}</span>
@@ -165,105 +193,123 @@
                     <span class="badge ${g.opted_in ? 'badge-ok' : 'badge-muted'}">
                         ${g.opted_in ? '✓ opted in' : '✗ opted out'}
                     </span>
-                    ${blocked ? `<span class="badge badge-danger">⛔ blocked</span>` : ''}
+                    ${blocked ? '<span class="badge badge-danger">⛔ blocked</span>' : ''}
                 </div>
                 <div class="guild-actions">
                     ${blocked
-                        ? `<button class="btn-sm btn-ok" onclick="unblockGuild('${g.guild_id}')">Unblock</button>`
-                        : `<button class="btn-sm btn-danger-sm" onclick="blockGuild('${g.guild_id}')">Block</button>`
+                        ? `<button class="btn-sm btn-ok"
+                            onclick="unblockGuild('${g.guild_id}')">Unblock</button>`
+                        : `<button class="btn-sm btn-danger-sm"
+                            onclick="promptBlock('${g.guild_id}')">Block</button>`
                     }
                 </div>
             </div>`;
-        });
-        container.innerHTML = html;
+        }).join('');
     }
 
-    /* ── Load events ──────────────────────────────────────────────────── */
+    /* ── Alert events ──────────────────────────────────────────────── */
+
     async function loadEvents() {
         const tbody  = document.getElementById('events-tbody');
         const table  = document.getElementById('events-table');
         const status = document.getElementById('events-status');
 
-        status.textContent = 'Loading…';
+        status.textContent   = 'Loading…';
         status.style.display = 'block';
         table.style.display  = 'none';
 
         const params = new URLSearchParams({ limit: EV_PAGE_SIZE, offset: evOffset });
         if (evUserFilter) params.set('user_id', evUserFilter);
 
-        const data = await apiGet('/api/propagation/events?' + params.toString());
-        if (!data) { status.textContent = 'Failed to load.'; return; }
+        const data = await apiGet('/api/propagation/events?' + params);
+        if (!data) { status.textContent = 'Failed to load events.'; return; }
 
         const rows = data.items || [];
         if (rows.length === 0) {
-            status.textContent = 'No propagation events found.';
+            status.textContent = evUserFilter
+                ? `No events found for user ${evUserFilter}.`
+                : 'No propagation events recorded yet.';
             return;
         }
 
         tbody.innerHTML = '';
         rows.forEach(ev => {
             const tr = document.createElement('tr');
+            const reportClass = (ev.report_count > 0) ? 'warn-text' : 'muted';
             tr.innerHTML = `
                 <td class="mono muted">#${ev.id}</td>
+                <td>${severityBadge(ev.severity)}</td>
                 <td class="mono muted">${fmtTs(ev.timestamp)}</td>
                 <td class="mono copyable" title="${ev.target_user_id}">${shortId(ev.target_user_id)}</td>
-                <td class="mono muted" title="${ev.source_guild_id}">${shortId(ev.source_guild_id)}</td>
+                <td class="mono copyable muted" title="${ev.source_guild_id}">${shortId(ev.source_guild_id)}</td>
                 <td class="mono muted" title="${ev.moderator_id}">${shortId(ev.moderator_id)}</td>
-                <td class="mono">${ev.notified_count}</td>
+                <td class="mono">${ev.notified_count ?? 0}</td>
+                <td class="mono ${reportClass}">${ev.report_count ?? 0}</td>
                 <td class="reason-cell">
                     <span>${esc(ev.reason || '—')}</span>
                     ${ev.evidence_url
-                        ? `<a class="evidence-link" href="${esc(ev.evidence_url)}" target="_blank" rel="noopener">🔗 evidence</a>`
+                        ? `<a class="evidence-link" href="${esc(ev.evidence_url)}"
+                            target="_blank" rel="noopener">🔗 evidence</a>`
                         : ''}
-                </td>
-            `;
+                </td>`;
             tbody.appendChild(tr);
         });
 
         status.style.display = 'none';
         table.style.display  = 'table';
 
-        const prev = document.getElementById('ev-prev');
-        const next = document.getElementById('ev-next');
-        const info = document.getElementById('ev-page-info');
-        prev.disabled = evOffset === 0;
-        next.disabled = rows.length < EV_PAGE_SIZE;
-        info.textContent = `page ${Math.floor(evOffset / EV_PAGE_SIZE) + 1}`;
+        document.getElementById('ev-prev').disabled = evOffset === 0;
+        document.getElementById('ev-next').disabled = rows.length < EV_PAGE_SIZE;
+        document.getElementById('ev-page-info').textContent =
+            `page ${Math.floor(evOffset / EV_PAGE_SIZE) + 1}`;
     }
 
-    /* ── Load blocked guilds ──────────────────────────────────────────── */
+    /* ── Blocked servers ───────────────────────────────────────────── */
+
     async function loadBlocked() {
-        const tbody = document.getElementById('blocked-tbody');
-        const data  = await apiGet('/api/propagation/blocked');
+        const tbody  = document.getElementById('blocked-tbody');
+        const status = document.getElementById('blocked-status');
+
+        status.textContent   = 'Loading…';
+        status.style.display = 'block';
+
+        const data = await apiGet('/api/propagation/blocked');
+        status.style.display = 'none';
+
         if (!data || data.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" class="empty-row">No servers are currently blocked.</td></tr>';
+            tbody.innerHTML =
+                '<tr><td colspan="4" class="empty-row">No servers are currently blocked.</td></tr>';
             return;
         }
-        tbody.innerHTML = '';
-        data.forEach(b => {
-            const tr = document.createElement('tr');
-            tr.innerHTML = `
+        tbody.innerHTML = data.map(b => `
+            <tr>
                 <td class="mono copyable" title="${b.guild_id}">${b.guild_id}</td>
                 <td class="mono muted">${fmtTs(b.blocked_at)}</td>
                 <td class="reason-cell">${esc(b.reason || '—')}</td>
                 <td><button class="btn-sm btn-ok"
-                    onclick="unblockGuild('${b.guild_id}')">Unblock</button></td>
-            `;
-            tbody.appendChild(tr);
-        });
+                        onclick="unblockGuild('${b.guild_id}')">Unblock</button></td>
+            </tr>`).join('');
     }
 
-    /* ── Block / unblock ──────────────────────────────────────────────── */
+    /* ── Block / unblock ───────────────────────────────────────────── */
+
+    /* Called from quick-block buttons in the guild rows. */
+    function promptBlock(guildId) {
+        const reason = prompt(`Reason for blocking ${guildId} (leave blank to skip):`);
+        if (reason === null) return; /* user cancelled */
+        blockGuild(guildId, reason);
+    }
+
     async function blockGuild(guildId, reason) {
-        reason = reason || '';
-        const body = `guild_id=${encodeURIComponent(guildId)}&reason=${encodeURIComponent(reason)}`;
+        const body = `guild_id=${encodeURIComponent(guildId)}`
+                + `&reason=${encodeURIComponent(reason || '')}`;
         const res  = await apiPost('/api/propagation/block', body);
         if (res && res.ok) {
-            appendLog(`Blocked server ${shortId(guildId)}.`, LogLevel.WARN);
+            showFeedback(`✅ Server ${guildId} blocked.`, false);
             loadGuilds();
             loadBlocked();
         } else {
-            appendLog(`Failed to block ${shortId(guildId)}.`, LogLevel.ERROR);
+            showFeedback(`❌ Failed to block ${guildId}: ${res?.error || 'unknown error'}`, true);
         }
     }
 
@@ -271,58 +317,55 @@
         const body = `guild_id=${encodeURIComponent(guildId)}`;
         const res  = await apiPost('/api/propagation/unblock', body);
         if (res && res.ok) {
-            appendLog(`Unblocked server ${shortId(guildId)}.`, LogLevel.OK);
+            showFeedback(`✅ Server ${guildId} unblocked.`, false);
             loadGuilds();
             loadBlocked();
         } else {
-            appendLog(`Failed to unblock ${shortId(guildId)}.`, LogLevel.ERROR);
+            showFeedback(`❌ Failed to unblock ${guildId}.`, true);
         }
     }
 
-    /* ── Event bindings ───────────────────────────────────────────────── */
-    document.getElementById('guilds-refresh').addEventListener('click', loadGuilds);
-    document.getElementById('events-refresh').addEventListener('click', () => { evOffset = 0; loadEvents(); });
-    document.getElementById('blocked-refresh').addEventListener('click', loadBlocked);
+    /* ── Event bindings ────────────────────────────────────────────── */
 
-    document.getElementById('event-user-filter').addEventListener('keydown', e => {
-        if (e.key === 'Enter') {
+    document.getElementById('guilds-refresh')
+        .addEventListener('click', loadGuilds);
+
+    document.getElementById('events-refresh')
+        .addEventListener('click', () => { evOffset = 0; loadEvents(); });
+
+    document.getElementById('blocked-refresh')
+        .addEventListener('click', loadBlocked);
+
+    document.getElementById('event-user-filter')
+        .addEventListener('keydown', e => {
+            if (e.key !== 'Enter') return;
             evUserFilter = e.target.value.trim();
             evOffset = 0;
             loadEvents();
-        }
-    });
+        });
 
-    document.getElementById('block-btn').addEventListener('click', () => {
-        const guildId = document.getElementById('block-guild-id').value.trim();
-        const reason  = document.getElementById('block-reason').value.trim();
-        const fb      = document.getElementById('block-feedback');
-        if (!guildId) {
-            fb.textContent = 'Please enter a server ID.';
-            fb.className   = 'feedback-msg feedback-error';
-            fb.style.display = 'block';
-            return;
-        }
-        fb.style.display = 'none';
-        blockGuild(guildId, reason);
-        document.getElementById('block-guild-id').value = '';
-        document.getElementById('block-reason').value   = '';
-    });
+    document.getElementById('block-btn')
+        .addEventListener('click', () => {
+            const guildId = document.getElementById('block-guild-id').value.trim();
+            const reason  = document.getElementById('block-reason').value.trim();
+            if (!guildId) { showFeedback('Please enter a server ID.', true); return; }
+            document.getElementById('block-guild-id').value = '';
+            document.getElementById('block-reason').value   = '';
+            blockGuild(guildId, reason);
+        });
 
-    document.getElementById('ev-prev').addEventListener('click', () => {
-        if (evOffset >= EV_PAGE_SIZE) { evOffset -= EV_PAGE_SIZE; loadEvents(); }
-    });
-    document.getElementById('ev-next').addEventListener('click', () => {
-        evOffset += EV_PAGE_SIZE; loadEvents();
-    });
+    document.getElementById('ev-prev')
+        .addEventListener('click', () => {
+            if (evOffset >= EV_PAGE_SIZE) { evOffset -= EV_PAGE_SIZE; loadEvents(); }
+        });
 
-    /* ── Boot ──────────────────────────────────────────────────────────── */
-    document.addEventListener('DOMContentLoaded', () => {
-        startFooterClock();
-        setStatus('online');
-        loadGuilds();
-        loadEvents();
-        loadBlocked();
-    });
+    document.getElementById('ev-next')
+        .addEventListener('click', () => { evOffset += EV_PAGE_SIZE; loadEvents(); });
+
+    /* ── Boot (scripts are at bottom of body — DOM is already ready) ─ */
+    loadGuilds();
+    loadEvents();
+    loadBlocked();
     </script>
 </body>
 </html>

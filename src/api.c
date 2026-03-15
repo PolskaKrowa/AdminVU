@@ -197,12 +197,21 @@ static const char *ticket_outcome_name(int o) {
 
 int api_init(Database *db) {
     const char *sql =
-        /* Guilds blocked from using the propagation system via the dashboard */
+        /* Guilds blocked from the propagation system via the dashboard */
         "CREATE TABLE IF NOT EXISTS propagation_blocked_guilds ("
         "    guild_id   INTEGER PRIMARY KEY,"
-        "    blocked_by INTEGER NOT NULL DEFAULT 0,"  /* 0 = dashboard */
+        "    blocked_by INTEGER NOT NULL DEFAULT 0,"
         "    reason     TEXT,"
         "    blocked_at INTEGER DEFAULT (strftime('%s','now'))"
+        ");"
+        /* Delivery log – created here so the dashboard can query it even
+           before the bot module has recorded its first notification.       */
+        "CREATE TABLE IF NOT EXISTS propagation_notifications ("
+        "    id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    event_id    INTEGER NOT NULL,"
+        "    guild_id    INTEGER NOT NULL,"
+        "    notified_at INTEGER DEFAULT (strftime('%s','now')),"
+        "    UNIQUE(event_id, guild_id)"
         ");";
 
     char *err = NULL;
@@ -430,19 +439,28 @@ static int handle_warnings(Database *db, const char *query, JB *j) {
 /* ── /api/propagation/guilds ────────────────────────────────────────────── */
 
 static int handle_prop_guilds(Database *db, JB *j) {
-    /* Left-join with the blocked table so we know block status per guild. */
+    /*
+     * UNION both tables so guilds that are only in propagation_blocked_guilds
+     * (blocked before they ever configured the bot) still appear in the list.
+     */
     const char *sql =
-        "SELECT pc.guild_id, pc.channel_id, pc.opted_in,"
+        "SELECT g.guild_id,"
+        "       pc.channel_id,"
+        "       COALESCE(pc.opted_in, 0) AS opted_in,"
         "       CASE WHEN pb.guild_id IS NOT NULL THEN 1 ELSE 0 END AS is_blocked,"
-        "       pb.reason AS block_reason,"
+        "       pb.reason    AS block_reason,"
         "       pb.blocked_at"
-        " FROM propagation_config pc"
-        " LEFT JOIN propagation_blocked_guilds pb ON pb.guild_id = pc.guild_id"
-        " ORDER BY pc.guild_id;";
+        " FROM ("
+        "   SELECT guild_id FROM propagation_config"
+        "   UNION"
+        "   SELECT guild_id FROM propagation_blocked_guilds"
+        " ) g"
+        " LEFT JOIN propagation_config         pc ON pc.guild_id = g.guild_id"
+        " LEFT JOIN propagation_blocked_guilds pb ON pb.guild_id = g.guild_id"
+        " ORDER BY g.guild_id;";
 
     sqlite3_stmt *s;
     if (sqlite3_prepare_v2(db->db, sql, -1, &s, NULL) != SQLITE_OK) {
-        /* propagation_config may not exist yet */
         jb_raw(j, "[]");
         return 200;
     }
@@ -452,13 +470,12 @@ static int handle_prop_guilds(Database *db, JB *j) {
     while (sqlite3_step(s) == SQLITE_ROW) {
         if (!first) jb_raw(j, ",");
         first = 0;
-        jb_raw(j, "{\"guild_id\":"); jb_u64str(j, sqlite3_column_int64(s, 0));
-        jb_raw(j, ",\"channel_id\":"); jb_u64str(j, sqlite3_column_int64(s, 1));
-        jb_printf(j, ",\"opted_in\":%d", sqlite3_column_int(s, 2));
+        jb_raw(j,    "{\"guild_id\":");    jb_u64str(j, sqlite3_column_int64(s, 0));
+        jb_raw(j,    ",\"channel_id\":"); jb_u64str(j, sqlite3_column_int64(s, 1));
+        jb_printf(j, ",\"opted_in\":%d",   sqlite3_column_int(s, 2));
         jb_printf(j, ",\"is_blocked\":%d", sqlite3_column_int(s, 3));
-        jb_raw(j, ",\"block_reason\":"); jb_str(j, (const char*)sqlite3_column_text(s, 4));
-        jb_printf(j, ",\"blocked_at\":%lld", (long long)sqlite3_column_int64(s, 5));
-        jb_raw(j, "}");
+        jb_raw(j,    ",\"block_reason\":"); jb_str(j, (const char *)sqlite3_column_text(s, 4));
+        jb_printf(j, ",\"blocked_at\":%lld}", (long long)sqlite3_column_int64(s, 5));
     }
     sqlite3_finalize(s);
     jb_raw(j, "]");
@@ -472,9 +489,17 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
     long long offset = get_param_i64(query, "offset", 0);
     if (limit < 1 || limit > 200) limit = 50;
 
-    char user_buf[64] = {0};
-    get_param(query, "user_id", user_buf, sizeof(user_buf));
+    char user_buf[64]  = {0};
+    char guild_buf[64] = {0};
+    get_param(query, "user_id",         user_buf,  sizeof(user_buf));
+    get_param(query, "source_guild_id", guild_buf, sizeof(guild_buf));
 
+    /*
+     * Columns:  0=id  1=target_user_id  2=source_guild_id  3=moderator_id
+     *           4=reason  5=evidence_url  6=timestamp
+     *           7=severity  8=report_count  9=weighted_confirmation_score
+     *           10=notified_count
+     */
     const char *sql_base =
         "SELECT pe.id, pe.target_user_id, pe.source_guild_id,"
         "       pe.moderator_id, pe.reason, pe.evidence_url, pe.timestamp,"
@@ -484,16 +509,24 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
         " LEFT JOIN propagation_notifications pn ON pn.event_id = pe.id";
 
     char sql[1024];
-    if (user_buf[0]) {
+    if (user_buf[0] && guild_buf[0]) {
+        snprintf(sql, sizeof(sql),
+                 "%s WHERE pe.target_user_id = %s AND pe.source_guild_id = %s"
+                 " GROUP BY pe.id ORDER BY pe.timestamp DESC LIMIT %lld OFFSET %lld",
+                 sql_base, user_buf, guild_buf, limit, offset);
+    } else if (user_buf[0]) {
         snprintf(sql, sizeof(sql),
                  "%s WHERE pe.target_user_id = %s"
-                 " GROUP BY pe.id ORDER BY pe.timestamp DESC"
-                 " LIMIT %lld OFFSET %lld",
+                 " GROUP BY pe.id ORDER BY pe.timestamp DESC LIMIT %lld OFFSET %lld",
                  sql_base, user_buf, limit, offset);
+    } else if (guild_buf[0]) {
+        snprintf(sql, sizeof(sql),
+                 "%s WHERE pe.source_guild_id = %s"
+                 " GROUP BY pe.id ORDER BY pe.timestamp DESC LIMIT %lld OFFSET %lld",
+                 sql_base, guild_buf, limit, offset);
     } else {
         snprintf(sql, sizeof(sql),
-                 "%s GROUP BY pe.id ORDER BY pe.timestamp DESC"
-                 " LIMIT %lld OFFSET %lld",
+                 "%s GROUP BY pe.id ORDER BY pe.timestamp DESC LIMIT %lld OFFSET %lld",
                  sql_base, limit, offset);
     }
 
@@ -509,17 +542,17 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
         if (!first) jb_raw(j, ",");
         first = 0;
         int sev = sqlite3_column_int(s, 7);
-        jb_printf(j, "{\"id\":%lld", (long long)sqlite3_column_int64(s, 0));
-        jb_raw(j, ",\"target_user_id\":");  jb_u64str(j, sqlite3_column_int64(s, 1));
-        jb_raw(j, ",\"source_guild_id\":"); jb_u64str(j, sqlite3_column_int64(s, 2));
-        jb_raw(j, ",\"moderator_id\":");    jb_u64str(j, sqlite3_column_int64(s, 3));
-        jb_raw(j, ",\"reason\":");          jb_str(j, (const char*)sqlite3_column_text(s, 4));
-        jb_raw(j, ",\"evidence_url\":");    jb_str(j, (const char*)sqlite3_column_text(s, 5));
-        jb_printf(j, ",\"timestamp\":%lld",                  (long long)sqlite3_column_int64(s, 6));
-        jb_printf(j, ",\"severity\":%d",                     sev);
-        jb_printf(j, ",\"report_count\":%d",                 sqlite3_column_int(s, 8));
-        jb_printf(j, ",\"weighted_confirmation_score\":%d",  sqlite3_column_int(s, 9));
-        jb_printf(j, ",\"notified_count\":%d}",              sqlite3_column_int(s, 10));
+        jb_printf(j, "{\"id\":%lld",                          (long long)sqlite3_column_int64(s, 0));
+        jb_raw(j,    ",\"target_user_id\":");                  jb_u64str(j, sqlite3_column_int64(s, 1));
+        jb_raw(j,    ",\"source_guild_id\":");                 jb_u64str(j, sqlite3_column_int64(s, 2));
+        jb_raw(j,    ",\"moderator_id\":");                    jb_u64str(j, sqlite3_column_int64(s, 3));
+        jb_raw(j,    ",\"reason\":");                          jb_str(j, (const char *)sqlite3_column_text(s, 4));
+        jb_raw(j,    ",\"evidence_url\":");                    jb_str(j, (const char *)sqlite3_column_text(s, 5));
+        jb_printf(j, ",\"timestamp\":%lld",                   (long long)sqlite3_column_int64(s, 6));
+        jb_printf(j, ",\"severity\":%d",                      sev);
+        jb_printf(j, ",\"report_count\":%d",                  sqlite3_column_int(s, 8));
+        jb_printf(j, ",\"weighted_confirmation_score\":%d",   sqlite3_column_int(s, 9));
+        jb_printf(j, ",\"notified_count\":%d}",               sqlite3_column_int(s, 10));
     }
     sqlite3_finalize(s);
     jb_raw(j, "]}");
@@ -814,11 +847,10 @@ int api_handle(Database *db,
     if (is_get && strcmp(path, "/api/tickets") == 0)
         return handle_tickets(db, query, &j);
 
-    /* Exact sub-routes must come before the numeric wildcard. */
+    /* Exact named sub-routes must precede the numeric wildcard. */
     if (is_get && strcmp(path, "/api/tickets/events") == 0)
         return handle_ticket_events(query, &j);
 
-    /* /api/tickets/<id> */
     if (is_get && strncmp(path, "/api/tickets/", 13) == 0)
         return handle_ticket_detail(db, path, &j);
 
