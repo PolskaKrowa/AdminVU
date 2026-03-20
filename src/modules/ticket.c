@@ -855,7 +855,7 @@ static void open_ticket(struct discord *client,
     build_channel_name(real_name, sizeof real_name, t.id, username);
     struct discord_modify_channel_params rename_p = { .name = real_name };
     discord_modify_channel(client, new_channel.id, &rename_p, NULL);
-    refresh_channel_topic(new_channel.id, &t);
+    // refresh_channel_topic(new_channel.id, &t);
 
     /* ── Post staff-facing header ──
      *
@@ -1025,7 +1025,7 @@ static void handle_claim(struct discord *client,
     post_to_channel(event->channel_id, msg);
 
     t.status = TICKET_STATUS_IN_PROGRESS;
-    refresh_channel_topic(event->channel_id, &t);
+    // refresh_channel_topic(event->channel_id, &t);
 
     /* Notify user anonymously. */
     u64_snowflake_t dm_ch = dm_map_get_active_dm_channel(t.opener_id);
@@ -1094,7 +1094,7 @@ static void handle_priority(struct discord *client,
     TicketPriority priority = (TicketPriority)atoi(level_str);
     ticket_db_update_priority(g_db, t.id, priority);
     t.priority = priority;
-    refresh_channel_topic(event->channel_id, &t);
+    // refresh_channel_topic(event->channel_id, &t);
 
     char msg[128];
     snprintf(msg, sizeof msg,
@@ -1135,7 +1135,7 @@ static void handle_status_cmd(struct discord *client,
     TicketStatus status = (TicketStatus)atoi(val_str);
     ticket_db_update_status(g_db, t.id, status);
     t.status = status;
-    refresh_channel_topic(event->channel_id, &t);
+    // refresh_channel_topic(event->channel_id, &t);
 
     char msg[128];
     snprintf(msg, sizeof msg,
