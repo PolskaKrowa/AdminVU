@@ -1,381 +1,585 @@
-# AdminVU V3
-
-A modular Discord bot written in C using the Orca Discord API library, with x86_64 assembly optimisations and SQLite database for moderation and cross-server alert propagation.
-
-## ⚡ Features
-
-- **Moderation Commands**: Warn, kick, ban, and timeout users
-- **Cross-Server Propagation**: Alert moderators across every opted-in server when a user is flagged
-- **Database Storage**: SQLite database for persistent user data, moderation logs, and propagation events
-- **Assembly Optimisations**: Fast hashing with x86_64 assembly
-- **Modular Architecture**: Easy to extend with new commands
-
-## 📋 Available Commands
-
-### General Commands
-- `/ping [target]` - Responds with "Pong!" and a hash of the target's username
-
-### Moderation Commands (Requires Kick/Ban/Moderate Members)
-- `/warn <user> [reason]` - Issue a warning to a user
-- `/warnings <user>` - View all warnings for a user
-- `/kick <user> [reason]` - Kick a user from the server
-- `/ban <user> [reason]` - Ban a user from the server
-- `/timeout <user> [duration] [reason]` - Timeout a user (1–40320 minutes)
-
-### Cross-Server Propagation Commands
-- `/propagate <user> <reason> <evidence> <confirm>` - Flag a user across all opted-in servers *(mod only — misuse results in a permanent ban from the system)*
-- `/propagate-config <channel_id>` - Set the channel for incoming alerts *(admin only)*
-- `/propagate-opt-out` - Stop receiving cross-server alerts *(admin only)*
-- `/propagate-history <user>` - View all cross-server alerts for a user *(mod only)*
-- `/propagate-revoke <moderator> <reason>` - Permanently blacklist a moderator from issuing alerts *(admin only)*
-
-## Project Structure
+<div align="center">
 
 ```
-discord-bot/
-├── CMakeLists.txt                  # Root build configuration
+╔════════════════════════════════════════════════════════════╗
+║                                                            ║
+║  █████╗ ██████╗ ███╗   ███╗██╗███╗   ██╗██╗   ██╗██╗   ██╗ ║
+║ ██╔══██╗██╔══██╗████╗ ████║██║████╗  ██║██║   ██║██║   ██║ ║
+║ ███████║██║  ██║██╔████╔██║██║██╔██╗ ██║██║   ██║██║   ██║ ║
+║ ██╔══██║██║  ██║██║╚██╔╝██║██║██║╚██╗██║╚██╗ ██╔╝██║   ██║ ║
+║ ██║  ██║██████╔╝██║ ╚═╝ ██║██║██║ ╚████║ ╚████╔╝ ╚██████╔╝ ║
+║ ╚═╝  ╚═╝╚═════╝ ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝  ╚═══╝   ╚═════╝  ║
+║                                                            ║
+║                                                            ║
+║             A   D I S C O R D   M O D   B O T              ║
+║                                                            ║
+╚════════════════════════════════════════════════════════════╝
+```
+
+<br/>
+
+[![Language](https://img.shields.io/badge/language-C11-blue?style=flat-square&logo=c)](#)
+[![Build System](https://img.shields.io/badge/build-CMake-red?style=flat-square&logo=cmake)](#)
+[![Database](https://img.shields.io/badge/database-SQLite3-lightgrey?style=flat-square&logo=sqlite)](#)
+[![Library](https://img.shields.io/badge/lib-Orca%2FDiscord-5865F2?style=flat-square&logo=discord)](#)
+[![Dashboard](https://img.shields.io/badge/dashboard-AdminVU-teal?style=flat-square)](#dashboard)
+[![Status](https://img.shields.io/badge/status-active%20development-yellow?style=flat-square)](#known-issues--todo)
+
+<br/>
+
+> **A cross-server Discord moderation bot written in C, with an embedded HTTP dashboard, a ticket system, a fact-check module powered by a local Ollama LLM, and a cross-guild propagation alert network.**
+
+<br/>
+
+</div>
+
+---
+
+## 📑 Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Building](#building)
+- [Configuration](#configuration)
+- [Running](#running)
+- [Modules](#modules)
+  - [Moderation](#-moderation)
+  - [Tickets](#-tickets)
+  - [Propagation](#-propagation)
+  - [Fact-Check](#-fact-check)
+  - [Fun](#-fun)
+  - [Ping](#-ping)
+- [Dashboard (AdminVU)](#dashboard-adminvu)
+- [REST API Reference](#rest-api-reference)
+- [Assembly Routine](#assembly-routine)
+- [Known Issues & TODO](#known-issues--todo)
+- [Project Structure](#project-structure)
+
+---
+
+## Overview
+
+**Nerdy** (working title) is a Discord bot written entirely in **C11**, targeting the Linux platform. It uses the [Orca](https://github.com/cee-studio/orca) C Discord library for gateway connectivity, stores all state in an **SQLite3** database, and ships with a self-hosted **HTTP dashboard** (AdminVU) accessible at `http://127.0.0.1:8080`.
+
+The bot is modular — each feature lives in its own `.c` file under `src/modules/` — and is designed to be fast, low-dependency, and operator-controlled.
+
+---
+
+## Features
+
+| Category | What it does |
+|---|---|
+| 🛡️ **Moderation** | `/warn`, `/kick`, `/ban`, `/timeout`, `/warnings` — all actions persisted to SQLite |
+| 🎫 **Tickets** | Full DM-relay ticket system with anonymous staff messaging, note-taking, and a per-server config |
+| 📡 **Propagation** | Cross-server alert network: flag bad actors, manage trust levels, appeals, and auto-escalation |
+| 🧐 **Fact-Check** | Mention the bot + "is this true?" in a reply → local Ollama LLM writes a (satirical) counter-argument |
+| 🎉 **Fun** | `/trivia`, `/joke`, `/roll`, `/8ball`, `/choose`, `/coinflip`, `/rps`, `/activity` |
+| 📊 **Dashboard** | Embedded HTTP server with a real-time web dashboard (no external hosting required) |
+| ⚙️ **ASM** | x86-64 NASM hash routine wired into the `/ping` command |
+
+---
+
+## Architecture
+
+```
+discord_bot/
+├── asm/                  ← x86-64 NASM routines (fast_hash)
 ├── src/
-│   ├── main.c                      # Main entry point
-│   ├── env_parser.c/h              # Environment variable parser
-│   ├── database.c/h                # SQLite database operations
-│   ├── database_propagation.c/h    # Propagation-specific DB layer
-│   ├── CMakeLists.txt              # Source build configuration
+│   ├── main.c            ← Entry point, event routing, startup
+│   ├── database.c        ← Core DB (users, warnings, mod_logs, timeouts)
+│   ├── database_propagation.c  ← Propagation-specific tables & queries
+│   ├── api.c             ← JSON REST handlers for the dashboard
+│   ├── http_server.c     ← Minimal HTTP/1.0 server (pthreads)
+│   ├── env_parser.c      ← .env file loader
 │   └── modules/
-│       ├── ping.c/h                # Ping command module
-│       ├── moderation.c/h          # Moderation commands module
-│       ├── ticket.c/h              # Ticket system module
-│       ├── factcheck.c/h           # Fact-check module
-│       └── propagation.c/h         # Cross-server propagation module
-├── asm/
-│   ├── fast_hash.asm               # x86_64 assembly functions
-│   └── CMakeLists.txt              # Assembly build configuration
-├── bot_data.db                     # SQLite database (created on first run)
-└── .env.example                    # Example environment variables
+│       ├── moderation.c
+│       ├── ticket.c
+│       ├── propagation.c
+│       ├── factcheck.c
+│       ├── fun.c
+│       └── ping.c
+├── src/web/              ← AdminVU dashboard (HTML + CSS + JS)
+│   ├── index.html
+│   ├── moderation.html
+│   ├── propagation.html
+│   ├── tickets.html
+│   ├── style.css
+│   └── script.js
+├── .env                  ← Secrets (not committed)
+└── CMakeLists.txt
 ```
+
+```
+                         ┌──────────────────────────────┐
+                         │       Discord Gateway         │
+                         │   (Orca websocket client)     │
+                         └──────────────┬───────────────┘
+                                        │ events
+                         ┌──────────────▼───────────────┐
+                         │          main.c               │
+                         │   routes interactions &        │
+                         │   message events to modules   │
+                         └────┬──────┬──────┬──────┬────┘
+                              │      │      │      │
+                  ┌───────────▼─┐ ┌──▼──┐ ┌▼────┐ ┌▼──────────┐
+                  │ moderation  │ │ tkt │ │ prop│ │ factcheck │
+                  └─────┬───────┘ └──┬──┘ └──┬──┘ └─────┬─────┘
+                        │            │        │           │
+                  ┌─────▼────────────▼────────▼───────────▼─────┐
+                  │               SQLite3 (bot_data.db)          │
+                  └──────────────────────┬───────────────────────┘
+                                         │
+                  ┌──────────────────────▼───────────────────────┐
+                  │     http_server.c  →  api.c  →  AdminVU       │
+                  │          127.0.0.1:8080                       │
+                  └───────────────────────────────────────────────┘
+```
+
+---
 
 ## Prerequisites
 
-### Ubuntu/Debian
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential cmake nasm pkg-config \
-    libcurl4-openssl-dev libsqlite3-dev git
-```
+| Dependency | Version | Notes |
+|---|---|---|
+| GCC / Clang | C11 | Any modern version |
+| CMake | ≥ 3.16 | |
+| NASM | Any | For the ASM subdir |
+| libcurl | Any | HTTP requests (fact-check, fun) |
+| SQLite3 | Any | Bundled on most distros |
+| pthreads | POSIX | For HTTP server thread |
+| **Orca** | Latest | Must be installed separately — see below |
+| **Ollama** | Any | Only required for fact-check module |
 
-pthreads is part of glibc on Linux and requires no separate installation.
-
-### Install Orca Library
-
-The Orca library is required. Build from source:
+### Installing Orca
 
 ```bash
 git clone https://github.com/cee-studio/orca.git
 cd orca
 make
 sudo make install
-sudo ldconfig
 ```
 
-**Verify installation:**
+### Installing Ollama (optional, for fact-check)
+
 ```bash
-ls /usr/local/lib/libdiscord*
-ls /usr/local/include/orca/discord.h
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull ministral-3:8b   # or any model — see FACTCHECK_OLLAMA_MODEL
 ```
+
+---
 
 ## Building
 
-1. Clone this repository and navigate to it:
 ```bash
-cd discord-bot
+# Clone the repo
+git clone https://github.com/yourname/nerdy-bot.git
+cd nerdy-bot
+
+# Create a build directory
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
 
-2. Create a build directory:
+> **Note:** The build copies your `.env` file and the `src/web/` assets into the build directory automatically. No manual copying is needed.
+
+### Build Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `FACTCHECK_OLLAMA_MODEL` | `"ministral-3:8b"` | Ollama model to use |
+| `FACTCHECK_OLLAMA_URL` | `"http://localhost:11434/api/generate"` | Ollama endpoint |
+
+Example:
+
 ```bash
-mkdir build && cd build
+cmake -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFACTCHECK_OLLAMA_MODEL='"mistral"'
 ```
 
-3. Configure and build:
-```bash
-cmake ..
-make
-```
+---
 
 ## Configuration
 
-1. Create a Discord application at https://discord.com/developers/applications
-2. Create a bot and copy the token
-3. Enable the following bot permissions:
-   - **General Permissions**: Administrator (or specific moderation permissions)
-   - **Text Permissions**: Send Messages, Embed Links
-   - **Member Permissions**: Kick Members, Ban Members, Moderate Members (Timeout)
-4. Enable these **Privileged Gateway Intents** in the Bot settings:
-   - Server Members Intent
-   - Message Content Intent (if needed)
+Create a `.env` file at the project root:
 
-5. Create a `.env` file in the **parent directory** (one level above the project):
+```dotenv
+# Required
+DISCORD_BOT_TOKEN=your_bot_token_here
+DISCORD_BOT_GUILD_ID=your_infra_guild_id
 
-```bash
-# From the parent directory containing discord-bot/
-cat > .env << EOF
-DISCORD_BOT_TOKEN=your_token_here
-DISCORD_BOT_GUILD_ID=your_central_administration_server_id
-DISCORD_DEV_GUILD_IDS=your_dev_server_ids
-EOF
+# Optional — comma-separated list of guilds for instant slash-command updates
+DISCORD_DEV_GUILD_IDS=123456789,987654321
 ```
 
-**To get your Guild ID:**
-- Enable Developer Mode in Discord (User Settings → Advanced → Developer Mode)
-- Right-click your server icon and select "Copy Server ID"
+> **Security note:** The `.env` file is copied into the build directory at configure time. Never commit it. It is listed in `.gitignore` by convention.
 
-**Directory structure:**
-```
-parent-directory/
-├── .env                    # Put your .env file here
-└── discord-bot/
-    ├── build/
-    ├── bot_data.db         # Database created here on first run
-    └── src/
-        └── discord_bot     # The bot executable
-```
+### Required Bot Permissions
+
+| Permission | Required by |
+|---|---|
+| `KICK_MEMBERS` | Moderation module |
+| `BAN_MEMBERS` | Moderation module |
+| `MODERATE_MEMBERS` | Timeout command |
+| `MANAGE_CHANNELS` | Ticket channel creation |
+| `MANAGE_MESSAGES` | Anonymous staff message relay |
+| `SEND_MESSAGES` | All modules |
+| `READ_MESSAGE_HISTORY` | Fact-check reply lookup |
+
+Enable the **Message Content** and **Server Members** privileged intents in the Discord Developer Portal.
+
+---
 
 ## Running
 
 ```bash
-./build/src/discord_bot
+cd build
+./discord_bot
 ```
 
-On first run, the bot will create `bot_data.db` in the project root directory.
+The bot will:
+1. Load `.env` (from `../` relative to the binary, or the build dir)
+2. Initialise the SQLite database (`bot_data.db`)
+3. Start the HTTP dashboard on `http://127.0.0.1:8080`
+4. Connect to the Discord gateway
+5. Register slash commands (global + dev guilds) in a background thread
 
-## Database Schema
+---
 
-The bot creates tables automatically on first run.
+## Modules
 
-### `users` table
-- `user_id` - Discord user snowflake ID
-- `guild_id` - Discord guild snowflake ID
-- `created_at` - Unix timestamp
+### 🛡️ Moderation
 
-### `warnings` table
-- `id` - Auto-incrementing primary key
-- `user_id` - Discord user snowflake ID
-- `guild_id` - Discord guild snowflake ID
-- `moderator_id` - Discord moderator snowflake ID
-- `reason` - Warning reason text
-- `timestamp` - Unix timestamp
+> `src/modules/moderation.c`
 
-### `mod_logs` table
-- `id` - Auto-incrementing primary key
-- `action_type` - Type of action (warn, kick, ban, timeout)
-- `user_id` - Discord user snowflake ID
-- `guild_id` - Discord guild snowflake ID
-- `moderator_id` - Discord moderator snowflake ID
-- `reason` - Action reason text
-- `timestamp` - Unix timestamp
+All actions are persisted to `mod_logs` and, where applicable, `warnings` / `timeouts`.
 
-### `propagation_events` table
-- `id` - Auto-incrementing primary key
-- `target_user_id` - Flagged user's snowflake ID
-- `source_guild_id` - Guild the alert originated from
-- `moderator_id` - Moderator who issued the alert
-- `reason` - Plain-text reason
-- `evidence_url` - URL to evidence (screenshot, video, etc.)
-- `timestamp` - Unix timestamp
+| Command | Permission | Description |
+|---|---|---|
+| `/warn <user> [reason]` | Kick / Ban / Moderate | Issue a warning; reply includes cumulative count |
+| `/warnings <user>` | Kick / Ban / Moderate | List all warnings for a user (paginated, up to 10 shown) |
+| `/kick <user> [reason]` | Kick Members | Remove a user from the guild |
+| `/ban <user> [reason]` | Ban Members | Ban a user; deletes 1 day of messages |
+| `/timeout <user> [duration] [reason]` | Moderate Members | Applies `communication_disabled_until` via direct REST PATCH; default 10 min, max 40 320 min (28 days) |
 
-### `propagation_notifications` table
-- `id` - Auto-incrementing primary key
-- `propagation_id` - Foreign key to `propagation_events`
-- `guild_id` - Guild that was notified
-- `notified_at` - Unix timestamp
+Timeouts are also stored in the `timeouts` table so the bot can track and query them independently of Discord's internal state.
 
-### `propagation_guild_config` table
-- `guild_id` - Primary key
-- `notification_channel` - Channel ID for incoming alerts
-- `opted_in` - 1 = receiving alerts, 0 = opted out
+---
 
-### `propagation_blacklist` table
-- `moderator_id` - Primary key
-- `banned_by` - Admin who issued the blacklist
-- `reason` - Reason for removal
-- `banned_at` - Unix timestamp
+### 🎫 Tickets
 
-### `known_guilds` table
-- `guild_id` - Primary key
-- `registered_at` - Unix timestamp
+> `src/modules/ticket.c`
 
-## Architecture Notes
+A full **anonymous DM-relay** ticket system. Users never see staff usernames; staff never see the user in the channel.
 
-### Off-thread command registration
+```
+User types /ticket open server:<id> subject:<text>
+          │
+          ▼
+Bot creates a private channel in the staff server's ticket category
+          │
+          ▼
+Bot opens a DM with the user and stores the mapping (user ↔ DM channel ↔ ticket channel)
+          │
+   ┌──────┴──────┐
+   │             │
+User DMs bot  Staff types in ticket channel
+   │             │
+   ▼             ▼
+Forwarded to   Deleted + re-posted as [Staff]: …
+ticket channel  then forwarded to user's DM
+```
 
-Slash commands are registered via blocking REST calls to Discord's API. Performing these inside the `on_ready` callback — which runs on the same thread as the WebSocket heartbeat — will starve the connection and cause the bot to disconnect, typically right as the largest command batch (propagation) is being sent.
+**Slash Commands**
 
-To avoid this, `on_ready` spawns a detached `pthread` that registers all commands in the background whilst the event loop continues uninterrupted.
+| Command | Permission | Description |
+|---|---|---|
+| `/ticket open <server> <subject>` | Anyone | Opens a ticket for a specific community server |
+| `/ticket claim` | Staff (in ticket channel) | Assigns ticket to self, sets status to In Progress |
+| `/ticket close [outcome] [notes]` | Staff | Closes the ticket, notifies the user via DM |
+| `/ticket priority <level>` | Staff | Updates priority (0 Low → 3 Urgent) |
+| `/ticket status <value>` | Staff | Updates status (0 Open → 4 Closed) |
+| `/ticket assign <staff>` | Staff | Reassigns ticket to another staff member |
+| `/ticketconfig [mainserver] [staffserver] [category] [logchannel]` | Administrator | Configures the ticket system for a guild |
 
-### Propagation delivery
+**Mention safety:** All forwarded messages are run through `strip_mentions()` which inserts a Unicode zero-width space (U+200B) after every `@`, preventing `@everyone`, `@here`, and user/role mentions from firing in either direction.
 
-When `/propagate` is fired, the bot iterates every opted-in guild, calls `discord_get_guild_member` to confirm the target is present, and posts a rich alert embed to that guild's configured channel. No automatic action is taken against the user in any receiving guild — moderators there make their own decisions. Every alert is persisted to the database with a unique ID so it can be referenced, queried, or disputed later.
+---
 
-## Usage Examples
+### 📡 Propagation
 
-### Moderation Workflow
+> `src/modules/propagation.c` · `src/database_propagation.c`
 
-1. **Warn a user for spam:**
-   ```
-   /warn user:@BadUser reason:Spamming in general chat
-   ```
+A **cross-server alert network**. Opted-in guilds receive notifications when a moderator flags a user. Severity is calculated from a weighted confirmation score based on each guild's trust level.
 
-2. **Check a user's warning history:**
-   ```
-   /warnings user:@BadUser
-   ```
+#### Trust Levels
 
-3. **Timeout a user for 60 minutes:**
-   ```
-   /timeout user:@BadUser duration:60 reason:Continued rule violations
-   ```
+| Level | Badge | Weight | Description |
+|---|---|---|---|
+| Unverified | ⚪ | 1 | Default for all guilds |
+| Trusted | 🔵 | 2 | Manually set by central admins |
+| Verified | ✅ | 3 | Verified community |
+| Partner | ⭐ | 4 | Auto-assigned to staff servers and the central guild |
 
-4. **Kick a user:**
-   ```
-   /kick user:@BadUser reason:Multiple warnings ignored
-   ```
+#### Severity Scale
 
-5. **Ban a user:**
-   ```
-   /ban user:@BadUser reason:Severe ToS violation
-   ```
+| Score | Level | Emoji |
+|---|---|---|
+| 0 | Unconfirmed | ⬜ |
+| 1 – 3 | Low | 🟡 |
+| 4 – 8 | Medium | 🟠 |
+| 9 – 15 | High | 🔴 |
+| 16+ | Critical | 🚨 |
 
-### Propagation Workflow
+#### Commands
 
-1. **Configure your server to receive alerts** *(admin, run once)*:
-   ```
-   /propagate-config channel_id:123456789012345678
-   ```
+| Command | Permission | Description |
+|---|---|---|
+| `/propagate <user> <reason> <evidence> <confirm>` | Mod | Issue a cross-server alert |
+| `/propagate-config <channel_id>` | Admin | Set alert delivery channel |
+| `/propagate-opt-out` | Admin | Stop receiving alerts |
+| `/propagate-history <user>` | Mod | View alert history for a user |
+| `/propagate-revoke <moderator> <reason>` | Admin | Permanently blacklist a moderator |
+| `/propagate-report <alert_id> <reason>` | Mod | Flag an alert as suspicious (auto-escalates at threshold) |
+| `/propagate-appeal <alert_id> <statement>` | Targeted user | Submit an appeal |
+| `/propagate-appeal-review <appeal_id> <approve\|deny> [notes]` | Admin | Decide an appeal; broadcasts result to all notified guilds |
+| `/propagate-trust <guild_id> <level> [notes]` | Central admin | Set a guild's trust level |
+| `/propagate-central <guild_id> <channel_id>` | Bot team only | Designate the central oversight server |
+| `/propagate-pair <main_guild_id> <staff_guild_id>` | Bot team only | Pair a community's main and staff servers |
 
-2. **Flag a user across the network** *(mod)*:
-   ```
-   /propagate user:@BadUser reason:Doxxing members evidence:https://imgur.com/... confirm:I UNDERSTAND THE CONSEQUENCES
-   ```
-   The bot will only send the alert to guilds where the target is actually a member.
+> **Misuse protection:** The `/propagate` command requires typing `I UNDERSTAND THE CONSEQUENCES` verbatim in the `confirm` field. Blacklisted moderators are silently blocked from issuing further alerts.
 
-3. **Check a user's alert history**:
-   ```
-   /propagate-history user:@BadUser
-   ```
+---
 
-4. **Remove a moderator from the system** *(admin)*:
-   ```
-   /propagate-revoke moderator:@BadMod reason:Issuing false alerts
-   ```
+### 🧐 Fact-Check
 
-5. **Opt your server out of the network** *(admin)*:
-   ```
-   /propagate-opt-out
-   ```
+> `src/modules/factcheck.c`
 
-## Permissions
+**Trigger:** Reply to any message, then mention the bot and include `"is this true?"` in your message.
 
-| Command | Required permission |
+The bot forwards the referenced message's content to a local **Ollama** instance, instructing it to act as a persuasive but dishonest AI that argues against the statement. The response is sent as a reply.
+
+```
+User replies to a message and mentions @Bot with "is this true?"
+                          │
+                  ┌───────▼──────┐
+                  │  Fetch the   │
+                  │ referenced   │
+                  │  message     │
+                  └───────┬──────┘
+                          │
+                  ┌───────▼──────┐
+                  │  POST to     │
+                  │  Ollama API  │
+                  │  (60s limit) │
+                  └───────┬──────┘
+                          │
+                  ┌───────▼──────┐
+                  │  Reply with  │
+                  │  AI response │
+                  └──────────────┘
+```
+
+Configure the model and endpoint at compile time via `-DFACTCHECK_OLLAMA_MODEL` and `-DFACTCHECK_OLLAMA_URL`.
+
+---
+
+### 🎉 Fun
+
+> `src/modules/fun.c`
+
+All fun commands return **ephemeral** responses (only visible to the invoker).
+
+| Command | Description |
 |---|---|
-| `/warn`, `/warnings` | Kick Members or Moderate Members |
-| `/kick` | Kick Members |
-| `/ban` | Ban Members |
-| `/timeout` | Moderate Members |
-| `/propagate`, `/propagate-history` | Kick Members, Ban Members, or Moderate Members |
-| `/propagate-config`, `/propagate-opt-out`, `/propagate-revoke` | Administrator or Manage Server |
+| `/joke` | Fetches a random dad joke from icanhazdadjoke.com |
+| `/roll [max]` | Rolls 1 – N (default: 6) |
+| `/8ball <question>` | Classic magic 8-ball |
+| `/choose <options>` | Picks randomly from a comma-separated list |
+| `/coinflip` | Heads or tails |
+| `/rps <rock\|paper\|scissors>` | Rock-paper-scissors against the bot |
+| `/trivia` | Fetches a multiple-choice question from Open Trivia DB; interactive buttons with a 60-second timeout |
+| `/activity` | Shows the top 3 most active text channels tracked in the current session |
 
-## Adding New Modules
+---
 
-1. Create your module files in `src/modules/`:
-   - `your_module.h` - Header file
-   - `your_module.c` - Implementation
+### 🏓 Ping
 
-2. Add to `src/CMakeLists.txt`:
-```cmake
-add_executable(discord_bot
-    main.c
-    env_parser.c
-    database.c
-    modules/ping.c
-    modules/moderation.c
-    modules/your_module.c  # Add this
-)
+> `src/modules/ping.c`
+
+```
+/ping [target]
 ```
 
-3. Include and initialise in `src/main.c`:
-```c
-#include "modules/your_module.h"
+Responds with `Pong! 🏓 (Target: <name>, Hash: 0x<hex>)`.
 
-// In main():
-your_module_init(client, &g_database, g_guild_id);
+The hash is computed by the x86-64 NASM routine `fast_hash` (see [Assembly Routine](#assembly-routine)). If a `target` user option is provided, the bot fetches their guild member record via REST and uses their nickname (or username as fallback).
+
+---
+
+## Dashboard (AdminVU)
+
+The bot runs a minimal HTTP/1.0 server on `http://127.0.0.1:8080` (loopback only — not externally accessible). The dashboard is a static single-page application served from `src/web/`.
+
+| Page | URL | Description |
+|---|---|---|
+| Dashboard | `/` | Live stats: guild count, warnings, open tickets, propagation events, uptime |
+| Moderation | `/moderation.html` | Paginated mod log with guild and action filters; user warning lookup |
+| Propagation | `/propagation.html` | Opted-in server list, alert history, block/unblock controls |
+| Tickets | `/tickets.html` | Full ticket list with status/guild filters; click any row to view detail + notes |
+
+> The dashboard polls `/api/status` every 15 seconds. All snowflake IDs are serialised as **strings** to preserve JavaScript precision.
+
+---
+
+## REST API Reference
+
+All endpoints return `application/json`. POST bodies are `application/x-www-form-urlencoded`.
+
+<details>
+<summary><strong>GET endpoints</strong></summary>
+
+| Endpoint | Query params | Description |
+|---|---|---|
+| `GET /api/status` | — | Warning count, open tickets, guild count, propagation events |
+| `GET /api/guilds` | — | All known guilds with warning + ticket counts |
+| `GET /api/mod-logs` | `guild_id`, `action` (0–3 or `all`), `limit`, `offset` | Paginated mod log |
+| `GET /api/warnings` | `guild_id`, `user_id` | Warning records |
+| `GET /api/propagation/guilds` | — | All guilds with propagation config + block status |
+| `GET /api/propagation/events` | `user_id`, `source_guild_id`, `limit`, `offset` | Alert events with notified counts |
+| `GET /api/propagation/blocked` | — | All dashboard-blocked guilds |
+| `GET /api/tickets` | `guild_id`, `status` | Ticket list |
+| `GET /api/tickets/<id>` | — | Single ticket with notes |
+| `GET /api/tickets/events` | `since` (unix ts) | SSE-style event poll |
+
+</details>
+
+<details>
+<summary><strong>POST endpoints</strong></summary>
+
+| Endpoint | Body params | Description |
+|---|---|---|
+| `POST /api/propagation/block` | `guild_id`, `reason` | Block a guild from receiving alerts |
+| `POST /api/propagation/unblock` | `guild_id` | Remove a guild block |
+
+</details>
+
+---
+
+## Assembly Routine
+
+> `asm/`
+
+The `/ping` command uses an **x86-64 NASM** hash function (`fast_hash`) wired via `extern uint64_t fast_hash(const char *str, size_t len)`. It is compiled as a separate CMake subdirectory and linked into the main binary.
+
+This serves both as a demonstration of C ↔ ASM interop and as a moderately fast string hash for display purposes.
+
+---
+
+## Known Issues & TODO
+
+> [!WARNING]
+> **The following items are known to be broken or incomplete.** Contributions and fixes are welcome — please open an issue or PR referencing the item below.
+
+---
+
+> [!CAUTION]
+> ### 🐛 Bug — Ticket Close Delay
+> **Tickets take 5–10 minutes to properly close.**
+> The `TICKET_STATUS_CLOSED` state is written immediately to the DB, but Discord channel state and DM relay teardown appear to lag. Root cause under investigation — likely a race between the status write and the next message relay tick.
+
+---
+
+> [!CAUTION]
+> ### 🐛 Bug — Dashboard Propagation Sync
+> **The Propagation dashboard page does not properly sync with live bot data.**
+> - Alert events are not displaying correctly in the events table.
+> - Block/unblock actions via the dashboard UI are accepted by the API but the bot does not pick up the change without a restart.
+> Needs a polling mechanism or a shared-state refresh path between `api.c` and `propagation.c`.
+
+---
+
+> [!CAUTION]
+> ### 🐛 Bug — Ticket Server Membership Check
+> **The ticket system currently allows users to open tickets for servers they have never been in.**
+> The `/ticket open server:<id>` command does not validate that the invoking user is actually a member of `server`. A `discord_get_guild_member()` call must be added in `open_ticket()` before channel creation.
+
+---
+
+> [!NOTE]
+> ### ✨ Feature — Propagation-Linked Tickets
+> **Propagation must allow warned users and staff members of other servers to create a ticket relating to a specific propagation warning.**
+> Suggested: when an alert fires, the DM to the target user should include a direct `/ticket open` pre-filled link (or a button). Staff in other guilds who receive the alert should also be able to raise a linked ticket referencing the alert ID. A `propagation_id` foreign key column on the `tickets` table would be needed.
+
+---
+
+> [!NOTE]
+> ### ✨ Feature — Restrict Who Can Appeal a Propagation Warning
+> **Currently, any server can appeal any propagated warning**, regardless of whether they were named in it or received the alert.
+> The `handle_appeal` handler in `propagation.c` checks `ev.target_user_id != user_id` but there is no guild-level restriction. Appeals should be restricted to: (a) the targeted user themselves, or (b) staff in a guild that received the alert notification.
+
+---
+
+> [!NOTE]
+> ### ✨ Feature — Edit Propagation Message on Updates
+> **Each new update to an existing propagation event (severity change, appeal outcome, report threshold) posts a new message instead of editing the original.**
+> The `propagation_notifications` table records `guild_id` but not the `message_id` of the alert that was posted. A `message_id` column should be added so that `broadcast_appeal_update()` and severity recalculations can call `discord_edit_message()` on the original embed rather than posting a follow-up.
+
+---
+
+> [!NOTE]
+> ### 🎉 Feature — High-Precision Scientific Calculator (for the fun of it)
+> **Add a `/calc` command** implementing a high-precision floating-point arithmetic calculator supporting scientific notation, standard mathematical functions (sin, cos, ln, exp, √, etc.), and arbitrary-precision integers. Could use the GNU MPFR library internally, or a bundled arbitrary-precision implementation. Purely for fun.
+
+---
+
+## Project Structure
+
+```
+discord_bot/
+│
+├── asm/                          # x86-64 NASM source
+│   └── CMakeLists.txt
+│
+├── src/
+│   ├── main.c                    # Bot entry point
+│   ├── database.c / .h           # Core DB operations
+│   ├── database_propagation.c / .h
+│   ├── api.c / .h                # Dashboard REST API
+│   ├── http_server.c / .h        # Embedded HTTP server
+│   ├── env_parser.c / .h         # .env loader
+│   │
+│   ├── modules/
+│   │   ├── moderation.c / .h
+│   │   ├── ticket.c / .h
+│   │   ├── propagation.c / .h
+│   │   ├── factcheck.c / .h
+│   │   ├── fun.c / .h
+│   │   └── ping.c / .h
+│   │
+│   └── web/                      # AdminVU dashboard
+│       ├── index.html
+│       ├── moderation.html
+│       ├── propagation.html
+│       ├── tickets.html
+│       ├── style.css
+│       └── script.js
+│
+├── CMakeLists.txt
+├── .env                          # ← not committed
+└── README.md
 ```
 
-4. Add command handler to the combined interaction handler:
-```c
-void on_interaction_create_combined(struct discord *client,
-                                    const struct discord_interaction *event) {
-    // ... existing code ...
-    
-    } else if (strcmp(cmd, "your_command") == 0) {
-        your_command_handler(client, event);
-    }
-}
+---
+
+<div align="center">
+
+```
+[ AdminVU ] · built in C · running on 127.0.0.1:8080
 ```
 
-## Troubleshooting
+*Made with way too much `printf` debugging.*
 
-### Bot disconnects after registering propagation commands
-
-Slash-command registration makes blocking HTTP calls. If these run on the WebSocket thread the heartbeat stalls and Discord drops the connection. The fix is already in place — command registration runs on a detached `pthread` spawned from `on_ready`. If you see this happen again, ensure nothing else is making blocking calls inside an event callback.
-
-### Database Issues
-
-**"Database is locked" error:**
-- Make sure only one instance of the bot is running
-- Check file permissions on `bot_data.db`
-
-**Resetting the database:**
-```bash
-rm bot_data.db
-# The bot will recreate it on next run
-```
-
-### Permission Issues
-
-**Bot can't kick/ban/timeout users:**
-- Ensure the bot role is above the target user's highest role in the server hierarchy
-- Check that the bot has the required permissions in the server settings
-- Verify the bot was invited with the correct permission scope
-
-### SQLite Not Found
-
-```bash
-sudo apt-get install libsqlite3-dev
-```
-
-## Assembly Calling Convention (x86_64 System V ABI)
-
-- First 6 integer/pointer arguments: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`
-- Return value: `rax`
-- Caller-saved: `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8–r11`
-- Callee-saved: `rbx`, `rbp`, `r12–r15`
-
-## Security Considerations
-
-1. **Token Security**: Never commit your `.env` file or expose your bot token
-2. **SQL Injection**: The database module uses prepared statements throughout
-3. **Permission Checks**: All commands verify Discord permissions before executing
-4. **Propagation Abuse**: Every alert is permanently logged with the issuing moderator's ID and guild. Admins can blacklist abusive moderators with `/propagate-revoke`
-5. **No Automatic Action**: Propagation alerts are informational only — receiving guilds decide what action, if any, to take
-
-## Licence
-
-This project is provided as-is for educational purposes.
-
-## Contributing
-
-Contributions are welcome! Areas for improvement:
-- Move propagation delivery into its own thread to avoid blocking the event loop during large alert batches
-- Add more moderation commands (unban, clear warnings, etc.)
-- Implement auto-moderation features (spam detection, etc.)
-- Add a logging channel configuration per guild
-- Create a web dashboard for viewing mod logs and propagation history
-- Implement an appeal system for warnings and bans
+</div>
