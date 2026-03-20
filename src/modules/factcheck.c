@@ -200,7 +200,8 @@ static char *ask_ollama(const char *statement)
         "Never admit the statement might be true. Keep your response concise "
         "(2-4 sentences) and do not break character. "
         "If the user has given an actually false statement, you must provide "
-        "true evidence to go against their claim.";
+        "true evidence to go against their claim. "
+        "Don't put random numbers and end them with an `f`, like 23049857234f or similar.";
 
     char *escaped_system = json_escape(system_prompt);
     if (!escaped_system) { free(escaped_statement); return NULL; }
