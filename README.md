@@ -22,7 +22,7 @@
 [![Build System](https://img.shields.io/badge/build-CMake-red?style=flat-square&logo=cmake)](#)
 [![Database](https://img.shields.io/badge/database-SQLite3-lightgrey?style=flat-square&logo=sqlite)](#)
 [![Library](https://img.shields.io/badge/lib-Orca%2FDiscord-5865F2?style=flat-square&logo=discord)](#)
-[![Dashboard](https://img.shields.io/badge/dashboard-AdminVU-teal?style=flat-square)](#dashboard)
+[![Dashboard](https://img.shields.io/badge/dashboard-AdminV-UI-teal?style=flat-square)](#dashboard)
 [![Status](https://img.shields.io/badge/status-active%20development-yellow?style=flat-square)](#known-issues--todo)
 
 <br/>
@@ -51,7 +51,7 @@
   - [Fact-Check](#-fact-check)
   - [Fun](#-fun)
   - [Ping](#-ping)
-- [Dashboard (AdminVU)](#dashboard-adminvu)
+- [Dashboard (AdminV-UI)](#dashboard-adminvu)
 - [REST API Reference](#rest-api-reference)
 - [Assembly Routine](#assembly-routine)
 - [Known Issues & TODO](#known-issues--todo)
@@ -61,7 +61,7 @@
 
 ## Overview
 
-**Nerdy** (working title) is a Discord bot written entirely in **C11**, targeting the Linux platform. It uses the [Orca](https://github.com/cee-studio/orca) C Discord library for gateway connectivity, stores all state in an **SQLite3** database, and ships with a self-hosted **HTTP dashboard** (AdminVU) accessible at `http://127.0.0.1:8080`.
+**AdminVU** (working title) is a Discord bot written entirely in **C11**, targeting the Linux platform. It uses the [Orca](https://github.com/cee-studio/orca) C Discord library for gateway connectivity, stores all state in an **SQLite3** database, and ships with a self-hosted **HTTP dashboard** (AdminV-UI) accessible at `http://127.0.0.1:8080`.
 
 The bot is modular — each feature lives in its own `.c` file under `src/modules/` — and is designed to be fast, low-dependency, and operator-controlled.
 
@@ -100,7 +100,7 @@ discord_bot/
 │       ├── factcheck.c
 │       ├── fun.c
 │       └── ping.c
-├── src/web/              ← AdminVU dashboard (HTML + CSS + JS)
+├── src/web/              ← AdminV-UI dashboard (HTML + CSS + JS)
 │   ├── index.html
 │   ├── moderation.html
 │   ├── propagation.html
@@ -132,8 +132,8 @@ discord_bot/
                   └──────────────────────┬───────────────────────┘
                                          │
                   ┌──────────────────────▼───────────────────────┐
-                  │     http_server.c  →  api.c  →  AdminVU      │
-                  │          127.0.0.1:8080                      │
+                  │     http_server.c  →  api.c  →  AdminV-UI    │
+                  │                127.0.0.1:8080                │
                   └──────────────────────────────────────────────┘
 ```
 
@@ -174,8 +174,8 @@ ollama pull ministral-3:8b   # or any model — see FACTCHECK_OLLAMA_MODEL
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourname/nerdy-bot.git
-cd nerdy-bot
+git clone https://github.com/PolskaKrowa/AdminVU.git
+cd AdminVU
 
 # Create a build directory
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -419,7 +419,7 @@ The hash is computed by the x86-64 NASM routine `fast_hash` (see [Assembly Routi
 
 ---
 
-## Dashboard (AdminVU)
+## Dashboard (AdminV-UI)
 
 The bot runs a minimal HTTP/1.0 server on `http://127.0.0.1:8080` (loopback only — not externally accessible). The dashboard is a static single-page application served from `src/web/`.
 
@@ -559,7 +559,7 @@ discord_bot/
 │   │   ├── fun.c / .h
 │   │   └── ping.c / .h
 │   │
-│   └── web/                      # AdminVU dashboard
+│   └── web/                      # AdminV-UI dashboard
 │       ├── index.html
 │       ├── moderation.html
 │       ├── propagation.html
