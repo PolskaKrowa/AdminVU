@@ -962,7 +962,7 @@ static void close_ticket(struct discord *client,
 
     t->status  = TICKET_STATUS_CLOSED;
     t->outcome = outcome;
-    refresh_channel_topic(t->channel_id, t);
+    // refresh_channel_topic(t->channel_id, t);
 
     char log_buf[256];
     snprintf(log_buf, sizeof log_buf,
