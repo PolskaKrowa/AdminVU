@@ -12,9 +12,17 @@
  *        user_id ↔ dm_channel_id ↔ ticket_channel_id
  *
  *  • Message relay (both directions):
- *      DM from user  → forwarded to ticket channel as   "username: …"
- *      Staff message → original deleted, re-posted as  "[Staff]: …",
- *                       then forwarded to user DM       "[Staff]: …"
+ *      DM from user  → always forwarded to ticket channel as "username: …"
+ *                       (user gets ⏳ reaction if unclaimed, 📨 if claimed)
+ *      Staff message → gated: only the claimant may relay to the user DM.
+ *                       Non-claimants and unclaimed tickets are rejected at
+ *                       the bot level; Discord's channel permission overwrite
+ *                       (DENY SEND_MESSAGES on @everyone, set at open time,
+ *                       per-member ALLOW added at claim time) enforces the
+ *                       same rule at the Discord level.
+ *
+ *  • Claim transfer: /ticket claim on an already-claimed ticket revokes the
+ *    previous claimant's SEND_MESSAGES overwrite and grants it to the new one.
  *
  *  • Mention suppression: every forwarded string is run through
  *    strip_mentions() before posting, so @everyone, @here, <@id> and
@@ -25,7 +33,10 @@
  *
  * Required bot permissions in the staff guild
  * ────────────────────────────────────────────
+ *   ADMINISTRATOR    – recommended; bypasses channel overwrites so the bot
+ *                      can always post in locked ticket channels
  *   MANAGE_CHANNELS  – create / rename ticket channels
+ *   MANAGE_ROLES     – edit channel permission overwrites (claim/unclaim)
  *   MANAGE_MESSAGES  – delete the original staff message before re-posting
  *   SEND_MESSAGES    – post in ticket channels + DMs
  *   VIEW_CHANNEL     – obvious
@@ -41,6 +52,7 @@
 
 #include <sqlite3.h>
 #include <orca/discord.h>
+#include "http_server.h"   /* http_sse_push */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Module-level state
@@ -145,6 +157,40 @@ int ticket_db_init_tables(Database *db) {
         "  ticket_channel_id INTEGER NOT NULL,"
         "  ticket_id         INTEGER NOT NULL,"
         "  PRIMARY KEY (user_id, ticket_id)"
+        ");"
+        /*
+         * Tracks every staff-side message so staff can edit/delete by index.
+         * msg_index is a per-ticket sequential counter starting at 1.
+         * dm_message_id is the ID of the copy posted in the user's DM so
+         * edits and deletes can be applied to the DM message directly.
+         * author_name is stored so the [#N] header survives edits made by
+         * a different staff member than the original author.
+         */
+        "CREATE TABLE IF NOT EXISTS ticket_staff_messages ("
+        "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  ticket_id     INTEGER NOT NULL REFERENCES tickets(id),"
+        "  msg_index     INTEGER NOT NULL,"
+        "  message_id    INTEGER NOT NULL,"
+        "  dm_message_id INTEGER NOT NULL DEFAULT 0,"
+        "  content       TEXT    NOT NULL,"
+        "  author_id     INTEGER NOT NULL,"
+        "  author_name   TEXT    NOT NULL DEFAULT '',"
+        "  created_at    INTEGER NOT NULL,"
+        "  UNIQUE(ticket_id, msg_index)"
+        ");"
+        /*
+         * Append-only audit log of staff message edits and deletions,
+         * surfaced in the dashboard ticket log HTML via SSE.
+         */
+        "CREATE TABLE IF NOT EXISTS ticket_log_events ("
+        "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  ticket_id   INTEGER NOT NULL,"
+        "  event_type  TEXT    NOT NULL,"   /* 'edit' | 'delete' */
+        "  msg_index   INTEGER NOT NULL,"
+        "  author_name TEXT    NOT NULL DEFAULT '',"
+        "  old_content TEXT,"
+        "  new_content TEXT,"
+        "  occurred_at INTEGER NOT NULL"
         ");";
 
     char *errmsg = NULL;
@@ -154,6 +200,16 @@ int ticket_db_init_tables(Database *db) {
         sqlite3_free(errmsg);
         return -1;
     }
+    /* Migrations for installations that pre-date the new columns.
+     * sqlite3_exec returns an error if the column already exists; ignore it. */
+    sqlite3_exec(db->db,
+        "ALTER TABLE ticket_staff_messages"
+        " ADD COLUMN dm_message_id INTEGER NOT NULL DEFAULT 0;",
+        NULL, NULL, NULL);
+    sqlite3_exec(db->db,
+        "ALTER TABLE ticket_staff_messages"
+        " ADD COLUMN author_name TEXT NOT NULL DEFAULT '';",
+        NULL, NULL, NULL);
     return 0;
 }
 
@@ -385,6 +441,106 @@ void ticket_notes_free(TicketNote *notes, int count) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Database – staff messages (index tracking for !edit / !del)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Insert a new staff message row; returns the assigned msg_index (>= 1),
+ * or -1 on error.
+ */
+static int staff_msg_insert(Database *db, int ticket_id,
+                             u64_snowflake_t message_id,
+                             u64_snowflake_t dm_message_id,
+                             u64_snowflake_t author_id,
+                             const char *author_name,
+                             const char *content) {
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db,
+            "SELECT COALESCE(MAX(msg_index),0)+1 FROM ticket_staff_messages"
+            " WHERE ticket_id=?;",
+            -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(stmt, 1, ticket_id);
+    int next_idx = 1;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        next_idx = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    if (sqlite3_prepare_v2(db->db,
+            "INSERT INTO ticket_staff_messages"
+            " (ticket_id,msg_index,message_id,dm_message_id,content,author_id,author_name,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?);",
+            -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int  (stmt, 1, ticket_id);
+    sqlite3_bind_int  (stmt, 2, next_idx);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)message_id);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)dm_message_id);
+    sqlite3_bind_text (stmt, 5, content, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 6, (sqlite3_int64)author_id);
+    sqlite3_bind_text (stmt, 7, author_name ? author_name : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 8, (sqlite3_int64)time(NULL));
+    int rc = sqlite3_step(stmt); sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? next_idx : -1;
+}
+
+/* Look up a staff message by ticket_id + msg_index.
+ * Fills *message_id and copies content into *content_out (caller must free).
+ * Returns 0 on success, -1 if not found. */
+static int staff_msg_get(Database *db, int ticket_id, int msg_index,
+                          u64_snowflake_t *message_id, char **content_out,
+                          u64_snowflake_t *author_id_out,
+                          u64_snowflake_t *dm_message_id_out,
+                          char **author_name_out) {
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db,
+            "SELECT message_id,content,author_id,dm_message_id,author_name"
+            " FROM ticket_staff_messages"
+            " WHERE ticket_id=? AND msg_index=?;",
+            -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(stmt, 1, ticket_id);
+    sqlite3_bind_int(stmt, 2, msg_index);
+    if (sqlite3_step(stmt) != SQLITE_ROW) { sqlite3_finalize(stmt); return -1; }
+    if (message_id)       *message_id       = (u64_snowflake_t)sqlite3_column_int64(stmt, 0);
+    if (content_out) {
+        const char *c = (const char *)sqlite3_column_text(stmt, 1);
+        *content_out = c ? strdup(c) : NULL;
+    }
+    if (author_id_out)    *author_id_out    = (u64_snowflake_t)sqlite3_column_int64(stmt, 2);
+    if (dm_message_id_out)*dm_message_id_out= (u64_snowflake_t)sqlite3_column_int64(stmt, 3);
+    if (author_name_out) {
+        const char *n = (const char *)sqlite3_column_text(stmt, 4);
+        *author_name_out = n ? strdup(n) : NULL;
+    }
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+static int staff_msg_update(Database *db, int ticket_id, int msg_index,
+                             const char *new_content) {
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db,
+            "UPDATE ticket_staff_messages SET content=?"
+            " WHERE ticket_id=? AND msg_index=?;",
+            -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, new_content, -1, SQLITE_STATIC);
+    sqlite3_bind_int (stmt, 2, ticket_id);
+    sqlite3_bind_int (stmt, 3, msg_index);
+    int rc = sqlite3_step(stmt); sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int staff_msg_delete(Database *db, int ticket_id, int msg_index) {
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db->db,
+            "DELETE FROM ticket_staff_messages"
+            " WHERE ticket_id=? AND msg_index=?;",
+            -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(stmt, 1, ticket_id);
+    sqlite3_bind_int(stmt, 2, msg_index);
+    int rc = sqlite3_step(stmt); sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Database – config
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -600,6 +756,79 @@ static void post_to_channel(u64_snowflake_t channel_id, const char *content) {
     if (rc != ORCA_OK)
         fprintf(stderr, "[ticket] post_to_channel %" PRIu64 " failed: %d\n",
                 channel_id, rc);
+}
+
+/*
+ * ticket_log_event_push
+ *
+ * Inserts an edit/delete audit row into ticket_log_events and pushes a live
+ * SSE event to any dashboard subscribers watching the ticket log.
+ *
+ * event_type  – "edit" or "delete"
+ * new_content – NULL for deletions
+ */
+static void ticket_log_event_push(int ticket_id,
+                                   const char *event_type,
+                                   int msg_index,
+                                   const char *author_name,
+                                   const char *old_content,
+                                   const char *new_content) {
+    if (!g_db) return;
+    sqlite3_int64 now = (sqlite3_int64)time(NULL);
+
+    /* Persist to DB. */
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(g_db->db,
+            "INSERT INTO ticket_log_events"
+            " (ticket_id,event_type,msg_index,author_name,old_content,new_content,occurred_at)"
+            " VALUES (?,?,?,?,?,?,?);",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int (stmt, 1, ticket_id);
+        sqlite3_bind_text(stmt, 2, event_type,  -1, SQLITE_STATIC);
+        sqlite3_bind_int (stmt, 3, msg_index);
+        sqlite3_bind_text(stmt, 4, author_name  ? author_name  : "", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 5, old_content  ? old_content  : "", -1, SQLITE_STATIC);
+        new_content ? sqlite3_bind_text(stmt, 6, new_content, -1, SQLITE_STATIC)
+                    : sqlite3_bind_null(stmt, 6);
+        sqlite3_bind_int64(stmt, 7, now);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+
+    /* Build SSE JSON payload.
+     * We need JSON-safe strings; use a simple hex-escape pass for the
+     * content fields which may contain quotes or backslashes. */
+    static char sse[8192];
+    int p = 0;
+    #define SSE_APPEND(fmt, ...) \
+        p += snprintf(sse + p, (int)sizeof(sse) - p, fmt, ##__VA_ARGS__)
+    #define SSE_STR(val) do { \
+        SSE_APPEND("\""); \
+        if (val) { \
+            for (const char *_c = (val); *_c && p + 4 < (int)sizeof(sse); _c++) { \
+                if (*_c == '"')       { sse[p++]='\\'  ; sse[p++]='"';  } \
+                else if (*_c == '\\') { sse[p++]='\\'  ; sse[p++]='\\'; } \
+                else if (*_c == '\n') { sse[p++]='\\'  ; sse[p++]='n';  } \
+                else                  { sse[p++]=*_c; } \
+            } \
+        } \
+        SSE_APPEND("\""); \
+    } while(0)
+
+    SSE_APPEND("{\"type\":\"ticket_log\",\"ticket_id\":%d,\"event_type\":", ticket_id);
+    SSE_STR(event_type);
+    SSE_APPEND(",\"msg_index\":%d,\"author_name\":", msg_index);
+    SSE_STR(author_name);
+    SSE_APPEND(",\"old_content\":");
+    SSE_STR(old_content);
+    SSE_APPEND(",\"new_content\":");
+    if (new_content) { SSE_STR(new_content); }
+    else              { SSE_APPEND("null"); }
+    SSE_APPEND(",\"occurred_at\":%" PRId64 "}", now);
+    #undef SSE_APPEND
+    #undef SSE_STR
+
+    http_sse_push(sse);
 }
 
 /*
@@ -855,6 +1084,28 @@ static void open_ticket(struct discord *client,
     build_channel_name(real_name, sizeof real_name, t.id, username);
     struct discord_modify_channel_params rename_p = { .name = real_name };
     discord_modify_channel(client, new_channel.id, &rename_p, NULL);
+
+    /* ── Lock send permissions until the ticket is claimed ──
+     *
+     * @everyone in the staff guild can VIEW_CHANNEL so all staff can read,
+     * but SEND_MESSAGES is denied.  The claimant receives an explicit member
+     * overwrite that grants it back (see handle_claim / ticket_channel_set_sender).
+     *
+     * The bot itself is unaffected because it holds ADMINISTRATOR in the staff
+     * guild, which bypasses all channel permission overwrites.
+     *
+     * @everyone role ID == staff guild ID in Discord's permission model.
+     */
+    {
+        struct discord_edit_channel_permissions_params lock = {
+            .allow = DISCORD_PERMISSION_VIEW_CHANNEL,
+            .deny  = DISCORD_PERMISSION_SEND_MESSAGES,
+            .type  = 0,   /* 0 = role overwrite */
+        };
+        discord_edit_channel_permissions(client, new_channel.id,
+                                         staff_guild /* @everyone role ID */,
+                                         &lock);
+    }
     // refresh_channel_topic(new_channel.id, &t);
 
     /* ── Post staff-facing header ──
@@ -924,6 +1175,36 @@ static void open_ticket(struct discord *client,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Permission helpers – claim/unclaim send access
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Grant or revoke SEND_MESSAGES for a specific member in the ticket channel.
+ *
+ * allow=1  → edit overwrite: ALLOW SEND_MESSAGES  (used when claiming)
+ * allow=0  → delete overwrite entirely so the member falls back to the
+ *             @everyone DENY SEND_MESSAGES set at ticket-open time
+ *             (used when transferring a claim to a different staff member)
+ */
+static void ticket_channel_set_sender(struct discord *client,
+                                       u64_snowflake_t channel_id,
+                                       u64_snowflake_t user_id,
+                                       int allow) {
+    if (!channel_id || !user_id) return;
+    if (allow) {
+        struct discord_edit_channel_permissions_params p = {
+            .allow = DISCORD_PERMISSION_SEND_MESSAGES,
+            .deny  = 0,
+            .type  = 1,   /* 1 = member overwrite */
+        };
+        discord_edit_channel_permissions(client, channel_id, user_id, &p);
+    } else {
+        /* Removing the overwrite reverts the member to the role/everyone rules. */
+        discord_delete_channel_permission(client, channel_id, user_id);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * close_ticket  –  shared close logic
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -940,9 +1221,7 @@ static void close_ticket(struct discord *client,
                  "🔒 **Your ticket #%d has been closed.**\n"
                  "**Outcome:** %s%s%s",
                  t->id,
-                 ticket_outcome_string(outcome),
-                 notes ? "\n**Notes:** " : "",
-                 notes ? notes           : "");
+                 ticket_outcome_string(outcome));
         post_to_channel(dm_ch, msg);
     }
 
@@ -955,20 +1234,21 @@ static void close_ticket(struct discord *client,
              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
              t->id,
              interaction_username(event),
-             ticket_outcome_string(outcome),
-             notes ? "\n**Notes:** " : "",
-             notes ? notes           : "");
+             ticket_outcome_string(outcome));
     post_to_channel(t->channel_id, summary);
 
     t->status  = TICKET_STATUS_CLOSED;
     t->outcome = outcome;
-    // refresh_channel_topic(t->channel_id, t);
 
     char log_buf[256];
     snprintf(log_buf, sizeof log_buf,
              "🔒 Ticket #%d closed by **%s** — outcome: %s",
              t->id, interaction_username(event), ticket_outcome_string(outcome));
     log_event(t->guild_id, log_buf);
+
+    /* Delete the channel immediately so it disappears as soon as /ticket close
+     * is invoked, rather than lingering until the next bot restart. */
+    discord_delete_channel(client, t->channel_id, NULL);
 
     reply_ephemeral(client, event, "✅ Ticket closed.");
 }
@@ -993,6 +1273,22 @@ static void handle_open(struct discord *client,
             "❌ Invalid server ID — please provide a numeric Discord server ID.");
         return;
     }
+
+    /* Verify the invoker is actually a member of the target community server.
+     * This prevents tickets being opened for servers the user has never joined. */
+    u64_snowflake_t invoker_id = interaction_user_id(event);
+    if (invoker_id) {
+        struct discord_guild_member member = {0};
+        ORCAcode member_rc = discord_get_guild_member(client, target,
+                                                       invoker_id, &member);
+        discord_guild_member_cleanup(&member);
+        if (member_rc != ORCA_OK) {
+            reply_ephemeral(client, event,
+                "❌ You must be a member of that server to open a ticket for it.");
+            return;
+        }
+    }
+
     open_ticket(client, event, target, subject);
 }
 
@@ -1015,23 +1311,43 @@ static void handle_claim(struct discord *client,
     }
 
     u64_snowflake_t staff_id = interaction_user_id(event);
+
+    if (t.assigned_to == staff_id) {
+        ticket_db_free(&t);
+        reply_ephemeral(client, event, "❌ You have already claimed this ticket.");
+        return;
+    }
+
+    /* ── Transfer: strip the previous claimant's send permission ── */
+    if (t.assigned_to != 0) {
+        ticket_channel_set_sender(client, event->channel_id, t.assigned_to, 0);
+
+        char xfer[192];
+        snprintf(xfer, sizeof xfer,
+                 "🔁 Ticket transferred from previous claimant to **%s**.",
+                 interaction_username(event));
+        post_to_channel(event->channel_id, xfer);
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof msg,
+                 "🙋 **%s** has claimed ticket #%d.",
+                 interaction_username(event), t.id);
+        post_to_channel(event->channel_id, msg);
+    }
+
+    /* ── Persist claim ── */
     ticket_db_update_assigned(g_db, t.id, staff_id);
     ticket_db_update_status(g_db, t.id, TICKET_STATUS_IN_PROGRESS);
 
-    char msg[128];
-    snprintf(msg, sizeof msg,
-             "🙋 **%s** has claimed ticket #%d.",
-             interaction_username(event), t.id);
-    post_to_channel(event->channel_id, msg);
+    /* ── Grant SEND_MESSAGES to the claimant ── */
+    ticket_channel_set_sender(client, event->channel_id, staff_id, 1);
 
-    t.status = TICKET_STATUS_IN_PROGRESS;
-    // refresh_channel_topic(event->channel_id, &t);
-
-    /* Notify user anonymously. */
+    /* ── Notify the user — only now that someone owns the ticket ── */
     u64_snowflake_t dm_ch = dm_map_get_active_dm_channel(t.opener_id);
     if (dm_ch)
         post_to_channel(dm_ch,
-            "👋 A staff member has picked up your ticket and will be with you shortly.");
+            "👋 A staff member has picked up your ticket and will be with you shortly.\n"
+            "You can now send messages and they will be relayed to staff.");
 
     char log_buf[200];
     snprintf(log_buf, sizeof log_buf,
@@ -1040,7 +1356,7 @@ static void handle_claim(struct discord *client,
     log_event(t.guild_id, log_buf);
 
     ticket_db_free(&t);
-    reply_ephemeral(client, event, "✅ You have claimed this ticket.");
+    reply_ephemeral(client, event, "✅ You have claimed this ticket. You can now message the user.");
 }
 
 /* ── /ticket close ── */
@@ -1346,6 +1662,10 @@ void on_ticket_message(struct discord *client,
             dm_map_get_active_ticket_channel(event->author->id);
         if (!ticket_ch) return;   /* Not a tracked ticket DM — ignore. */
 
+        /* Look up the ticket to check claim status. */
+        Ticket user_t = {0};
+        int has_ticket = ticket_db_get_by_channel(g_db, ticket_ch, &user_t);
+
         char fwd[2000];
         snprintf(fwd, sizeof fwd,
                  "**%s:** %s",
@@ -1353,7 +1673,21 @@ void on_ticket_message(struct discord *client,
                  safe);
         post_to_channel(ticket_ch, fwd);
         relay_attachments(ticket_ch, event->attachments);
-        post_to_channel(event->channel_id, "✉️ *Message delivered to staff.*");
+
+        if (has_ticket == 0 && user_t.assigned_to == 0) {
+            /* Ticket exists but is unclaimed — warn the user their message
+             * is visible to staff but no one has taken ownership yet. */
+            discord_create_reaction(client, event->channel_id, event->id,
+                                    0, "⏳");
+            post_to_channel(event->channel_id,
+                "⏳ *Your message has been received. "
+                "A staff member will claim your ticket shortly.*");
+        } else {
+            /* Claimed — standard 📨 acknowledgement. */
+            discord_create_reaction(client, event->channel_id, event->id,
+                                    0, "📨");
+        }
+        ticket_db_free(&user_t);
         return;
     }
 
@@ -1362,28 +1696,202 @@ void on_ticket_message(struct discord *client,
     if (ticket_db_get_by_channel(g_db, event->channel_id, &t) != 0) return;
     if (t.status >= TICKET_STATUS_CLOSED) { ticket_db_free(&t); return; }
 
+    const char *author_name = event->author->username
+                              ? event->author->username : "Staff";
+    u64_snowflake_t author_id = event->author->id;
+
+    /* ── !edit <index> <new text> ── */
+    if (strncmp(event->content, "!edit ", 6) == 0) {
+        discord_delete_message(client, event->channel_id, event->id);
+
+        char *rest = (char *)event->content + 6;
+        int idx = (int)strtol(rest, &rest, 10);
+        while (*rest == ' ') rest++;
+
+        u64_snowflake_t old_msg_id    = 0;
+        u64_snowflake_t old_dm_msg_id = 0;
+        char *old_content   = NULL;
+        char *orig_author   = NULL;
+        if (idx < 1 || staff_msg_get(g_db, t.id, idx,
+                                      &old_msg_id, &old_content, NULL,
+                                      &old_dm_msg_id, &orig_author) != 0) {
+            char err[128];
+            snprintf(err, sizeof err,
+                     "⚠️ No staff message with index **#%d** in this ticket.", idx);
+            post_to_channel(event->channel_id, err);
+            free(old_content);
+            free(orig_author);
+            ticket_db_free(&t);
+            return;
+        }
+
+        /* Strip mentions from the replacement text. */
+        char new_safe[2000] = {0};
+        strip_mentions(rest, new_safe, sizeof new_safe);
+
+        /* Edit the staff-channel message, preserving the [#N] **name:** header. */
+        char indexed[2048];
+        snprintf(indexed, sizeof indexed,
+                 "`[#%d]` **%s:** %s *(edited)*",
+                 idx, orig_author ? orig_author : "Staff", new_safe);
+        struct discord_edit_message_params ep = { .content = indexed };
+        discord_edit_message(g_client, event->channel_id, old_msg_id, &ep, NULL);
+
+        /* Edit the DM message directly — the bot owns it so this works. */
+        u64_snowflake_t dm_ch = dm_map_get_active_dm_channel(t.opener_id);
+        if (dm_ch && old_dm_msg_id) {
+            char anon_new[2000];
+            snprintf(anon_new, sizeof anon_new, "**[Staff]:** %s", new_safe);
+            struct discord_edit_message_params dm_ep = { .content = anon_new };
+            discord_edit_message(g_client, dm_ch, old_dm_msg_id, &dm_ep, NULL);
+        }
+
+        staff_msg_update(g_db, t.id, idx, new_safe);
+
+        ticket_log_event_push(t.id, "edit", idx,
+                              orig_author ? orig_author : "Staff",
+                              old_content, new_safe);
+
+        free(old_content);
+        free(orig_author);
+        ticket_db_free(&t);
+        return;
+    }
+
+    /* ── !del <index> ── */
+    if (strncmp(event->content, "!del ", 5) == 0) {
+        discord_delete_message(client, event->channel_id, event->id);
+
+        int idx = (int)strtol(event->content + 5, NULL, 10);
+        u64_snowflake_t old_msg_id    = 0;
+        u64_snowflake_t old_dm_msg_id = 0;
+        char *old_content  = NULL;
+        char *orig_author  = NULL;
+        if (idx < 1 || staff_msg_get(g_db, t.id, idx,
+                                      &old_msg_id, &old_content, NULL,
+                                      &old_dm_msg_id, &orig_author) != 0) {
+            char err[128];
+            snprintf(err, sizeof err,
+                     "⚠️ No staff message with index **#%d** in this ticket.", idx);
+            post_to_channel(event->channel_id, err);
+            free(old_content);
+            free(orig_author);
+            ticket_db_free(&t);
+            return;
+        }
+
+        /* Delete the staff-channel message. */
+        discord_delete_message(g_client, event->channel_id, old_msg_id);
+
+        /* Delete the DM message directly. */
+        u64_snowflake_t dm_ch = dm_map_get_active_dm_channel(t.opener_id);
+        if (dm_ch && old_dm_msg_id)
+            discord_delete_message(g_client, dm_ch, old_dm_msg_id);
+
+        ticket_log_event_push(t.id, "delete", idx,
+                              orig_author ? orig_author : "Staff",
+                              old_content, NULL);
+
+        staff_msg_delete(g_db, t.id, idx);
+        free(old_content);
+        free(orig_author);
+        ticket_db_free(&t);
+        return;
+    }
+
+    /* ── Any other message starting with '!' is a staff-internal note ──
+     * Leave it visible in the ticket channel; just don't relay it to the user. */
+    if (event->content && event->content[0] == '!') {
+        ticket_db_free(&t);
+        return;
+    }
+
     /*
-     * Delete the original so the staff member's username/avatar is not
-     * visible anywhere.  Requires MANAGE_MESSAGES in the staff guild.
+     * ── Claim gate ──
+     *
+     * Only the assigned staff member may relay messages to the user.
+     * Discord's channel permission overwrite (set at claim time) already
+     * prevents ordinary users from sending here, but someone with
+     * ADMINISTRATOR in the staff guild can bypass that — we catch it
+     * at the bot level too.
+     */
+    if (t.assigned_to == 0) {
+        post_to_channel(event->channel_id,
+            "⚠️ This ticket has not been claimed yet. "
+            "Use `/ticket claim` to take ownership before messaging the user.");
+        ticket_db_free(&t);
+        return;
+    }
+    if (event->author->id != t.assigned_to) {
+        char err[192];
+        snprintf(err, sizeof err,
+                 "⚠️ Only the assigned staff member can relay messages to the user. "
+                 "Use `/ticket claim` to take over this ticket first.");
+        post_to_channel(event->channel_id, err);
+        ticket_db_free(&t);
+        return;
+    }
+
+    /*
+     * Normal staff reply.
+     *
+     * Staff-side:  show the real username + sequential index so staff know
+     *              who said what and can use !edit / !del.
+     * User-side:   always anonymous "[Staff]: …".
      */
     discord_delete_message(client, event->channel_id, event->id);
 
-    /* Re-post anonymously for the channel's own audit trail. */
+    /* Build the anonymous version for the user DM. */
     char anon[2000];
     snprintf(anon, sizeof anon, "**[Staff]:** %s", safe);
-    post_to_channel(event->channel_id, anon);
-    relay_attachments(event->channel_id, event->attachments);
 
-    /* Forward to the user's DM. */
-    u64_snowflake_t dm_ch = dm_map_get_active_dm_channel(t.opener_id);
-    if (dm_ch) {
-        post_to_channel(dm_ch, anon);
-        relay_attachments(dm_ch, event->attachments);
-    } else {
-        post_to_channel(event->channel_id,
-            "⚠️ Could not deliver your message — the user's DM channel is unavailable. "
-            "They may have disabled DMs.");
+    /* Determine the next index before posting, so we can embed it. */
+    /* We post first (to get the message_id), then record in DB.
+     * Use a two-step approach: post → capture message_id → insert row. */
+
+    /* Staff-visible post includes the real name and the index placeholder.
+     * We don't know the index until after posting, so post, then immediately
+     * edit with the correct index header. */
+    char staff_post[2048];
+    snprintf(staff_post, sizeof staff_post,
+             "**%s:** %s", author_name, safe);
+
+    struct discord_create_message_params mp = { .content = staff_post };
+    struct discord_message posted_msg = {0};
+    if (discord_create_message(g_client, event->channel_id,
+                               &mp, &posted_msg) == ORCA_OK && posted_msg.id) {
+        /* Forward anonymously to the user's DM first so we can capture the
+         * DM message ID and store it alongside the staff-channel message ID. */
+        u64_snowflake_t dm_ch = dm_map_get_active_dm_channel(t.opener_id);
+        u64_snowflake_t dm_msg_id = 0;
+        if (dm_ch) {
+            struct discord_create_message_params dm_params = { .content = anon };
+            struct discord_message dm_posted = {0};
+            if (discord_create_message(g_client, dm_ch,
+                                       &dm_params, &dm_posted) == ORCA_OK)
+                dm_msg_id = dm_posted.id;
+            discord_message_cleanup(&dm_posted);
+            relay_attachments(dm_ch, event->attachments);
+        } else {
+            post_to_channel(event->channel_id,
+                "⚠️ Could not deliver your message — the user's DM channel is unavailable. "
+                "They may have disabled DMs.");
+        }
+
+        int idx = staff_msg_insert(g_db, t.id, posted_msg.id, dm_msg_id,
+                                   author_id, author_name, safe);
+        if (idx > 0) {
+            /* Edit to prepend the index badge so staff can reference it. */
+            char indexed[2048];
+            snprintf(indexed, sizeof indexed,
+                     "`[#%d]` **%s:** %s", idx, author_name, safe);
+            struct discord_edit_message_params ep = { .content = indexed };
+            discord_edit_message(g_client, event->channel_id,
+                                 posted_msg.id, &ep, NULL);
+        }
     }
+    discord_message_cleanup(&posted_msg);
+    relay_attachments(event->channel_id, event->attachments);
 
     ticket_db_free(&t);
 }
@@ -1437,13 +1945,13 @@ void register_ticket_commands(struct discord *client,
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "outcome",
         .description = "1=Resolved 2=Duplicate 3=Invalid 4=NoResponse 5=Escalated 6=Other",
-        .required    = false,
+        .required    = true,
     };
     static struct discord_application_command_option close_notes = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "notes",
         .description = "Internal closing notes (never shown to the user)",
-        .required    = false,
+        .required    = true,
     };
     static struct discord_application_command_option *close_opts[] = {
         &close_outcome, &close_notes, NULL
@@ -1539,25 +2047,25 @@ void register_ticket_commands(struct discord *client,
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "mainserver",
         .description = "Snowflake ID of the community server this staff server handles",
-        .required    = false,
+        .required    = true,
     };
     static struct discord_application_command_option cfg_staffserver = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "staffserver",
         .description = "Snowflake ID of this staff server (where ticket channels are created)",
-        .required    = false,
+        .required    = true,
     };
     static struct discord_application_command_option cfg_category = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "category",
         .description = "ID of the category channel where ticket channels will be created",
-        .required    = false,
+        .required    = true,
     };
     static struct discord_application_command_option cfg_logchannel = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "logchannel",
         .description = "ID of the staff-only channel where ticket events are logged",
-        .required    = false,
+        .required    = true,
     };
     static struct discord_application_command_option *cfg_opts[] = {
         &cfg_mainserver, &cfg_staffserver, &cfg_category, &cfg_logchannel, NULL

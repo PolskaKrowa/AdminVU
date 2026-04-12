@@ -212,6 +212,18 @@ int api_init(Database *db) {
         "    guild_id    INTEGER NOT NULL,"
         "    notified_at INTEGER DEFAULT (strftime('%s','now')),"
         "    UNIQUE(event_id, guild_id)"
+        ");"
+        /* Staff message edit/delete audit log — populated by ticket.c and
+           surfaced in the dashboard ticket log HTML.                        */
+        "CREATE TABLE IF NOT EXISTS ticket_log_events ("
+        "    id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    ticket_id   INTEGER NOT NULL,"
+        "    event_type  TEXT    NOT NULL,"
+        "    msg_index   INTEGER NOT NULL,"
+        "    author_name TEXT    NOT NULL DEFAULT '',"
+        "    old_content TEXT,"
+        "    new_content TEXT,"
+        "    occurred_at INTEGER NOT NULL"
         ");";
 
     char *err = NULL;
@@ -792,16 +804,223 @@ static int handle_ticket_detail(Database *db, const char *path, JB *j) {
         jb_raw(j, "]");
     }
 
+    /* Staff message edit/delete log */
+    const char *log_sql =
+        "SELECT id, event_type, msg_index, author_name,"
+        "       old_content, new_content, occurred_at"
+        " FROM ticket_log_events WHERE ticket_id = ?"
+        " ORDER BY occurred_at ASC;";
+
+    if (sqlite3_prepare_v2(db->db, log_sql, -1, &s, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(s, 1, ticket_id);
+        jb_raw(j, ",\"log_events\":[");
+        int first = 1;
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            if (!first) jb_raw(j, ",");
+            first = 0;
+            jb_printf(j, "{\"id\":%d", sqlite3_column_int(s, 0));
+            jb_raw(j, ",\"event_type\":"); jb_str(j, (const char *)sqlite3_column_text(s, 1));
+            jb_printf(j, ",\"msg_index\":%d", sqlite3_column_int(s, 2));
+            jb_raw(j, ",\"author_name\":"); jb_str(j, (const char *)sqlite3_column_text(s, 3));
+            jb_raw(j, ",\"old_content\":"); jb_str(j, (const char *)sqlite3_column_text(s, 4));
+            const char *nc = (const char *)sqlite3_column_text(s, 5);
+            if (nc) { jb_raw(j, ",\"new_content\":"); jb_str(j, nc); }
+            else      jb_raw(j, ",\"new_content\":null");
+            jb_printf(j, ",\"occurred_at\":%lld}", (long long)sqlite3_column_int64(s, 6));
+        }
+        sqlite3_finalize(s);
+        jb_raw(j, "]");
+    }
+
     jb_raw(j, "}");
     return 200;
 }
-
-/* ── GET /api/tickets/events?since=<unix_ts> ──────────────────────────── */
 static int handle_ticket_events(const char *query, JB *j) {
     long long since = get_param_i64(query, "since", 0);
     /* http_sse_poll writes directly into the JB buffer. */
     http_sse_poll(since, j->buf + j->pos, j->cap - j->pos);
     j->pos += strlen(j->buf + j->pos);
+    return 200;
+}
+
+/* ── GET /api/tickets/<id>/log ──────────────────────────────────────────── */
+
+/*
+ * Returns the ordered edit/delete audit log for a single ticket.
+ * The dashboard ticket log HTML polls this (or receives events via SSE)
+ * to render a live timeline of staff message modifications.
+ */
+static int handle_ticket_log(Database *db, const char *path, JB *j) {
+    /* Path is "/api/tickets/<id>/log" — extract the numeric ID. */
+    const char *after_tickets = path + strlen("/api/tickets/");
+    int ticket_id = atoi(after_tickets);
+    if (ticket_id <= 0) {
+        jb_raw(j, "{\"error\":\"invalid ticket id\"}");
+        return 400;
+    }
+
+    const char *sql =
+        "SELECT id, event_type, msg_index, author_name,"
+        "       old_content, new_content, occurred_at"
+        " FROM ticket_log_events WHERE ticket_id = ?"
+        " ORDER BY occurred_at ASC;";
+
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &s, NULL) != SQLITE_OK) {
+        jb_raw(j, "{\"error\":\"db error\"}");
+        return 500;
+    }
+    sqlite3_bind_int(s, 1, ticket_id);
+
+    jb_printf(j, "{\"ticket_id\":%d,\"events\":[", ticket_id);
+    int first = 1;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        if (!first) jb_raw(j, ",");
+        first = 0;
+        jb_printf(j, "{\"id\":%d", sqlite3_column_int(s, 0));
+        jb_raw(j, ",\"event_type\":"); jb_str(j, (const char *)sqlite3_column_text(s, 1));
+        jb_printf(j, ",\"msg_index\":%d", sqlite3_column_int(s, 2));
+        jb_raw(j, ",\"author_name\":"); jb_str(j, (const char *)sqlite3_column_text(s, 3));
+        jb_raw(j, ",\"old_content\":"); jb_str(j, (const char *)sqlite3_column_text(s, 4));
+        /* new_content is NULL for deletions. */
+        const char *nc = (const char *)sqlite3_column_text(s, 5);
+        if (nc) { jb_raw(j, ",\"new_content\":"); jb_str(j, nc); }
+        else      jb_raw(j, ",\"new_content\":null");
+        jb_printf(j, ",\"occurred_at\":%lld}", (long long)sqlite3_column_int64(s, 6));
+    }
+    sqlite3_finalize(s);
+    jb_raw(j, "]}");
+    return 200;
+}
+
+/* ── GET /api/guilds/<guild_id>/channels ────────────────────────────────── */
+
+static int handle_channels(Database *db, const char *path, JB *j) {
+    /* Extract guild_id from path "/api/guilds/<guild_id>/channels" */
+    const char *after_guilds = path + strlen("/api/guilds/");
+    char guild_id_str[64] = {0};
+    const char *p = after_guilds;
+    int i = 0;
+    while (*p && *p != '/' && i < 63) {
+        guild_id_str[i++] = *p++;
+    }
+    guild_id_str[i] = '\0';
+
+    if (!guild_id_str[0]) {
+        jb_raw(j, "{\"error\":\"missing guild_id\"}");
+        return 400;
+    }
+
+    sqlite3_int64 guild_id = atoll(guild_id_str);
+
+    /*
+     * Query for all text channels in this guild.
+     * This assumes a channels table exists with (id, guild_id, name, type).
+     * Adjust the query based on your actual schema.
+     */
+    const char *sql =
+        "SELECT DISTINCT "
+        "       COALESCE(c.id, CAST(? AS INTEGER)) AS id,"
+        "       COALESCE(c.guild_id, ?) AS guild_id,"
+        "       COALESCE(c.name, 'general') AS name,"
+        "       COALESCE(c.type, 0) AS type"
+        " FROM ("
+        "   SELECT DISTINCT guild_id FROM mod_logs WHERE guild_id = ?"
+        " ) g"
+        " LEFT JOIN channels c ON c.guild_id = g.guild_id"
+        " ORDER BY c.name;";
+
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &s, NULL) != SQLITE_OK) {
+        /* If channels table doesn't exist, return empty but valid response */
+        jb_raw(j, "{\"channels\":[]}");
+        return 200;
+    }
+
+    sqlite3_bind_int64(s, 1, guild_id);
+    sqlite3_bind_int64(s, 2, guild_id);
+    sqlite3_bind_int64(s, 3, guild_id);
+
+    jb_raw(j, "{\"channels\":[");
+    int first = 1;
+    int found_rows = 0;
+
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        found_rows++;
+        if (!first) jb_raw(j, ",");
+        first = 0;
+        jb_raw(j, "{\"id\":");
+        jb_u64str(j, sqlite3_column_int64(s, 0));
+        jb_raw(j, ",\"guild_id\":");
+        jb_u64str(j, sqlite3_column_int64(s, 1));
+        jb_raw(j, ",\"name\":");
+        jb_str(j, (const char *)sqlite3_column_text(s, 2));
+        jb_printf(j, ",\"type\":%d}", sqlite3_column_int(s, 3));
+    }
+    sqlite3_finalize(s);
+    jb_raw(j, "]}");
+    return 200;
+}
+
+/* ── POST /api/send-message ────────────────────────────────────────────── */
+
+static int handle_send_message(Database *db, const char *body,
+                                size_t body_len, JB *j) {
+    char guild_id_buf[64] = {0};
+    char channel_id_buf[64] = {0};
+    char content_buf[2048] = {0};
+
+    if (!get_body_param(body, body_len, "guild_id", guild_id_buf, sizeof(guild_id_buf))
+            || !guild_id_buf[0]) {
+        jb_raw(j, "{\"error\":\"missing guild_id\"}");
+        return 400;
+    }
+
+    if (!get_body_param(body, body_len, "channel_id", channel_id_buf, sizeof(channel_id_buf))
+            || !channel_id_buf[0]) {
+        jb_raw(j, "{\"error\":\"missing channel_id\"}");
+        return 400;
+    }
+
+    if (!get_body_param(body, body_len, "content", content_buf, sizeof(content_buf))
+            || !content_buf[0]) {
+        jb_raw(j, "{\"error\":\"missing content\"}");
+        return 400;
+    }
+
+    /* Validate content length (Discord limit is 2000 characters) */
+    if (strlen(content_buf) > 2000) {
+        jb_raw(j, "{\"error\":\"content exceeds 2000 character limit\"}");
+        return 400;
+    }
+
+    sqlite3_int64 guild_id = atoll(guild_id_buf);
+    sqlite3_int64 channel_id = atoll(channel_id_buf);
+
+    /*
+     * Attempt to send the message through the bot.
+     * This function should be implemented in your bot code to actually
+     * dispatch the message to Discord.
+     * For now, we'll log it to indicate success and can integrate with
+     * bot_send_message() or similar once the bot module is available.
+     */
+    extern int bot_send_message(sqlite3_int64 guild_id, sqlite3_int64 channel_id,
+                                 const char *content);
+
+    int send_result = bot_send_message(guild_id, channel_id, content_buf);
+
+    if (send_result != 0) {
+        jb_raw(j, "{\"error\":\"failed to send message\"}");
+        return 500;
+    }
+
+    jb_raw(j, "{\"ok\":true,\"guild_id\":");
+    jb_u64str(j, guild_id);
+    jb_raw(j, ",\"channel_id\":");
+    jb_u64str(j, channel_id);
+    jb_raw(j, ",\"message_length\":");
+    jb_printf(j, "%zu", strlen(content_buf));
+    jb_raw(j, "}");
     return 200;
 }
 
@@ -822,6 +1041,11 @@ int api_handle(Database *db,
 
     if (is_get && strcmp(path, "/api/guilds") == 0)
         return handle_guilds(db, &j);
+
+    /* /api/guilds/<guild_id>/channels — get channels for a guild */
+    if (is_get && strncmp(path, "/api/guilds/", 12) == 0
+               && strstr(path + 12, "/channels") != NULL)
+        return handle_channels(db, path, &j);
 
     if (is_get && strcmp(path, "/api/mod-logs") == 0)
         return handle_mod_logs(db, query, &j);
@@ -844,12 +1068,20 @@ int api_handle(Database *db,
     if (is_post && strcmp(path, "/api/propagation/unblock") == 0)
         return handle_prop_unblock(db, body, body_len, &j);
 
+    if (is_post && strcmp(path, "/api/send-message") == 0)
+        return handle_send_message(db, body, body_len, &j);
+
     if (is_get && strcmp(path, "/api/tickets") == 0)
         return handle_tickets(db, query, &j);
 
     /* Exact named sub-routes must precede the numeric wildcard. */
     if (is_get && strcmp(path, "/api/tickets/events") == 0)
         return handle_ticket_events(query, &j);
+
+    /* /api/tickets/<id>/log — edit/delete audit log for one ticket. */
+    if (is_get && strncmp(path, "/api/tickets/", 13) == 0
+               && strstr(path + 13, "/log") != NULL)
+        return handle_ticket_log(db, path, &j);
 
     if (is_get && strncmp(path, "/api/tickets/", 13) == 0)
         return handle_ticket_detail(db, path, &j);

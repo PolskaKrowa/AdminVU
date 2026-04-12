@@ -9,6 +9,7 @@
  * Routes:
  *   GET  /api/status
  *   GET  /api/guilds
+ *   GET  /api/guilds/<guild_id>/channels
  *   GET  /api/mod-logs          ?guild_id=X&action=all&limit=50&offset=0
  *   GET  /api/warnings          ?guild_id=X&user_id=Y
  *   GET  /api/propagation/guilds
@@ -16,8 +17,10 @@
  *   GET  /api/propagation/blocked
  *   POST /api/propagation/block   body: guild_id=X&reason=Y
  *   POST /api/propagation/unblock body: guild_id=X
+ *   POST /api/send-message        body: guild_id=X&channel_id=Y&content=Z
  *   GET  /api/tickets           ?guild_id=X&status=all
  *   GET  /api/tickets/<id>
+ *   GET  /api/tickets/<id>/log
  */
 
 #include "database.h"

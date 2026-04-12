@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Messaging — Bot Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="scanline"></div>
+
+    <header class="site-header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-bracket">[</span>
+                <span class="logo-text">AdminVU</span>
+                <span class="logo-bracket">]</span>
+            </div>
+            <nav class="site-nav">
+                <a href="index.html"       class="nav-link">Dashboard</a>
+                <a href="moderation.html"  class="nav-link">Moderation</a>
+                <a href="propagation.html" class="nav-link">Propagation</a>
+                <a href="messaging.html"   class="nav-link active">Messaging</a>
+                <a href="tickets.html"     class="nav-link">Tickets</a>
+            </nav>
+            <div class="status-badge">
+                <span class="status-dot" id="status-dot"></span>
+                <span class="status-label" id="status-label">connecting…</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-content">
+
+        <section class="hero">
+            <p class="hero-eyebrow">// messaging</p>
+            <h1 class="hero-title">Send Message</h1>
+            <p class="hero-sub">Broadcast messages to Discord channels across your servers.</p>
+        </section>
+
+        <div class="message-form-container">
+            <div class="message-form">
+                <div class="form-group">
+                    <label class="form-label">Server</label>
+                    <select class="form-select" id="guild-select">
+                        <option value="">Choose a server…</option>
+                    </select>
+                    <div class="form-hint">Select the server containing the channel</div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Channel</label>
+                    <select class="form-select" id="channel-select" disabled>
+                        <option value="">Choose a channel…</option>
+                    </select>
+                    <div class="form-hint">Available channels in the selected server</div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Message</label>
+                    <textarea class="form-textarea" id="message-input" 
+                              placeholder="Type your message here…"
+                              rows="8"></textarea>
+                    <div class="form-hint">
+                        <span id="char-count">0</span> / 2000 characters
+                    </div>
+                </div>
+
+                <div class="form-actions">
+                    <button class="btn-primary" id="send-btn">
+                        <span class="btn-icon">→</span> Send Message
+                    </button>
+                    <button class="btn-secondary" id="clear-btn">Clear</button>
+                </div>
+            </div>
+
+            <div class="message-preview">
+                <div class="preview-header">
+                    <span class="preview-title">// message preview</span>
+                </div>
+                <div class="preview-body" id="preview-body">
+                    <div class="preview-placeholder">Your message will appear here…</div>
+                </div>
+            </div>
+        </div>
+
+        <section class="log-section">
+            <div class="log-header">
+                <span class="log-title">// message history</span>
+                <button class="log-clear-btn" id="log-clear">clear</button>
+            </div>
+            <div class="log-body" id="log-body">
+                <div class="log-line log-info">
+                    <span class="log-time" id="init-time"></span>
+                    <span class="log-msg">Ready to send messages…</span>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <footer class="site-footer">
+        <span>running on <span class="mono">127.0.0.1:8080</span></span>
+        <span class="footer-sep">&middot;</span>
+        <span id="footer-time" class="mono"></span>
+    </footer>
+
+    <script src="script.js"></script>
+    <script>
+    /* ── Messaging Page Logic ──────────────────────────────────────────────── */
+
+    let currentGuild = null;
+    let guilds = [];
+    let channels = {};
+
+    /**
+     * Load list of guilds where bot is present
+     */
+    async function loadGuilds() {
+        const data = await apiGet('/api/guilds');
+        if (!data || !data.guilds) {
+            appendLog('Failed to load guilds', LogLevel.ERROR);
+            return;
+        }
+        
+        guilds = data.guilds;
+        const select = qs('#guild-select');
+        if (!select) return;
+        
+        select.innerHTML = '<option value="">Choose a server…</option>';
+        guilds.forEach(guild => {
+            const opt = document.createElement('option');
+            opt.value = guild.id;
+            opt.textContent = guild.name;
+            select.appendChild(opt);
+        });
+        
+        appendLog(`Loaded ${guilds.length} servers`, LogLevel.OK);
+    }
+
+    /**
+     * Load channels for a specific guild
+     */
+    async function loadChannels(guildId) {
+        if (!guildId) {
+            qs('#channel-select').disabled = true;
+            qs('#channel-select').innerHTML = '<option value="">Choose a channel…</option>';
+            return;
+        }
+
+        const data = await apiGet(`/api/guilds/${guildId}/channels`);
+        if (!data || !data.channels) {
+            appendLog(`Failed to load channels for guild ${guildId}`, LogLevel.ERROR);
+            return;
+        }
+        
+        channels[guildId] = data.channels;
+        const select = qs('#channel-select');
+        select.innerHTML = '<option value="">Choose a channel…</option>';
+        
+        data.channels.forEach(channel => {
+            const opt = document.createElement('option');
+            opt.value = channel.id;
+            opt.textContent = `# ${channel.name}`;
+            select.appendChild(opt);
+        });
+        
+        select.disabled = false;
+        appendLog(`Loaded ${data.channels.length} channels`, LogLevel.OK);
+    }
+
+    /**
+     * Update message preview
+     */
+    function updatePreview() {
+        const msg = qs('#message-input').value;
+        const preview = qs('#preview-body');
+        const charCount = qs('#char-count');
+        
+        charCount.textContent = msg.length;
+        
+        if (msg.length === 0) {
+            preview.innerHTML = '<div class="preview-placeholder">Your message will appear here…</div>';
+        } else {
+            preview.innerHTML = `<div class="preview-message">${esc(msg).replace(/\n/g, '<br>')}</div>`;
+        }
+    }
+
+    /**
+     * Send the message to the selected channel
+     */
+    async function sendMessage() {
+        const guildId = qs('#guild-select').value;
+        const channelId = qs('#channel-select').value;
+        const content = qs('#message-input').value.trim();
+        
+        if (!guildId || !channelId || !content) {
+            appendLog('Please fill in all fields', LogLevel.WARN);
+            return;
+        }
+        
+        if (content.length > 2000) {
+            appendLog('Message exceeds 2000 character limit', LogLevel.WARN);
+            return;
+        }
+
+        const btn = qs('#send-btn');
+        btn.disabled = true;
+        btn.textContent = '⋯ Sending…';
+
+        const body = new URLSearchParams({
+            guild_id: guildId,
+            channel_id: channelId,
+            content: content
+        });
+
+        const result = await apiPost('/api/send-message', body.toString());
+        
+        btn.disabled = false;
+        btn.innerHTML = '<span class="btn-icon">→</span> Send Message';
+
+        if (!result) {
+            appendLog('Failed to send message', LogLevel.ERROR);
+            return;
+        }
+
+        if (result.error) {
+            appendLog(`Error: ${result.error}`, LogLevel.ERROR);
+            return;
+        }
+
+        // Success
+        qs('#message-input').value = '';
+        updatePreview();
+        appendLog(`Message sent to channel ${channelId}`, LogLevel.OK);
+    }
+
+    /* ── Event Listeners ────────────────────────────────────────────────────── */
+
+    qs('#guild-select').addEventListener('change', (e) => {
+        currentGuild = e.target.value;
+        loadChannels(currentGuild);
+    });
+
+    qs('#message-input').addEventListener('input', updatePreview);
+
+    qs('#send-btn').addEventListener('click', sendMessage);
+
+    qs('#clear-btn').addEventListener('click', () => {
+        qs('#message-input').value = '';
+        updatePreview();
+        appendLog('Cleared message', LogLevel.INFO);
+    });
+
+    qs('#log-clear').addEventListener('click', () => {
+        const body = qs('#log-body');
+        if (body) body.innerHTML = '';
+        appendLog('Log cleared', LogLevel.INFO);
+    });
+
+    /* ── Init ──────────────────────────────────────────────────────────────── */
+
+    (function stampInitTime() {
+        const el = qs('#init-time');
+        if (el) el.textContent = fmt();
+    })();
+
+    document.addEventListener('DOMContentLoaded', () => {
+        startFooterClock();
+        loadGuilds();
+        setStatus('online');
+    });
+
+    </script>
+</body>
+</html>
