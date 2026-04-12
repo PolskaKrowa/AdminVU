@@ -22,7 +22,6 @@
 [![Build System](https://img.shields.io/badge/build-CMake-red?style=flat-square&logo=cmake)](#)
 [![Database](https://img.shields.io/badge/database-SQLite3-lightgrey?style=flat-square&logo=sqlite)](#)
 [![Library](https://img.shields.io/badge/lib-Orca%2FDiscord-5865F2?style=flat-square&logo=discord)](#)
-[![Dashboard](https://img.shields.io/badge/dashboard-AdminV-UI-teal?style=flat-square)](#dashboard)
 [![Status](https://img.shields.io/badge/status-active%20development-yellow?style=flat-square)](#known-issues--todo)
 
 <br/>
