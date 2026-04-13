@@ -485,25 +485,11 @@ This serves both as a demonstration of C ↔ ASM interop and as a moderately fas
 ---
 
 > [!CAUTION]
-> ### 🐛 Bug — Ticket Close Delay
-> **Tickets take 5–10 minutes to properly close.**
-> The `TICKET_STATUS_CLOSED` state is written immediately to the DB, but Discord channel state and DM relay teardown appear to lag. Root cause under investigation — likely a race between the status write and the next message relay tick.
-
----
-
-> [!CAUTION]
 > ### 🐛 Bug — Dashboard Propagation Sync
 > **The Propagation dashboard page does not properly sync with live bot data.**
 > - Alert events are not displaying correctly in the events table.
 > - Block/unblock actions via the dashboard UI are accepted by the API but the bot does not pick up the change without a restart.
 > Needs a polling mechanism or a shared-state refresh path between `api.c` and `propagation.c`.
-
----
-
-> [!CAUTION]
-> ### 🐛 Bug — Ticket Server Membership Check
-> **The ticket system currently allows users to open tickets for servers they have never been in.**
-> The `/ticket open server:<id>` command does not validate that the invoking user is actually a member of `server`. A `discord_get_guild_member()` call must be added in `open_ticket()` before channel creation.
 
 ---
 
