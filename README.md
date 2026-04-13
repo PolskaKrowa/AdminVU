@@ -102,6 +102,7 @@ discord_bot/
 ├── src/web/              ← AdminV-UI dashboard (HTML + CSS + JS)
 │   ├── index.html
 │   ├── moderation.html
+│   ├── messaging.html
 │   ├── propagation.html
 │   ├── tickets.html
 │   ├── style.css
@@ -547,6 +548,7 @@ discord_bot/
 │   └── web/                      # AdminV-UI dashboard
 │       ├── index.html
 │       ├── moderation.html
+│       ├── messaging.html
 │       ├── propagation.html
 │       ├── tickets.html
 │       ├── style.css
