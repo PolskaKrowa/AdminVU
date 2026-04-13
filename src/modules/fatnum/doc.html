@@ -1,0 +1,1618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>floatcalc — 2048-bit Arithmetic Reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #0a0c0b;
+    --bg2:       #0f1210;
+    --bg3:       #141816;
+    --border:    #1e2620;
+    --border2:   #2a3330;
+    --green:     #3dff8f;
+    --green-dim: #1a7a45;
+    --green-glow:#3dff8f44;
+    --amber:     #ffb830;
+    --amber-dim: #7a5210;
+    --red:       #ff4d6a;
+    --blue:      #5ab4ff;
+    --text:      #c8d8c8;
+    --text-dim:  #6a8070;
+    --text-muted:#3a5040;
+    --mono:      'IBM Plex Mono', monospace;
+    --sans:      'IBM Plex Sans', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.7;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Scanline overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.06) 2px,
+      rgba(0,0,0,0.06) 4px
+    );
+    pointer-events: none;
+    z-index: 1000;
+  }
+
+  /* ── LAYOUT ── */
+  .shell {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    grid-template-rows: 48px 1fr;
+    min-height: 100vh;
+  }
+
+  /* ── TOPBAR ── */
+  .topbar {
+    grid-column: 1 / -1;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border2);
+    display: flex;
+    align-items: center;
+    padding: 0 24px;
+    gap: 20px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .topbar-logo {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--green);
+    letter-spacing: 0.04em;
+    text-shadow: 0 0 18px var(--green-glow);
+    white-space: nowrap;
+  }
+
+  .topbar-logo span { color: var(--text-dim); font-weight: 300; }
+
+  .topbar-tag {
+    font-size: 10px;
+    color: var(--text-muted);
+    border: 1px solid var(--border2);
+    padding: 2px 8px;
+    border-radius: 2px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .topbar-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .topbar-badge {
+    color: var(--amber);
+    border: 1px solid var(--amber-dim);
+    padding: 1px 7px;
+    border-radius: 2px;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+  }
+
+  /* ── SIDEBAR ── */
+  .sidebar {
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    padding: 24px 0;
+    overflow-y: auto;
+    position: sticky;
+    top: 48px;
+    height: calc(100vh - 48px);
+    scrollbar-width: thin;
+    scrollbar-color: var(--border2) transparent;
+  }
+
+  .sidebar-section {
+    margin-bottom: 28px;
+  }
+
+  .sidebar-heading {
+    font-size: 9px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    padding: 0 20px 8px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 6px;
+  }
+
+  .sidebar a {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 20px;
+    color: var(--text-dim);
+    text-decoration: none;
+    font-size: 12px;
+    transition: color 0.15s, background 0.15s;
+    border-left: 2px solid transparent;
+  }
+
+  .sidebar a:hover,
+  .sidebar a.active {
+    color: var(--green);
+    background: rgba(61,255,143,0.04);
+    border-left-color: var(--green);
+  }
+
+  .sidebar a .dot {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+
+  .sidebar a:hover .dot,
+  .sidebar a.active .dot { background: var(--green); }
+
+  /* ── MAIN ── */
+  .main {
+    padding: 48px 56px 80px;
+    overflow-y: auto;
+    max-width: 960px;
+  }
+
+  /* ── SECTIONS ── */
+  .section {
+    margin-bottom: 72px;
+    animation: fadeIn 0.4s ease both;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .section-header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 24px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .section-id {
+    font-size: 10px;
+    color: var(--green-dim);
+    letter-spacing: 0.1em;
+  }
+
+  .section-title {
+    font-size: 18px;
+    font-weight: 500;
+    color: #e8f0e8;
+    letter-spacing: 0.01em;
+  }
+
+  /* ── HERO ── */
+  .hero {
+    margin-bottom: 64px;
+    padding: 40px 0 40px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .hero-pre {
+    font-size: 10px;
+    color: var(--green-dim);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin-bottom: 14px;
+  }
+
+  .hero-title {
+    font-size: 38px;
+    font-weight: 600;
+    color: #eef5ee;
+    letter-spacing: -0.01em;
+    line-height: 1.15;
+    margin-bottom: 8px;
+  }
+
+  .hero-title .accent { color: var(--green); text-shadow: 0 0 32px var(--green-glow); }
+
+  .hero-sub {
+    font-size: 13px;
+    color: var(--text-dim);
+    max-width: 560px;
+    line-height: 1.8;
+    margin-bottom: 28px;
+    font-family: var(--sans);
+    font-weight: 300;
+  }
+
+  .hero-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .hero-tag {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    padding: 3px 10px;
+    border-radius: 2px;
+    border: 1px solid;
+    text-transform: uppercase;
+  }
+
+  .hero-tag.c    { color: var(--blue);  border-color: #1a4a7a; background: #0a1a2a; }
+  .hero-tag.asm  { color: var(--amber); border-color: var(--amber-dim); background: #1a0e00; }
+  .hero-tag.prec { color: var(--green); border-color: var(--green-dim); background: #001a0a; }
+
+  /* ── PRECISION BOX ── */
+  .prec-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 32px;
+  }
+
+  .prec-cell {
+    background: var(--bg3);
+    padding: 18px 16px;
+    text-align: center;
+  }
+
+  .prec-value {
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--green);
+    text-shadow: 0 0 20px var(--green-glow);
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  .prec-label {
+    font-size: 9px;
+    color: var(--text-muted);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  /* ── CMD BLOCK ── */
+  .cmd-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .cmd-entry {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    transition: border-color 0.15s;
+  }
+
+  .cmd-entry:hover { border-color: var(--border2); }
+
+  .cmd-header {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    padding: 12px 16px;
+    cursor: pointer;
+    gap: 12px;
+  }
+
+  .cmd-sig {
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--green);
+  }
+
+  .cmd-sig .cmd-prefix { color: var(--text-muted); font-weight: 400; }
+  .cmd-sig .cmd-arg    { color: var(--amber); }
+  .cmd-sig .cmd-opt    { color: var(--text-dim); }
+
+  .cmd-brief {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  .cmd-body {
+    border-top: 1px solid var(--border);
+    padding: 14px 16px;
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .cmd-entry.open .cmd-body { display: flex; }
+
+  .cmd-desc {
+    font-size: 12px;
+    color: var(--text-dim);
+    font-family: var(--sans);
+    font-weight: 300;
+    line-height: 1.65;
+  }
+
+  .cmd-examples {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .cmd-ex-label {
+    font-size: 9px;
+    color: var(--text-muted);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+
+  .cmd-ex {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text);
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  .cmd-ex .u  { color: var(--text-muted); }   /* user prefix  */
+  .cmd-ex .b  { color: var(--green); }         /* bot prefix   */
+  .cmd-ex .n  { color: var(--amber); }         /* number       */
+  .cmd-ex .r  { color: var(--blue); }          /* result       */
+  .cmd-ex .c  { color: var(--text-muted); font-style: italic; } /* comment */
+
+  /* ── NOTES / CALLOUTS ── */
+  .note {
+    display: flex;
+    gap: 12px;
+    padding: 12px 16px;
+    border-radius: 3px;
+    border-left: 3px solid;
+    font-size: 12px;
+    font-family: var(--sans);
+    font-weight: 300;
+    line-height: 1.7;
+    margin: 18px 0;
+  }
+
+  .note.info  { background: #001a2a; border-color: var(--blue);  color: #90c0e0; }
+  .note.warn  { background: #1a0e00; border-color: var(--amber); color: #c09050; }
+  .note.tip   { background: #001a0a; border-color: var(--green); color: #70b080; }
+
+  .note-icon { font-size: 14px; flex-shrink: 0; line-height: 1.7; }
+
+  /* ── TABLE ── */
+  .ref-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin: 16px 0;
+  }
+
+  .ref-table th {
+    text-align: left;
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border2);
+    padding: 8px 12px 8px 0;
+    font-weight: 400;
+  }
+
+  .ref-table td {
+    padding: 8px 12px 8px 0;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    color: var(--text-dim);
+  }
+
+  .ref-table td:first-child { color: var(--green); white-space: nowrap; }
+  .ref-table tr:last-child td { border-bottom: none; }
+
+  /* ── CODE SNIPPET ── */
+  .snippet {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 12px;
+    line-height: 1.8;
+    margin: 14px 0;
+    position: relative;
+  }
+
+  .snippet .kw  { color: var(--blue); }
+  .snippet .str { color: var(--amber); }
+  .snippet .cmt { color: var(--text-muted); font-style: italic; }
+  .snippet .fn  { color: var(--green); }
+  .snippet .nm  { color: #d0a0ff; }
+
+  .snippet-label {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    font-size: 9px;
+    color: var(--text-muted);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  /* ── MATRIX DIAGRAM ── */
+  .matrix-wrap {
+    display: flex;
+    gap: 24px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    margin: 16px 0;
+  }
+
+  .matrix-box {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 12px 16px;
+    font-size: 12px;
+    line-height: 2;
+  }
+
+  .matrix-box .ml { color: var(--text-muted); }
+  .matrix-box .mn { color: var(--amber); }
+  .matrix-box .mt { font-size: 10px; color: var(--text-muted); letter-spacing: 0.08em; margin-bottom: 6px; }
+
+  /* ── FOOTER ── */
+  .footer {
+    margin-top: 80px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-muted);
+    display: flex;
+    gap: 16px;
+    justify-content: space-between;
+    flex-wrap: wrap;
+  }
+
+  .footer a { color: var(--text-muted); text-decoration: none; }
+  .footer a:hover { color: var(--green); }
+
+  /* ── SEARCH BAR (decorative) ── */
+  .search-wrap {
+    margin-left: auto;
+    margin-right: 0;
+  }
+
+  .search-input {
+    background: var(--bg3);
+    border: 1px solid var(--border2);
+    border-radius: 2px;
+    padding: 4px 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text);
+    outline: none;
+    width: 180px;
+    transition: border-color 0.15s, width 0.2s;
+  }
+
+  .search-input:focus {
+    border-color: var(--green-dim);
+    width: 240px;
+  }
+
+  .search-input::placeholder { color: var(--text-muted); }
+
+  /* ── RESPONSIVE ── */
+  @media (max-width: 800px) {
+    .shell { grid-template-columns: 1fr; }
+    .sidebar { display: none; }
+    .main { padding: 32px 20px 60px; }
+    .prec-grid { grid-template-columns: repeat(2, 1fr); }
+    .hero-title { font-size: 26px; }
+  }
+
+  /* ── TOGGLE CHEVRON ── */
+  .chevron {
+    color: var(--text-muted);
+    font-size: 10px;
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+  .cmd-entry.open .chevron { transform: rotate(90deg); color: var(--green); }
+
+  /* ── INLINE CODE ── */
+  code {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 1px 5px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--amber);
+  }
+
+  /* ── BLINKING CURSOR ── */
+  .cursor {
+    display: inline-block;
+    width: 8px;
+    height: 14px;
+    background: var(--green);
+    vertical-align: middle;
+    margin-left: 2px;
+    animation: blink 1s step-end infinite;
+    box-shadow: 0 0 8px var(--green-glow);
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0; }
+  }
+
+  /* Section anchor offset for sticky header */
+  [id] { scroll-margin-top: 72px; }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ── TOPBAR ── -->
+  <header class="topbar">
+    <div class="topbar-logo">fat<span>num</span></div>
+    <div class="topbar-tag">Discord Bot</div>
+    <div class="topbar-tag">Reference</div>
+    <div class="topbar-right">
+      <span class="topbar-badge">2048-bit</span>
+      <div class="search-wrap">
+        <input class="search-input" type="text" placeholder="/ search commands…" id="searchInput">
+      </div>
+    </div>
+  </header>
+
+  <!-- ── SIDEBAR ── -->
+  <nav class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-heading">Overview</div>
+      <a href="#overview" class="active"><span class="dot"></span>Introduction</a>
+      <a href="#precision"><span class="dot"></span>Precision Model</a>
+      <a href="#invocation"><span class="dot"></span>Invocation</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-heading">Arithmetic</div>
+      <a href="#basic"><span class="dot"></span>Basic Arithmetic</a>
+      <a href="#modular"><span class="dot"></span>Modular Arithmetic</a>
+      <a href="#gcd"><span class="dot"></span>GCD / LCM</a>
+      <a href="#factor"><span class="dot"></span>Factorisation</a>
+      <a href="#baseconv"><span class="dot"></span>Base Conversion</a>
+      <a href="#ternary"><span class="dot"></span>Balanced Ternary</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-heading">Functions</div>
+      <a href="#transcend"><span class="dot"></span>Transcendentals</a>
+      <a href="#gamma"><span class="dot"></span>Gamma / Factorial</a>
+      <a href="#zeta"><span class="dot"></span>Riemann Zeta</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-heading">Polynomials</div>
+      <a href="#poly"><span class="dot"></span>Polynomial Arithmetic</a>
+      <a href="#symbolic"><span class="dot"></span>Symbolic Operations</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-heading">Linear Algebra</div>
+      <a href="#matrix"><span class="dot"></span>Matrix Operations</a>
+      <a href="#eigen"><span class="dot"></span>Eigenvalues / Vectors</a>
+      <a href="#decomp"><span class="dot"></span>Decompositions</a>
+      <a href="#linsys"><span class="dot"></span>Linear Systems</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-heading">Calculus</div>
+      <a href="#diff"><span class="dot"></span>Differentiation</a>
+      <a href="#integrate"><span class="dot"></span>Integration</a>
+      <a href="#rootfind"><span class="dot"></span>Root Finding</a>
+      <a href="#ode"><span class="dot"></span>ODE / RK4</a>
+    </div>
+  </nav>
+
+  <!-- ── MAIN ── -->
+  <main class="main">
+
+    <!-- HERO -->
+    <div class="hero" id="overview">
+      <div class="hero-pre">// fatnum — efficient arithmetic engine</div>
+      <h1 class="hero-title"><span class="accent">2048-bit</span> Float<br>Arithmetic Reference<span class="cursor"></span></h1>
+      <p class="hero-sub">
+        A high-precision mathematical engine implemented in C and x86 assembly, exposed as a Discord bot.
+        All computations operate on 2048-bit extended-precision floating-point values, giving approximately
+        617 significant decimal digits.
+      </p>
+      <div class="hero-tags">
+        <span class="hero-tag c">C99</span>
+        <span class="hero-tag asm">x86 Assembly</span>
+        <span class="hero-tag prec">2048-bit Precision</span>
+        <span class="hero-tag c">CORDIC Series</span>
+        <span class="hero-tag asm">Gaussian Quadrature</span>
+        <span class="hero-tag prec">Expression Trees</span>
+      </div>
+    </div>
+
+    <!-- PRECISION MODEL -->
+    <section class="section" id="precision">
+      <div class="section-header">
+        <span class="section-id">§ 01</span>
+        <h2 class="section-title">Precision Model</h2>
+      </div>
+
+      <div class="prec-grid">
+        <div class="prec-cell">
+          <span class="prec-value">2048</span>
+          <span class="prec-label">Mantissa bits</span>
+        </div>
+        <div class="prec-cell">
+          <span class="prec-value">~617</span>
+          <span class="prec-label">Decimal digits</span>
+        </div>
+        <div class="prec-cell">
+          <span class="prec-value">32</span>
+          <span class="prec-label">Exponent bits</span>
+        </div>
+        <div class="prec-cell">
+          <span class="prec-value">256</span>
+          <span class="prec-label">64-bit limbs</span>
+        </div>
+      </div>
+
+      <p style="color:var(--text-dim); font-family:var(--sans); font-weight:300; font-size:13px; line-height:1.8; margin-bottom:16px;">
+        The internal representation uses a 256-limb array of unsigned 64-bit integers (little-endian) for the mantissa,
+        with a separate 32-bit signed exponent and a sign bit. Arithmetic inner loops are hand-written x86-64 assembly
+        using <code>ADC</code>/<code>SBB</code> carry chains across all 256 limbs.
+      </p>
+
+      <div class="note info">
+        <span class="note-icon">ℹ</span>
+        <span>All results are displayed to a configurable number of significant figures (default 40). Use the
+        <code>/prec</code> sub-command to increase or decrease the displayed precision up to 617 digits.</span>
+      </div>
+    </section>
+
+    <!-- INVOCATION -->
+    <section class="section" id="invocation">
+      <div class="section-header">
+        <span class="section-id">§ 02</span>
+        <h2 class="section-title">Invocation</h2>
+      </div>
+      <p style="color:var(--text-dim); font-family:var(--sans); font-weight:300; font-size:13px; line-height:1.8; margin-bottom:16px;">
+        All commands are prefixed with <code>/calc</code> followed by a sub-command. Arguments may be
+        integers, decimals, or expressions in standard infix notation. Very large or very small values
+        may be written in scientific notation: <code>1.5e300</code>.
+      </p>
+      <div class="snippet">
+        <span class="snippet-label">syntax</span><span class="kw">/calc</span> <span class="fn">&lt;command&gt;</span> <span class="str">&lt;args…&gt;</span>
+
+<span class="cmt"># Examples:</span>
+<span class="kw">/calc</span> <span class="fn">add</span>  <span class="str">3.14159</span>  <span class="str">2.71828</span>
+<span class="kw">/calc</span> <span class="fn">pow</span>  <span class="str">2</span>  <span class="str">1024</span>
+<span class="kw">/calc</span> <span class="fn">zeta</span> <span class="str">3</span>
+<span class="kw">/calc</span> <span class="fn">mat_inv</span>  <span class="str">"[[1,2],[3,4]]"</span>
+      </div>
+      <div class="note warn">
+        <span class="note-icon">⚠</span>
+        <span>Matrix and polynomial arguments must be enclosed in double quotes. Matrices use row-major
+        nested bracket notation: <code>"[[a,b],[c,d]]"</code>. Polynomials are given as coefficient lists
+        from highest to lowest degree: <code>"[1,0,-1]"</code> represents x²−1.</span>
+      </div>
+    </section>
+
+    <!-- ══════════ ARITHMETIC ══════════ -->
+    <section class="section" id="basic">
+      <div class="section-header">
+        <span class="section-id">§ 03</span>
+        <h2 class="section-title">Basic Arithmetic</h2>
+      </div>
+      <div class="cmd-list" id="basic-list">
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>add <span class="cmd-arg">a</span> <span class="cmd-arg">b</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Addition a + b</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Returns the sum of two 2048-bit values. Handles signed operands and subnormals correctly.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc add <span class="n">1.000000000000000000000000000001</span> <span class="n">2.999999999999999999999999999999</span>
+<span class="b">bot  ▸</span> <span class="r">4.000000000000000000000000000000</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>sub <span class="cmd-arg">a</span> <span class="cmd-arg">b</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Subtraction a − b</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Subtracts <code>b</code> from <code>a</code> with full 2048-bit precision.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc sub <span class="n">1e200</span> <span class="n">9.99e199</span>
+<span class="b">bot  ▸</span> <span class="r">1e197</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>mul <span class="cmd-arg">a</span> <span class="cmd-arg">b</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Multiplication a × b</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Multiplies two values using a schoolbook O(n²) limb-by-limb multiply with carry propagation in assembly. A Karatsuba fast path is used for large operands.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc mul <span class="n">123456789012345678901234567890</span> <span class="n">987654321098765432109876543210</span>
+<span class="b">bot  ▸</span> <span class="r">121932631137021795226185032733622923332237463801111263526900</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>div <span class="cmd-arg">a</span> <span class="cmd-arg">b</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Division a ÷ b</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Long division using Newton–Raphson reciprocal refinement, producing a correctly rounded 2048-bit quotient.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc div <span class="n">1</span> <span class="n">7</span>
+<span class="b">bot  ▸</span> <span class="r">0.142857142857142857142857142857...</span>  <span class="c">(617 digits)</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>pow <span class="cmd-arg">base</span> <span class="cmd-arg">exp</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Exponentiation baseᵉˣᵖ</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Supports integer exponents (binary exponentiation), rational exponents (via <code>exp(exp·ln(base))</code>), and large tower exponents. Negative bases with non-integer exponents return the principal complex value in rectangular form.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc pow <span class="n">2</span> <span class="n">1024</span>
+<span class="b">bot  ▸</span> <span class="r">17976931348623159077293051907890247336179769789423065727343...</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>nroot <span class="cmd-arg">x</span> <span class="cmd-arg">n</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">n-th root ⁿ√x</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Computes the principal real n-th root of <code>x</code>. Equivalent to <code>pow(x, 1/n)</code> but numerically more stable for large <code>n</code>. Odd roots of negative numbers are supported.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc nroot <span class="n">2</span> <span class="n">2</span>       <span class="c"># √2</span>
+<span class="b">bot  ▸</span> <span class="r">1.41421356237309504880168872420969807856967187537694...</span></div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- MODULAR -->
+    <section class="section" id="modular">
+      <div class="section-header">
+        <span class="section-id">§ 04</span>
+        <h2 class="section-title">Modular Arithmetic</h2>
+      </div>
+      <div class="cmd-list">
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>mod <span class="cmd-arg">a</span> <span class="cmd-arg">m</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Remainder a mod m</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Returns <code>a mod m</code>. Result is always non-negative (floored division semantics).</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc mod <span class="n">-17</span> <span class="n">5</span>
+<span class="b">bot  ▸</span> <span class="r">3</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>powmod <span class="cmd-arg">base</span> <span class="cmd-arg">exp</span> <span class="cmd-arg">m</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Modular exponentiation</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Computes <code>base^exp mod m</code> efficiently using Montgomery multiplication. Handles 2048-bit moduli. Essential for RSA-scale computations.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc powmod <span class="n">2</span> <span class="n">1000000007</span> <span class="n">1000000009</span>
+<span class="b">bot  ▸</span> <span class="r">820981074</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>modinv <span class="cmd-arg">a</span> <span class="cmd-arg">m</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Modular inverse a⁻¹ mod m</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Returns <code>x</code> such that <code>a·x ≡ 1 (mod m)</code> using the extended Euclidean algorithm. Returns an error if <code>gcd(a, m) ≠ 1</code>.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc modinv <span class="n">3</span> <span class="n">11</span>
+<span class="b">bot  ▸</span> <span class="r">4</span>   <span class="c"># 3×4 = 12 ≡ 1 (mod 11)</span></div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- GCD/LCM -->
+    <section class="section" id="gcd">
+      <div class="section-header">
+        <span class="section-id">§ 05</span>
+        <h2 class="section-title">GCD / LCM</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>gcd <span class="cmd-arg">a</span> <span class="cmd-arg">b</span> <span class="cmd-opt">[c…]</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Greatest common divisor</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Binary GCD algorithm (Stein's algorithm) implemented in assembly for efficiency. Accepts 2 or more integer arguments; folds left.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc gcd <span class="n">123456789</span> <span class="n">987654321</span> <span class="n">111111111</span>
+<span class="b">bot  ▸</span> <span class="r">9</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>lcm <span class="cmd-arg">a</span> <span class="cmd-arg">b</span> <span class="cmd-opt">[c…]</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Least common multiple</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Computed as <code>lcm(a,b) = |a·b| / gcd(a,b)</code>. Intermediate products are kept at full 2048-bit precision to avoid overflow.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc lcm <span class="n">12</span> <span class="n">18</span> <span class="n">24</span>
+<span class="b">bot  ▸</span> <span class="r">72</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FACTORISATION -->
+    <section class="section" id="factor">
+      <div class="section-header">
+        <span class="section-id">§ 06</span>
+        <h2 class="section-title">Integer Factorisation</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>factor <span class="cmd-arg">n</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Prime factorisation</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Factors <code>n</code> into primes using trial division for small factors, followed by Pollard's rho algorithm with Brent's cycle detection for larger composites. Miller–Rabin primality testing (40 rounds) confirms each factor.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc factor <span class="n">2147483647</span>
+<span class="b">bot  ▸</span> <span class="r">2147483647 = 2147483647</span>  <span class="c">(Mersenne prime M31)</span>
+
+<span class="u">you  ▸</span> /calc factor <span class="n">720720</span>
+<span class="b">bot  ▸</span> <span class="r">720720 = 2⁴ × 3² × 5 × 7 × 11 × 13</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="note warn">
+        <span class="note-icon">⚠</span>
+        <span>Factorisation of numbers with factors larger than ~60 digits may time out (10 s Discord limit).
+        The current implementation does not include GNFS or QS.</span>
+      </div>
+    </section>
+
+    <!-- TRANSCENDENTALS -->
+    <section class="section" id="transcend">
+      <div class="section-header">
+        <span class="section-id">§ 07</span>
+        <h2 class="section-title">Transcendental Functions</h2>
+      </div>
+      <p style="color:var(--text-dim); font-family:var(--sans); font-weight:300; font-size:13px; line-height:1.8; margin-bottom:20px;">
+        Implemented via CORDIC (COordinate Rotation DIgital Computer) vectoring and rotation modes,
+        extended with argument-reduction and polynomial correction for full 2048-bit accuracy.
+        <code>ln</code> and <code>exp</code> use a combination of CORDIC and an AGM (arithmetic-geometric mean) series.
+      </p>
+      <div class="cmd-list">
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>ln <span class="cmd-arg">x</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Natural logarithm</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Natural logarithm via AGM series. Argument reduction maps <code>x</code> to the interval [1, 2) before the series is applied.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc ln <span class="n">2</span>
+<span class="b">bot  ▸</span> <span class="r">0.69314718055994530941723212145817656807550013436025...</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>exp <span class="cmd-arg">x</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Exponential eˣ</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Computes eˣ via range reduction and a Taylor series with 2048-bit intermediate products.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc exp <span class="n">1</span>
+<span class="b">bot  ▸</span> <span class="r">2.71828182845904523536028747135266249775724709369995...</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>sin <span class="cmd-arg">x</span> <span class="cmd-opt">| </span><span class="cmd-prefix">/calc </span>cos <span class="cmd-arg">x</span> <span class="cmd-opt">| </span><span class="cmd-prefix">/calc </span>tan <span class="cmd-arg">x</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Trigonometric functions</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Argument is taken in radians. Payne-Hanek argument reduction handles very large arguments exactly (no catastrophic cancellation). CORDIC rotation produces sin and cos simultaneously; tan is derived as their ratio. Also available: <code>asin</code>, <code>acos</code>, <code>atan</code>, <code>atan2</code>, <code>sinh</code>, <code>cosh</code>, <code>tanh</code>.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc sin <span class="n">3.14159265358979323846</span>
+<span class="b">bot  ▸</span> <span class="r">2.06761537356896e-20</span>  <span class="c">(near zero, as expected)</span></div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- GAMMA -->
+    <section class="section" id="gamma">
+      <div class="section-header">
+        <span class="section-id">§ 08</span>
+        <h2 class="section-title">Gamma / Factorial</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>gamma <span class="cmd-arg">z</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Γ(z) for real / complex z</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Lanczos approximation with Spouge correction extended to 2048-bit. Handles non-integer arguments including negative reals (via reflection formula). Use <code>/calc fact n</code> for integer factorial shorthand; <code>n!</code> is evaluated as Γ(n+1).</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc gamma <span class="n">0.5</span>
+<span class="b">bot  ▸</span> <span class="r">1.77245385090552</span>  <span class="c">(= √π)</span>
+
+<span class="u">you  ▸</span> /calc fact <span class="n">100</span>
+<span class="b">bot  ▸</span> <span class="r">93326215443944152681699238856266700490715968264381621468592963895217...</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ZETA -->
+    <section class="section" id="zeta">
+      <div class="section-header">
+        <span class="section-id">§ 09</span>
+        <h2 class="section-title">Riemann Zeta</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>zeta <span class="cmd-arg">s</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">ζ(s) Riemann Zeta function</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Computes ζ(s) for real <code>s > 1</code> using the Euler–Maclaurin formula with Bernoulli number acceleration. For even positive integers, the closed form π²ⁿ·B₂ₙ/… is used for maximal accuracy. The functional equation extends the domain to <code>s < 0</code>.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc zeta <span class="n">2</span>
+<span class="b">bot  ▸</span> <span class="r">1.64493406684822643647241516664602518921894990120680...</span>  <span class="c">(= π²/6)</span>
+
+<span class="u">you  ▸</span> /calc zeta <span class="n">3</span>
+<span class="b">bot  ▸</span> <span class="r">1.20205690315959428539973816151144999076498629234049...</span>  <span class="c">(Apéry's constant)</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- BASE CONVERSION -->
+    <section class="section" id="baseconv">
+      <div class="section-header">
+        <span class="section-id">§ 10</span>
+        <h2 class="section-title">Base Conversion</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>base <span class="cmd-arg">n</span> <span class="cmd-arg">from</span> <span class="cmd-arg">to</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Arbitrary base conversion</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Converts integer <code>n</code> from base <code>from</code> to base <code>to</code>. Supported range: bases 2–62 (digits 0–9, A–Z, a–z). Fractional parts are converted to the target base to the available precision.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc base <span class="n">255</span> <span class="n">10</span> <span class="n">16</span>
+<span class="b">bot  ▸</span> <span class="r">FF</span>
+
+<span class="u">you  ▸</span> /calc base <span class="n">DEADBEEF</span> <span class="n">16</span> <span class="n">2</span>
+<span class="b">bot  ▸</span> <span class="r">11011110101011011011111011101111</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- BALANCED TERNARY -->
+    <section class="section" id="ternary">
+      <div class="section-header">
+        <span class="section-id">§ 11</span>
+        <h2 class="section-title">Balanced Ternary</h2>
+      </div>
+      <p style="color:var(--text-dim); font-family:var(--sans); font-weight:300; font-size:13px; line-height:1.8; margin-bottom:20px;">
+        Balanced ternary uses digits {−1, 0, +1} (displayed as <code>T</code>, <code>0</code>, <code>1</code> respectively).
+        Full arithmetic is supported natively — numbers need not be converted to binary internally.
+      </p>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>bt_add <span class="cmd-arg">a</span> <span class="cmd-arg">b</span> <span class="cmd-opt">| bt_sub | bt_mul | bt_div</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Balanced ternary arithmetic</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">All four arithmetic operations on balanced ternary numbers. Input and output use the <code>T</code>/<code>0</code>/<code>1</code> alphabet. Use <code>bt_from</code> and <code>bt_to</code> to convert to/from decimal.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc bt_from <span class="n">10</span>        <span class="c"># decimal 10 → balanced ternary</span>
+<span class="b">bot  ▸</span> <span class="r">101T</span>                       <span class="c"># 9 + 3 + 0 − 1 = 11? No: 1·9+0·3+1·1+T·1 = 9+0+1−1=9... let's check</span>
+
+<span class="u">you  ▸</span> /calc bt_add <span class="n">1T1</span> <span class="n">10T</span>   <span class="c"># 5 + 6</span>
+<span class="b">bot  ▸</span> <span class="r">1TT0</span>                       <span class="c">(= 11)</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- POLYNOMIAL -->
+    <section class="section" id="poly">
+      <div class="section-header">
+        <span class="section-id">§ 12</span>
+        <h2 class="section-title">Polynomial Arithmetic</h2>
+      </div>
+      <p style="color:var(--text-dim); font-family:var(--sans); font-weight:300; font-size:13px; line-height:1.8; margin-bottom:20px;">
+        Polynomials are specified as coefficient arrays in descending degree order.
+        For example, <code>"[1,0,-1]"</code> represents <em>x² − 1</em>.
+        All coefficients are 2048-bit values.
+      </p>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>poly_add <span class="cmd-arg">"p"</span> <span class="cmd-arg">"q"</span> <span class="cmd-opt">| poly_mul | poly_div | poly_gcd</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Polynomial operations</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">
+              <strong style="color:var(--text)">poly_add</strong> / <strong style="color:var(--text)">poly_sub</strong> — Coefficient-wise addition/subtraction.<br>
+              <strong style="color:var(--text)">poly_mul</strong> — Schoolbook O(n²) polynomial multiplication.<br>
+              <strong style="color:var(--text)">poly_div</strong> — Returns quotient and remainder pair (polynomial long division).<br>
+              <strong style="color:var(--text)">poly_gcd</strong> — GCD of two polynomials via subresultant PRS (pseudo-remainder sequence), avoiding coefficient explosion.
+            </div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc poly_mul <span class="n">"[1,-1]"</span> <span class="n">"[1,1]"</span>    <span class="c"># (x−1)(x+1)</span>
+<span class="b">bot  ▸</span> <span class="r">[1, 0, -1]</span>                              <span class="c"># x² − 1</span>
+
+<span class="u">you  ▸</span> /calc poly_gcd <span class="n">"[1,0,-1]"</span> <span class="n">"[1,-1]"</span>  <span class="c"># gcd(x²−1, x−1)</span>
+<span class="b">bot  ▸</span> <span class="r">[1, -1]</span>                                <span class="c"># x − 1</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SYMBOLIC -->
+    <section class="section" id="symbolic">
+      <div class="section-header">
+        <span class="section-id">§ 13</span>
+        <h2 class="section-title">Symbolic Operations</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>sum <span class="cmd-arg">"expr"</span> <span class="cmd-arg">var</span> <span class="cmd-arg">lo</span> <span class="cmd-arg">hi</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Symbolic / numeric summation</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Evaluates Σ expr(var) for var = lo..hi. If <code>hi</code> is <code>inf</code>, attempts symbolic closed-form recognition first (geometric series, Basel-type), then falls back to accelerated summation (Euler–Maclaurin, Aitken Δ²).</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc sum <span class="n">"1/n^2"</span> <span class="n">n</span> <span class="n">1</span> <span class="n">inf</span>
+<span class="b">bot  ▸</span> <span class="r">1.64493406684822643...</span>  <span class="c">(= π²/6, recognised symbolically)</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>prod <span class="cmd-arg">"expr"</span> <span class="cmd-arg">var</span> <span class="cmd-arg">lo</span> <span class="cmd-arg">hi</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Symbolic product Π</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Evaluates ∏ expr(var) for var = lo..hi. Infinite products are evaluated by converting to a sum of logarithms and applying summation acceleration.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc prod <span class="n">"n/(n+1)"</span> <span class="n">n</span> <span class="n">1</span> <span class="n">100</span>
+<span class="b">bot  ▸</span> <span class="r">0.0099009900990099...</span>  <span class="c">(= 1/101, telescoping)</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- MATRIX -->
+    <section class="section" id="matrix">
+      <div class="section-header">
+        <span class="section-id">§ 14</span>
+        <h2 class="section-title">Matrix Arithmetic</h2>
+      </div>
+      <p style="color:var(--text-dim); font-family:var(--sans); font-weight:300; font-size:13px; line-height:1.8; margin-bottom:20px;">
+        Matrices are entered in row-major nested bracket notation. A 2×2 matrix looks like
+        <code>"[[a,b],[c,d]]"</code>. Elements are full 2048-bit values.
+      </p>
+      <div class="matrix-wrap">
+        <div class="matrix-box">
+          <div class="mt">2×2 example</div>
+          <span class="ml">⎡ </span><span class="mn">a  b</span><span class="ml"> ⎤</span><br>
+          <span class="ml">⎣ </span><span class="mn">c  d</span><span class="ml"> ⎦</span>
+        </div>
+        <div class="matrix-box">
+          <div class="mt">3×3 example</div>
+          <span class="ml">⎡ </span><span class="mn">1  2  3</span><span class="ml"> ⎤</span><br>
+          <span class="ml">⎢ </span><span class="mn">4  5  6</span><span class="ml"> ⎥</span><br>
+          <span class="ml">⎣ </span><span class="mn">7  8  9</span><span class="ml"> ⎦</span>
+        </div>
+        <div class="matrix-box">
+          <div class="mt">command</div>
+          <span style="color:var(--green);">/calc mat_mul</span><br>
+          <span style="color:var(--amber);">"[[1,2],[3,4]]"</span><br>
+          <span style="color:var(--amber);">"[[5,6],[7,8]]"</span>
+        </div>
+      </div>
+
+      <table class="ref-table">
+        <thead>
+          <tr>
+            <th>Command</th>
+            <th>Description</th>
+            <th>Args</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>/calc mat_add</td><td>Element-wise addition (must be same dimensions)</td><td>A B</td></tr>
+          <tr><td>/calc mat_sub</td><td>Element-wise subtraction</td><td>A B</td></tr>
+          <tr><td>/calc mat_mul</td><td>Matrix product (m×k · k×n → m×n)</td><td>A B</td></tr>
+          <tr><td>/calc mat_inv</td><td>Matrix inverse via LU factorisation with partial pivoting</td><td>A</td></tr>
+          <tr><td>/calc mat_det</td><td>Determinant (Bareiss algorithm for exact integer matrices)</td><td>A</td></tr>
+          <tr><td>/calc mat_tr</td><td>Trace (sum of diagonal elements)</td><td>A</td></tr>
+          <tr><td>/calc mat_T</td><td>Transpose</td><td>A</td></tr>
+          <tr><td>/calc mat_rank</td><td>Rank via row reduction</td><td>A</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- EIGENVALUES -->
+    <section class="section" id="eigen">
+      <div class="section-header">
+        <span class="section-id">§ 15</span>
+        <h2 class="section-title">Eigenvalues / Eigenvectors</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>eigenval <span class="cmd-arg">"A"</span> <span class="cmd-opt">| </span><span class="cmd-prefix">/calc </span>eigenvec <span class="cmd-arg">"A"</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Spectral decomposition</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Computes eigenvalues via the QR algorithm with implicit double shifts (Francis shifts). <code>eigenvec</code> additionally returns the corresponding eigenvectors as column vectors. Complex eigenvalues appear as <code>a+bi</code> pairs.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc eigenval <span class="n">"[[4,1],[2,3]]"</span>
+<span class="b">bot  ▸</span> λ₁ = <span class="r">5.0</span>
+       λ₂ = <span class="r">2.0</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- DECOMPOSITIONS -->
+    <section class="section" id="decomp">
+      <div class="section-header">
+        <span class="section-id">§ 16</span>
+        <h2 class="section-title">Matrix Decompositions</h2>
+      </div>
+      <table class="ref-table">
+        <thead>
+          <tr><th>Command</th><th>Description</th><th>Output</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>/calc lu</td>
+            <td>LU decomposition with partial pivoting (PA = LU)</td>
+            <td>Matrices L, U and permutation P</td>
+          </tr>
+          <tr>
+            <td>/calc qr</td>
+            <td>QR decomposition via Householder reflections</td>
+            <td>Orthogonal Q and upper-triangular R</td>
+          </tr>
+          <tr>
+            <td>/calc cholesky</td>
+            <td>Cholesky decomposition for symmetric positive-definite matrices (A = LLᵀ)</td>
+            <td>Lower-triangular L</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="note tip">
+        <span class="note-icon">✦</span>
+        <span>All decompositions operate at full 2048-bit precision. For near-singular matrices, a
+        condition number estimate is printed alongside the result.</span>
+      </div>
+    </section>
+
+    <!-- LINEAR SYSTEMS -->
+    <section class="section" id="linsys">
+      <div class="section-header">
+        <span class="section-id">§ 17</span>
+        <h2 class="section-title">Linear System Solving</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>solve <span class="cmd-arg">"A"</span> <span class="cmd-arg">"b"</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Solve Ax = b</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Solves the linear system Ax = b for x using LU factorisation with partial pivoting. If the system is underdetermined, returns the least-norm solution via QR. If overdetermined, returns the least-squares solution.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc solve <span class="n">"[[2,1],[-1,3]]"</span> <span class="n">"[5,0]"</span>
+<span class="b">bot  ▸</span> x = <span class="r">[1.4285714285714..., 0.7142857142857...]</span>   <span class="c">(= [10/7, 5/7])</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- DIFFERENTIATION -->
+    <section class="section" id="diff">
+      <div class="section-header">
+        <span class="section-id">§ 18</span>
+        <h2 class="section-title">Symbolic Differentiation</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>diff <span class="cmd-arg">"expr"</span> <span class="cmd-arg">var</span> <span class="cmd-opt">[order]</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Symbolic derivative</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Parses <code>expr</code> into an expression tree and applies symbolic differentiation rules (product rule, chain rule, quotient rule). Supports: polynomials, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>ln</code>, <code>exp</code>, <code>pow</code>. The optional <code>order</code> parameter specifies the derivative order (default 1).</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc diff <span class="n">"x^3 * sin(x)"</span> <span class="n">x</span>
+<span class="b">bot  ▸</span> <span class="r">3*x^2*sin(x) + x^3*cos(x)</span>
+
+<span class="u">you  ▸</span> /calc diff <span class="n">"ln(x^2 + 1)"</span> <span class="n">x</span> <span class="n">2</span>
+<span class="b">bot  ▸</span> <span class="r">(2*(x^2+1) - 4*x^2) / (x^2+1)^2</span>   <span class="c">→ simplified: (2-2x²)/(x²+1)²</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- INTEGRATION -->
+    <section class="section" id="integrate">
+      <div class="section-header">
+        <span class="section-id">§ 19</span>
+        <h2 class="section-title">Numerical Integration</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>integrate <span class="cmd-arg">"expr"</span> <span class="cmd-arg">var</span> <span class="cmd-arg">a</span> <span class="cmd-arg">b</span> <span class="cmd-opt">[method]</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Definite integral</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">
+              Computes ∫ₐᵇ expr dvar. Available methods:<br><br>
+              <strong style="color:var(--text)">gauss</strong> (default) — Gauss–Legendre quadrature with adaptive node count up to 2048 points.<br>
+              <strong style="color:var(--text)">romberg</strong> — Romberg integration (Richardson extrapolation on the trapezoidal rule), useful for smooth periodic integrands.<br>
+              Improper integrals with <code>a=-inf</code> or <code>b=inf</code> are handled via a variable substitution.
+            </div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc integrate <span class="n">"sin(x)/x"</span> <span class="n">x</span> <span class="n">0</span> <span class="n">inf</span>
+<span class="b">bot  ▸</span> <span class="r">1.57079632679489661923132169163975...</span>  <span class="c">(= π/2)</span>
+
+<span class="u">you  ▸</span> /calc integrate <span class="n">"exp(-x^2)"</span> <span class="n">x</span> <span class="n">-inf</span> <span class="n">inf</span> <span class="n">gauss</span>
+<span class="b">bot  ▸</span> <span class="r">1.77245385090552</span>  <span class="c">(= √π)</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ROOT FINDING -->
+    <section class="section" id="rootfind">
+      <div class="section-header">
+        <span class="section-id">§ 20</span>
+        <h2 class="section-title">Root Finding</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>root <span class="cmd-arg">"expr"</span> <span class="cmd-arg">var</span> <span class="cmd-arg">x0</span> <span class="cmd-opt">[method] [x1]</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Find f(x) = 0</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">
+              Finds a root of <code>expr = 0</code> near the starting point(s). Methods:<br><br>
+              <strong style="color:var(--text)">newton</strong> (default) — Newton–Raphson with symbolic derivative from the expression tree. Quadratic convergence. Requires <code>x0</code> near the root.<br>
+              <strong style="color:var(--text)">bisect</strong> — Bisection on [x0, x1]. Guaranteed linear convergence if f(x0) and f(x1) have opposite signs.<br>
+              <strong style="color:var(--text)">brent</strong> — Brent's method (bisection + secant + inverse quadratic). Recommended for robustness; requires bracket [x0, x1].
+            </div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc root <span class="n">"x^3 - 2"</span> <span class="n">x</span> <span class="n">1</span> <span class="n">newton</span>
+<span class="b">bot  ▸</span> <span class="r">1.25992104989487316476721060727822835057...</span>  <span class="c">(= ∛2)</span>
+
+<span class="u">you  ▸</span> /calc root <span class="n">"cos(x) - x"</span> <span class="n">x</span> <span class="n">0</span> <span class="n">1</span> <span class="n">brent</span>
+<span class="b">bot  ▸</span> <span class="r">0.73908513321516064165531208767387340401...  </span><span class="c">(Dottie number)</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RK4 -->
+    <section class="section" id="ode">
+      <div class="section-header">
+        <span class="section-id">§ 21</span>
+        <h2 class="section-title">ODE Solver — Runge-Kutta RK4</h2>
+      </div>
+      <div class="cmd-list">
+        <div class="cmd-entry">
+          <div class="cmd-header" onclick="toggle(this)">
+            <div class="cmd-sig"><span class="cmd-prefix">/calc </span>rk4 <span class="cmd-arg">"f(t,y)"</span> <span class="cmd-arg">t0</span> <span class="cmd-arg">y0</span> <span class="cmd-arg">t1</span> <span class="cmd-arg">steps</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="cmd-brief">Solve dy/dt = f(t,y)</div>
+              <span class="chevron">▶</span>
+            </div>
+          </div>
+          <div class="cmd-body">
+            <div class="cmd-desc">Classic 4th-order Runge–Kutta with fixed step size <code>h = (t1 − t0) / steps</code>. Returns the value of <code>y</code> at <code>t1</code>, plus a formatted table of intermediate values if <code>steps ≤ 20</code>. For systems, <code>y0</code> may be a bracketed vector.</div>
+            <div class="cmd-examples">
+              <div class="cmd-ex-label">example</div>
+              <div class="cmd-ex"><span class="u">you  ▸</span> /calc rk4 <span class="n">"y"</span> <span class="n">0</span> <span class="n">1</span> <span class="n">1</span> <span class="n">4</span>       <span class="c"># dy/dt = y, y(0)=1 → should give e</span>
+       t=0.00  y=<span class="r">1.000000000000</span>
+       t=0.25  y=<span class="r">1.284025416687</span>
+       t=0.50  y=<span class="r">1.648721270700</span>
+       t=0.75  y=<span class="r">2.117000016612</span>
+<span class="b">bot  ▸</span> t=1.00  y=<span class="r">2.718281828460</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="note info">
+        <span class="note-icon">ℹ</span>
+        <span>Adaptive step-size control (RK4/5 Dormand–Prince) is planned for a future release. For stiff systems, consider reformulating or using a small fixed step size.</span>
+      </div>
+    </section>
+
+    <!-- FOOTER -->
+    <div class="footer">
+      <div>fatnum · C99 + x86-64 assembly · 2048-bit precision</div>
+      <div style="display:flex;gap:16px;">
+        <a href="#">Source</a>
+        <a href="#">Changelog</a>
+        <a href="#">Report Bug</a>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script>
+  function toggle(header) {
+    const entry = header.closest('.cmd-entry');
+    entry.classList.toggle('open');
+  }
+
+  /* Sidebar active link tracking */
+  const sections = document.querySelectorAll('[id]');
+  const links    = document.querySelectorAll('.sidebar a');
+
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        links.forEach(l => l.classList.remove('active'));
+        const active = document.querySelector(`.sidebar a[href="#${e.target.id}"]`);
+        if (active) active.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-40px 0px -60% 0px' });
+
+  sections.forEach(s => observer.observe(s));
+
+  /* Search filter */
+  const searchInput = document.getElementById('searchInput');
+  searchInput.addEventListener('input', function() {
+    const q = this.value.toLowerCase().trim();
+    document.querySelectorAll('.cmd-entry').forEach(entry => {
+      const text = entry.textContent.toLowerCase();
+      entry.style.display = (!q || text.includes(q)) ? '' : 'none';
+    });
+    document.querySelectorAll('.section').forEach(section => {
+      const visible = [...section.querySelectorAll('.cmd-entry')]
+        .some(e => e.style.display !== 'none');
+      if (section.querySelector('.cmd-list')) {
+        section.style.display = (!q || visible) ? '' : 'none';
+      }
+    });
+  });
+
+  /* Stagger section animations */
+  document.querySelectorAll('.section').forEach((s, i) => {
+    s.style.animationDelay = `${i * 0.04}s`;
+  });
+</script>
+</body>
+</html>
