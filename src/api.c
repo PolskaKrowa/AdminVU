@@ -205,14 +205,38 @@ int api_init(Database *db) {
         "    blocked_at INTEGER DEFAULT (strftime('%s','now'))"
         ");"
         /* Delivery log – created here so the dashboard can query it even
-           before the bot module has recorded its first notification.       */
+           before the bot module has recorded its first notification.
+           message_id stores the Discord message ID of the posted alert so
+           broadcast_appeal_update() can edit-in-place rather than posting
+           a follow-up.                                                     */
         "CREATE TABLE IF NOT EXISTS propagation_notifications ("
         "    id          INTEGER PRIMARY KEY AUTOINCREMENT,"
         "    event_id    INTEGER NOT NULL,"
         "    guild_id    INTEGER NOT NULL,"
+        "    message_id  INTEGER NOT NULL DEFAULT 0,"
         "    notified_at INTEGER DEFAULT (strftime('%s','now')),"
         "    UNIQUE(event_id, guild_id)"
         ");"
+        /* Tickets opened by warned users or staff that are linked to a
+           specific propagation alert. Populated by the bot's button
+           handler and queryable via GET /api/propagation/events/<id>/tickets. */
+        "CREATE TABLE IF NOT EXISTS propagation_linked_tickets ("
+        "    id         INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    alert_id   INTEGER NOT NULL,"
+        "    ticket_id  INTEGER,"
+        "    guild_id   INTEGER NOT NULL,"
+        "    opener_id  INTEGER NOT NULL,"
+        "    created_at INTEGER DEFAULT (strftime('%s','now')),"
+        "    UNIQUE(alert_id, guild_id, opener_id)"
+        ");"
+        /* Single-row version counter bumped by every block/unblock action
+           so propagation.c can detect dashboard state changes without a
+           full restart (see propagation_poll_tick()).                       */
+        "CREATE TABLE IF NOT EXISTS propagation_state_version ("
+        "    id      INTEGER PRIMARY KEY CHECK(id = 1),"
+        "    version INTEGER NOT NULL DEFAULT 0"
+        ");"
+        "INSERT OR IGNORE INTO propagation_state_version (id, version) VALUES (1, 0);"
         /* Staff message edit/delete audit log — populated by ticket.c and
            surfaced in the dashboard ticket log HTML.                        */
         "CREATE TABLE IF NOT EXISTS ticket_log_events ("
@@ -233,6 +257,16 @@ int api_init(Database *db) {
         sqlite3_free(err);
         return -1;
     }
+
+    /*
+     * Schema migration: add message_id to propagation_notifications for
+     * databases created before this column was introduced.  sqlite3_exec
+     * returns an error if the column already exists; we silently ignore it.
+     */
+    sqlite3_exec(db->db,
+        "ALTER TABLE propagation_notifications ADD COLUMN message_id INTEGER NOT NULL DEFAULT 0;",
+        NULL, NULL, NULL);
+
     return 0;
 }
 
@@ -507,54 +541,74 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
     get_param(query, "source_guild_id", guild_buf, sizeof(guild_buf));
 
     /*
+     * Build a WHERE clause fragment so we can reuse it for both the COUNT
+     * query and the data query without duplicating filter logic.
+     */
+    char where_clause[256] = {0};
+    if (user_buf[0] && guild_buf[0])
+        snprintf(where_clause, sizeof(where_clause),
+                 " WHERE pe.target_user_id = %s AND pe.source_guild_id = %s",
+                 user_buf, guild_buf);
+    else if (user_buf[0])
+        snprintf(where_clause, sizeof(where_clause),
+                 " WHERE pe.target_user_id = %s", user_buf);
+    else if (guild_buf[0])
+        snprintf(where_clause, sizeof(where_clause),
+                 " WHERE pe.source_guild_id = %s", guild_buf);
+
+    /* Total matching rows (for dashboard pagination). */
+    long long total = 0;
+    {
+        char count_sql[512];
+        snprintf(count_sql, sizeof(count_sql),
+                 "SELECT COUNT(*) FROM propagation_events pe%s", where_clause);
+        sqlite3_stmt *cs;
+        if (sqlite3_prepare_v2(db->db, count_sql, -1, &cs, NULL) == SQLITE_OK) {
+            if (sqlite3_step(cs) == SQLITE_ROW)
+                total = sqlite3_column_int64(cs, 0);
+            sqlite3_finalize(cs);
+        }
+    }
+
+    /*
      * Columns:  0=id  1=target_user_id  2=source_guild_id  3=moderator_id
      *           4=reason  5=evidence_url  6=timestamp
      *           7=severity  8=report_count  9=weighted_confirmation_score
-     *           10=notified_count
+     *           10=notified_count  11=appeal_status (NULL if no appeal)
+     *
+     * IDs are serialised as JSON strings to preserve JS integer precision
+     * for 64-bit snowflakes — this includes the alert id itself.
      */
-    const char *sql_base =
-        "SELECT pe.id, pe.target_user_id, pe.source_guild_id,"
-        "       pe.moderator_id, pe.reason, pe.evidence_url, pe.timestamp,"
-        "       pe.severity, pe.report_count, pe.weighted_confirmation_score,"
-        "       COUNT(pn.guild_id) AS notified_count"
-        " FROM propagation_events pe"
-        " LEFT JOIN propagation_notifications pn ON pn.event_id = pe.id";
-
-    char sql[1024];
-    if (user_buf[0] && guild_buf[0]) {
-        snprintf(sql, sizeof(sql),
-                 "%s WHERE pe.target_user_id = %s AND pe.source_guild_id = %s"
-                 " GROUP BY pe.id ORDER BY pe.timestamp DESC LIMIT %lld OFFSET %lld",
-                 sql_base, user_buf, guild_buf, limit, offset);
-    } else if (user_buf[0]) {
-        snprintf(sql, sizeof(sql),
-                 "%s WHERE pe.target_user_id = %s"
-                 " GROUP BY pe.id ORDER BY pe.timestamp DESC LIMIT %lld OFFSET %lld",
-                 sql_base, user_buf, limit, offset);
-    } else if (guild_buf[0]) {
-        snprintf(sql, sizeof(sql),
-                 "%s WHERE pe.source_guild_id = %s"
-                 " GROUP BY pe.id ORDER BY pe.timestamp DESC LIMIT %lld OFFSET %lld",
-                 sql_base, guild_buf, limit, offset);
-    } else {
-        snprintf(sql, sizeof(sql),
-                 "%s GROUP BY pe.id ORDER BY pe.timestamp DESC LIMIT %lld OFFSET %lld",
-                 sql_base, limit, offset);
-    }
+    char sql[1536];
+    snprintf(sql, sizeof(sql),
+             "SELECT pe.id, pe.target_user_id, pe.source_guild_id,"
+             "       pe.moderator_id, pe.reason, pe.evidence_url, pe.timestamp,"
+             "       pe.severity, pe.report_count, pe.weighted_confirmation_score,"
+             "       COUNT(DISTINCT pn.guild_id) AS notified_count,"
+             "       pa.status AS appeal_status"
+             " FROM propagation_events pe"
+             " LEFT JOIN propagation_notifications pn ON pn.event_id = pe.id"
+             " LEFT JOIN propagation_appeals pa ON pa.propagation_id = pe.id"
+             "%s"
+             " GROUP BY pe.id"
+             " ORDER BY pe.timestamp DESC"
+             " LIMIT %lld OFFSET %lld",
+             where_clause, limit, offset);
 
     sqlite3_stmt *s;
     if (sqlite3_prepare_v2(db->db, sql, -1, &s, NULL) != SQLITE_OK) {
-        jb_raw(j, "{\"items\":[]}");
+        jb_printf(j, "{\"total\":0,\"items\":[]}");
         return 200;
     }
 
-    jb_raw(j, "{\"items\":[");
+    jb_printf(j, "{\"total\":%lld,\"items\":[", total);
     int first = 1;
     while (sqlite3_step(s) == SQLITE_ROW) {
         if (!first) jb_raw(j, ",");
         first = 0;
         int sev = sqlite3_column_int(s, 7);
-        jb_printf(j, "{\"id\":%lld",                          (long long)sqlite3_column_int64(s, 0));
+        /* id as string — avoids JS precision loss for large snowflakes. */
+        jb_raw(j,    "{\"id\":");                               jb_u64str(j, sqlite3_column_int64(s, 0));
         jb_raw(j,    ",\"target_user_id\":");                  jb_u64str(j, sqlite3_column_int64(s, 1));
         jb_raw(j,    ",\"source_guild_id\":");                 jb_u64str(j, sqlite3_column_int64(s, 2));
         jb_raw(j,    ",\"moderator_id\":");                    jb_u64str(j, sqlite3_column_int64(s, 3));
@@ -564,7 +618,12 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
         jb_printf(j, ",\"severity\":%d",                      sev);
         jb_printf(j, ",\"report_count\":%d",                  sqlite3_column_int(s, 8));
         jb_printf(j, ",\"weighted_confirmation_score\":%d",   sqlite3_column_int(s, 9));
-        jb_printf(j, ",\"notified_count\":%d}",               sqlite3_column_int(s, 10));
+        jb_printf(j, ",\"notified_count\":%d",                sqlite3_column_int(s, 10));
+        /* appeal_status is NULL when no appeal has been filed. */
+        if (sqlite3_column_type(s, 11) == SQLITE_NULL)
+            jb_raw(j, ",\"appeal_status\":null}");
+        else
+            jb_printf(j, ",\"appeal_status\":%d}", sqlite3_column_int(s, 11));
     }
     sqlite3_finalize(s);
     jb_raw(j, "]}");
@@ -630,6 +689,12 @@ static int handle_prop_block(Database *db, const char *body,
         jb_raw(j, "{\"ok\":false,\"error\":\"insert failed\"}");
         return 500;
     }
+
+    /* Bump the shared state version so propagation.c detects the change. */
+    sqlite3_exec(db->db,
+        "UPDATE propagation_state_version SET version = version + 1 WHERE id = 1;",
+        NULL, NULL, NULL);
+
     jb_raw(j, "{\"ok\":true}");
     return 200;
 }
@@ -656,7 +721,65 @@ static int handle_prop_unblock(Database *db, const char *body,
     sqlite3_bind_int64(s, 1, atoll(guild_buf));
     sqlite3_step(s);
     sqlite3_finalize(s);
+
+    /* Bump the shared state version so propagation.c detects the change. */
+    sqlite3_exec(db->db,
+        "UPDATE propagation_state_version SET version = version + 1 WHERE id = 1;",
+        NULL, NULL, NULL);
+
     jb_raw(j, "{\"ok\":true}");
+    return 200;
+}
+
+/* ── GET /api/propagation/events/<id>/tickets ───────────────────────────── */
+/*
+ * Returns all linked-ticket records for a given propagation alert.
+ * The bot's button handler (on_propagation_component_interaction) writes
+ * to propagation_linked_tickets; the dashboard reads it here.
+ */
+static int handle_prop_event_tickets(Database *db, const char *path, JB *j) {
+    /*
+     * Path is "/api/propagation/events/<id>/tickets".
+     * Walk past the prefix to reach the numeric alert id.
+     */
+    const char *after = path + strlen("/api/propagation/events/");
+    int64_t alert_id = (int64_t)strtoll(after, NULL, 10);
+    if (alert_id <= 0) {
+        jb_raw(j, "{\"error\":\"invalid alert id\"}");
+        return 400;
+    }
+
+    const char *sql =
+        "SELECT id, alert_id, ticket_id, guild_id, opener_id, created_at"
+        " FROM propagation_linked_tickets"
+        " WHERE alert_id = ?"
+        " ORDER BY created_at ASC;";
+
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &s, NULL) != SQLITE_OK) {
+        jb_raw(j, "{\"error\":\"db error\"}");
+        return 500;
+    }
+    sqlite3_bind_int64(s, 1, alert_id);
+
+    jb_printf(j, "{\"alert_id\":\"%" PRId64 "\",\"tickets\":[", alert_id);
+    int first = 1;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        if (!first) jb_raw(j, ",");
+        first = 0;
+        jb_printf(j, "{\"id\":%lld", (long long)sqlite3_column_int64(s, 0));
+        jb_raw(j, ",\"alert_id\":");   jb_u64str(j, sqlite3_column_int64(s, 1));
+        /* ticket_id may be NULL if a full ticket hasn't been created yet. */
+        if (sqlite3_column_type(s, 2) == SQLITE_NULL)
+            jb_raw(j, ",\"ticket_id\":null");
+        else
+            jb_printf(j, ",\"ticket_id\":%lld", (long long)sqlite3_column_int64(s, 2));
+        jb_raw(j, ",\"guild_id\":");   jb_u64str(j, sqlite3_column_int64(s, 3));
+        jb_raw(j, ",\"opener_id\":");  jb_u64str(j, sqlite3_column_int64(s, 4));
+        jb_printf(j, ",\"created_at\":%lld}", (long long)sqlite3_column_int64(s, 5));
+    }
+    sqlite3_finalize(s);
+    jb_raw(j, "]}");
     return 200;
 }
 
@@ -1067,6 +1190,12 @@ int api_handle(Database *db,
 
     if (is_post && strcmp(path, "/api/propagation/unblock") == 0)
         return handle_prop_unblock(db, body, body_len, &j);
+
+    /* /api/propagation/events/<id>/tickets — linked tickets for one alert.
+       Must be matched before the bare /events handler. */
+    if (is_get && strncmp(path, "/api/propagation/events/", 24) == 0
+               && strstr(path + 24, "/tickets") != NULL)
+        return handle_prop_event_tickets(db, path, &j);
 
     if (is_post && strcmp(path, "/api/send-message") == 0)
         return handle_send_message(db, body, body_len, &j);

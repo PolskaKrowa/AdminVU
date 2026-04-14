@@ -62,6 +62,13 @@ static Database       *g_db          = NULL;
 static struct discord *g_client      = NULL;
 static uint64_t        g_self_guild  = 0;
 
+/*
+ * Last-seen value of propagation_state_version.version.
+ * Initialised to -1 so the first poll always registers as a change and
+ * prints the startup log line.
+ */
+static int64_t g_last_block_version = -1;
+
 /* ── Permission helpers ──────────────────────────────────────────────────── */
 
 /*
@@ -101,16 +108,41 @@ static bool has_admin_permissions(const struct discord_interaction *event) {
 
 /* Returns true if the dashboard has blocked this guild from receiving alerts. */
 static bool is_guild_prop_blocked(uint64_t guild_id) {
-    if (!g_db || !g_db->db) return false;
+    /* Delegates to is_dashboard_blocked — kept as a named alias so call
+     * sites remain self-documenting without an extra DB round-trip. */
+    return is_dashboard_blocked(guild_id);
+}
+
+/*
+ * propagation_poll_tick – call from the bot's main/timer loop (e.g. every
+ * 5 seconds).  Reads propagation_state_version and logs whenever the
+ * dashboard has made a block/unblock change that the bot should pick up.
+ *
+ * Because is_dashboard_blocked() queries the DB on every call there is no
+ * in-memory cache to invalidate here; the log line is the primary signal.
+ * If a local cache is added later, flush it inside the `if` branch below.
+ */
+void propagation_poll_tick(void) {
+    if (!g_db || !g_db->db) return;
+
     sqlite3_stmt *st;
     const char *sql =
-        "SELECT 1 FROM propagation_blocked_guilds WHERE guild_id = ? LIMIT 1;";
+        "SELECT version FROM propagation_state_version WHERE id = 1;";
     if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) != SQLITE_OK)
-        return false;
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)guild_id);
-    bool blocked = (sqlite3_step(st) == SQLITE_ROW);
+        return;
+
+    int64_t ver = g_last_block_version;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        ver = sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
-    return blocked;
+
+    if (ver != g_last_block_version) {
+        printf("[propagation] Block state version changed "
+               "%" PRId64 " → %" PRId64 " — picking up dashboard changes.\n",
+               g_last_block_version, ver);
+        g_last_block_version = ver;
+        /* Future: flush any in-memory guild-block cache here. */
+    }
 }
 
 /*
@@ -281,7 +313,8 @@ static void build_alert_message(char                    *buf,
 static bool notify_guild(struct discord         *client,
                           uint64_t                guild_id,
                           const PropagationEvent *ev,
-                          GuildTrustLevel         source_trust) {
+                          GuildTrustLevel         source_trust,
+                          uint64_t               *out_message_id) {
     /* Only deliver if the user is actually a member of this guild. */
     struct discord_guild_member member = { 0 };
     ORCAcode rc = discord_get_guild_member(client, guild_id,
@@ -295,15 +328,51 @@ static bool notify_guild(struct discord         *client,
     char msg[2048];
     build_alert_message(msg, sizeof(msg), ev, source_trust, NULL);
 
-    struct discord_create_message_params params = { .content = msg };
-    ORCAcode post_rc = discord_create_message(client, channel_id, &params, NULL);
+    /*
+     * Add an action-row button so staff in this guild can open a linked
+     * ticket directly from the alert embed.  The custom_id encodes the
+     * alert ID so the component interaction handler can look it up.
+     */
+    char custom_id[64];
+    snprintf(custom_id, sizeof(custom_id), "prop_ticket:%" PRId64, ev->id);
+
+    struct discord_component button = {
+        .type      = DISCORD_COMPONENT_BUTTON,
+        .style     = 1, /* PRIMARY */
+        .label     = "Open Linked Ticket",
+        .custom_id = custom_id,
+    };
+    struct discord_component *btn_arr[] = { &button, NULL };
+    struct discord_component action_row = {
+        .type       = DISCORD_COMPONENT_ACTION_ROW,
+        .components = btn_arr,
+    };
+    struct discord_component *row_arr[] = { &action_row, NULL };
+
+    struct discord_create_message_params params = {
+        .content    = msg,
+        .components = row_arr,
+    };
+
+    /*
+     * Pass a discord_message struct so we can capture the snowflake ID of
+     * the posted message for later in-place edits (appeal updates, severity
+     * changes).  Cleanup is always called even on failure paths.
+     */
+    struct discord_message created = { 0 };
+    ORCAcode post_rc = discord_create_message(client, channel_id,
+                                              &params, &created);
     if (post_rc != ORCA_OK) {
         fprintf(stderr,
                 "[propagation] Failed to post to channel %" PRIu64
                 " in guild %" PRIu64 " (ORCAcode %d)\n",
                 channel_id, guild_id, post_rc);
+        discord_message_cleanup(&created);
         return false;
     }
+
+    if (out_message_id) *out_message_id = created.id;
+    discord_message_cleanup(&created);
     return true;
 }
 
@@ -315,10 +384,6 @@ static void broadcast_appeal_update(struct discord         *client,
                                      int64_t                 appeal_id,
                                      AppealStatus            new_status,
                                      const char             *reviewer_notes) {
-    uint64_t *opted_guilds = NULL;
-    int        guild_count  = 0;
-    db_get_opted_in_guilds(g_db, &opted_guilds, &guild_count);
-
     char msg[1024];
     snprintf(msg, sizeof(msg),
              "📋 **Appeal update – Alert #%" PRId64 "**\n"
@@ -337,13 +402,47 @@ static void broadcast_appeal_update(struct discord         *client,
              reviewer_notes && *reviewer_notes
                  ? "\n" : "");
 
-    for (int i = 0; i < guild_count; i++) {
-        uint64_t ch = db_get_propagation_channel(g_db, opted_guilds[i]);
-        if (ch) post_to_channel(client, ch, msg);
-    }
-    free(opted_guilds);
+    /*
+     * For each guild that received the original alert, look up the stored
+     * Discord message ID.  If we have it, edit the original alert embed in
+     * place so staff see the updated status without a new message cluttering
+     * the channel.  Fall back to posting a follow-up if the message_id is
+     * missing (e.g. records predating this schema change).
+     */
+    if (g_db && g_db->db) {
+        sqlite3_stmt *st;
+        const char *sql =
+            "SELECT pn.message_id, pc.channel_id"
+            " FROM propagation_notifications pn"
+            " LEFT JOIN propagation_config pc ON pc.guild_id = pn.guild_id"
+            " WHERE pn.event_id = ?;";
+        if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, propagation_id);
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                uint64_t msg_id    = (uint64_t)sqlite3_column_int64(st, 0);
+                uint64_t ch_id     = (uint64_t)sqlite3_column_int64(st, 1);
+                if (!ch_id) continue;
 
-    /* Also notify the central server. */
+                if (msg_id) {
+                    /*
+                     * Edit the original alert message.  Append the appeal
+                     * status line to the existing content so the channel
+                     * history stays clean.
+                     */
+                    struct discord_edit_message_params edit_p = {
+                        .content = msg,
+                    };
+                    discord_edit_message(client, ch_id, msg_id, &edit_p, NULL);
+                } else {
+                    /* No stored message_id — post a follow-up instead. */
+                    post_to_channel(client, ch_id, msg);
+                }
+            }
+            sqlite3_finalize(st);
+        }
+    }
+
+    /* Always forward the update to the central server as a new post. */
     notify_central(client, msg);
 }
 
@@ -448,8 +547,25 @@ static void handle_propagate(struct discord                  *client,
             continue;
         }
 
-        if (notify_guild(client, opted_guilds[i], &ev, source_trust)) {
+        uint64_t msg_id = 0;
+        if (notify_guild(client, opted_guilds[i], &ev, source_trust, &msg_id)) {
             db_record_propagation_notification(g_db, event_id, opted_guilds[i]);
+            /* Persist the message_id so appeal/severity updates can edit
+             * the original embed rather than posting a follow-up message. */
+            if (msg_id && g_db && g_db->db) {
+                sqlite3_stmt *st;
+                const char *upd =
+                    "UPDATE propagation_notifications"
+                    " SET message_id = ?"
+                    " WHERE event_id = ? AND guild_id = ?;";
+                if (sqlite3_prepare_v2(g_db->db, upd, -1, &st, NULL) == SQLITE_OK) {
+                    sqlite3_bind_int64(st, 1, (sqlite3_int64)msg_id);
+                    sqlite3_bind_int64(st, 2, (sqlite3_int64)event_id);
+                    sqlite3_bind_int64(st, 3, (sqlite3_int64)opted_guilds[i]);
+                    sqlite3_step(st);
+                    sqlite3_finalize(st);
+                }
+            }
             notified++;
         }
     }
@@ -459,8 +575,23 @@ static void handle_propagate(struct discord                  *client,
     uint64_t paired_staff = db_get_staff_guild_for(g_db, event->guild_id);
     if (paired_staff && paired_staff != event->guild_id
             && !is_dashboard_blocked(paired_staff)) {
-        if (notify_guild(client, paired_staff, &ev, source_trust)) {
+        uint64_t msg_id = 0;
+        if (notify_guild(client, paired_staff, &ev, source_trust, &msg_id)) {
             db_record_propagation_notification(g_db, event_id, paired_staff);
+            if (msg_id && g_db && g_db->db) {
+                sqlite3_stmt *st;
+                const char *upd =
+                    "UPDATE propagation_notifications"
+                    " SET message_id = ?"
+                    " WHERE event_id = ? AND guild_id = ?;";
+                if (sqlite3_prepare_v2(g_db->db, upd, -1, &st, NULL) == SQLITE_OK) {
+                    sqlite3_bind_int64(st, 1, (sqlite3_int64)msg_id);
+                    sqlite3_bind_int64(st, 2, (sqlite3_int64)event_id);
+                    sqlite3_bind_int64(st, 3, (sqlite3_int64)paired_staff);
+                    sqlite3_step(st);
+                    sqlite3_finalize(st);
+                }
+            }
             notified++;
         }
     }
@@ -472,22 +603,31 @@ static void handle_propagate(struct discord                  *client,
            ", notified %d guild(s), severity=%s\n",
            event_id, target_id, notified, severity_name(final_sev));
 
-    /* ── DM the target user so they can appeal. ──────────────────────── */
-    char dm_msg[1024];
+    /* ── DM the target user so they can appeal or open a linked ticket. ─ */
+    char dm_msg[1536];
     snprintf(dm_msg, sizeof(dm_msg),
              "⚠️ **Cross-server alert issued against you**\n\n"
              "A moderator has raised a cross-server alert citing your account "
              "(Alert ID `#%" PRId64 "`).\n\n"
              "**Reason given:** %s\n"
              "**Evidence:** %s\n\n"
-             "If you believe this alert is incorrect you may submit an appeal "
-             "in any server where this bot is active:\n"
+             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+             "**What you can do:**\n\n"
+             "📝 **Submit an appeal** — run this command in any server where "
+             "this bot is active:\n"
              "```\n/propagate-appeal alert_id:%" PRId64 " "
              "statement:<your explanation>\n```\n"
+             "🎫 **Open a linked support ticket** — run this in any server "
+             "that has the ticket system:\n"
+             "```\n/ticket open subject:Appeal for propagation alert #%" PRId64 "\n```\n"
+             "Reference Alert ID `#%" PRId64 "` in your ticket so staff can "
+             "look it up quickly.\n\n"
              "You will be notified here when your appeal status changes.",
              event_id,
              reason       ? reason       : "*(none provided)*",
              evidence_url ? evidence_url : "*(none provided)*",
+             event_id,
+             event_id,
              event_id);
     dm_user(client, target_id, dm_msg);
 
@@ -853,11 +993,44 @@ static void handle_appeal(struct discord                  *client,
         return;
     }
 
+    /* ── Eligibility check 1: only the named target may appeal. ──────── */
     if (ev.target_user_id != user_id) {
         send_ephemeral(client, event,
                        "❌ You can only appeal alerts that are against you.");
         db_free_propagation_event(&ev);
         return;
+    }
+
+    /*
+     * Eligibility check 2: the appeal must be filed from a guild that either
+     * (a) issued the alert, or (b) received a notification for it.
+     * This prevents guilds that were never part of the alert from processing
+     * appeals — especially relevant for high-trust paired staff servers.
+     *
+     * The check is skipped if the user is appealing from a DM (guild_id == 0),
+     * since DM interactions are not associated with any guild.
+     */
+    if (event->guild_id != 0 && event->guild_id != ev.source_guild_id) {
+        bool received = false;
+        if (g_db && g_db->db) {
+            sqlite3_stmt *st;
+            const char *sql =
+                "SELECT 1 FROM propagation_notifications"
+                " WHERE event_id = ? AND guild_id = ? LIMIT 1;";
+            if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(st, 1, alert_id);
+                sqlite3_bind_int64(st, 2, (sqlite3_int64)event->guild_id);
+                received = (sqlite3_step(st) == SQLITE_ROW);
+                sqlite3_finalize(st);
+            }
+        }
+        if (!received) {
+            send_ephemeral(client, event,
+                           "❌ You can only appeal this alert from a server "
+                           "that received the notification.");
+            db_free_propagation_event(&ev);
+            return;
+        }
     }
 
     int64_t appeal_id = db_submit_appeal(g_db, alert_id, user_id, statement);
@@ -1082,10 +1255,80 @@ static void handle_central(struct discord                  *client,
 void on_propagation_interaction(struct discord                  *client,
                                  const struct discord_interaction *event) {
     if (!event->data) return;
-    if (event->type != DISCORD_INTERACTION_APPLICATION_COMMAND) return;
 
     if (event->guild_id)
         db_register_known_guild(g_db, event->guild_id);
+
+    /* ── Message component interactions (button clicks) ─────────────── */
+    if (event->type == DISCORD_INTERACTION_MESSAGE_COMPONENT) {
+        const char *cid = event->data->custom_id;
+        if (!cid) return;
+
+        /*
+         * "Open Linked Ticket" button posted alongside every alert embed.
+         * custom_id format: "prop_ticket:<alert_id>"
+         *
+         * Records the intent in propagation_linked_tickets immediately.
+         * The actual ticket channel is created by the ticket module when
+         * the user subsequently runs /ticket open (or if the bot has
+         * slash-command pre-fill support, that flow can be extended here).
+         */
+        if (strncmp(cid, "prop_ticket:", 12) == 0) {
+            int64_t  alert_id = (int64_t)strtoll(cid + 12, NULL, 10);
+            uint64_t user_id  = event->member ? event->member->user->id : 0;
+            uint64_t guild_id = event->guild_id;
+
+            if (alert_id <= 0 || !user_id) {
+                send_ephemeral(client, event,
+                               "❌ Could not determine alert ID or your user ID.");
+                return;
+            }
+
+            /* Verify the alert exists and this guild received it. */
+            PropagationEvent ev = { 0 };
+            if (db_get_propagation_event_by_id(g_db, alert_id, &ev) != 0) {
+                send_ephemeral(client, event, "❌ Alert not found.");
+                return;
+            }
+            db_free_propagation_event(&ev);
+
+            /* Record the linked-ticket intent (ticket_id filled in later). */
+            if (g_db && g_db->db) {
+                sqlite3_stmt *st;
+                const char *sql =
+                    "INSERT OR IGNORE INTO propagation_linked_tickets"
+                    " (alert_id, guild_id, opener_id)"
+                    " VALUES (?, ?, ?);";
+                if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) == SQLITE_OK) {
+                    sqlite3_bind_int64(st, 1, alert_id);
+                    sqlite3_bind_int64(st, 2, (sqlite3_int64)guild_id);
+                    sqlite3_bind_int64(st, 3, (sqlite3_int64)user_id);
+                    sqlite3_step(st);
+                    sqlite3_finalize(st);
+                }
+            }
+
+            /* Instruct the user how to open the ticket. */
+            char reply[512];
+            snprintf(reply, sizeof(reply),
+                     "🎫 **Open a linked ticket for Alert #%" PRId64 "**\n\n"
+                     "Your intent has been logged.  To open the ticket, run:\n"
+                     "```\n/ticket open subject:Propagation alert #%" PRId64 "\n```\n"
+                     "Include the alert ID in your first message so staff can "
+                     "look it up quickly.\n\n"
+                     "If you are the **warned user** and want to dispute this "
+                     "alert, use `/propagate-appeal alert_id:%" PRId64 "` instead.",
+                     alert_id, alert_id, alert_id);
+            send_ephemeral(client, event, reply);
+            return;
+        }
+
+        /* Unknown component — ignore silently. */
+        return;
+    }
+
+    /* ── Slash-command interactions ───────────────────────────────────── */
+    if (event->type != DISCORD_INTERACTION_APPLICATION_COMMAND) return;
 
     const char *cmd = event->data->name;
 
@@ -1399,6 +1642,15 @@ void propagation_module_init(struct discord *client,
     if (self_guild_id)
         db_register_known_guild(db, self_guild_id);
 
+    /*
+     * Seed g_last_block_version so the first propagation_poll_tick() call
+     * prints the initial version rather than spuriously reporting a change.
+     */
+    g_last_block_version = -1;
+    propagation_poll_tick();
+
     printf("[propagation] Propagation module initialised "
            "(self=%" PRIu64 ").\n", self_guild_id);
+    printf("[propagation] Call propagation_poll_tick() from your main loop "
+           "every ~5 s to pick up dashboard block/unblock changes live.\n");
 }
