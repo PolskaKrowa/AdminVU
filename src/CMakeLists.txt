@@ -18,6 +18,7 @@ add_executable(discord_bot
     modules/propagation.c
     modules/fun.c
     modules/messaging.c
+    modules/personaplex_bridge.c
 )
 
 target_link_libraries(discord_bot
@@ -27,6 +28,8 @@ target_link_libraries(discord_bot
     pthread
     m
     sqlite3
+    websockets
+    sodium
 )
 
 target_include_directories(discord_bot PRIVATE
