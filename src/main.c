@@ -15,6 +15,7 @@
 #include "modules/factcheck.h"
 #include "modules/propagation.h"
 #include "modules/fun.h"
+#include "modules/chess.h"
 
 /* ── Global state ─────────────────────────────────────────────────────────── */
 
@@ -99,6 +100,7 @@ static void register_global_commands(struct discord  *client,
     register_ticket_commands(client, application_id, 0);
     register_propagation_commands(client, application_id, 0);
     register_fun_commands(client, application_id, 0);
+    register_chess_commands(client, application_id, 0);
     printf("[main] Global community commands registered.\n");
 }
 
@@ -126,6 +128,7 @@ static void *register_commands_thread(void *arg) {
         register_ticket_commands(a->client, a->application_id, gid);
         register_propagation_commands(a->client, a->application_id, gid);
         register_fun_commands(a->client, a->application_id, gid);
+        register_chess_commands(a->client, a->application_id, gid);
 
         printf("[main] Registered commands in dev guild %" PRIu64 "\n", gid);
     }
@@ -150,6 +153,7 @@ void on_ready(struct discord *client) {
     }
 
     factcheck_module_init(client);
+    chess_module_init(client);
 
     RegisterArgs *args = malloc(sizeof *args);
     if (!args) return;
@@ -216,6 +220,9 @@ void on_interaction_create_combined(struct discord *client,
                strcmp(cmd, "trivia")   == 0 ||
                strcmp(cmd, "activity") == 0) {
         on_fun_interaction(client, event);
+
+    } else if (strcmp(cmd, "chess") == 0) {
+        on_chess_interaction(client, event);
 
     } else {
         printf("[main] Unknown command: %s\n", cmd);

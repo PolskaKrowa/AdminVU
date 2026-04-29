@@ -19,6 +19,12 @@ add_executable(discord_bot
     modules/fun.c
     modules/messaging.c
     modules/personaplex_bridge.c
+    modules/chess.c
+    modules/chess/src/chess.c
+    modules/chess/src/move_lawyer.c
+    modules/chess/src/chess_engine.c
+    modules/chess/src/nnue.c
+    modules/chess/src/search.c
 )
 
 target_link_libraries(discord_bot
@@ -36,4 +42,5 @@ target_include_directories(discord_bot PRIVATE
     ${ORCA_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/asm
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/chess/include
 )
