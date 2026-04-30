@@ -19,12 +19,6 @@ add_executable(discord_bot
     modules/fun.c
     modules/messaging.c
     modules/personaplex_bridge.c
-    modules/chess.c
-    modules/chess/src/chess.c
-    modules/chess/src/move_lawyer.c
-    modules/chess/src/chess_engine.c
-    modules/chess/src/nnue.c
-    modules/chess/src/search.c
 )
 
 target_link_libraries(discord_bot
