@@ -16,9 +16,6 @@ function fmtDuration(s) {
     return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
 }
 
-/**
- * fmtTs(unixSeconds) – format a Unix timestamp as a compact local datetime.
- */
 function fmtTs(ts) {
     if (!ts) return '—';
     const d = new Date(Number(ts) * 1000);
@@ -27,17 +24,12 @@ function fmtTs(ts) {
          + `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/**
- * shortId(id) – abbreviate a Discord snowflake for display.
- * Shows last 6 digits to keep it recognisable without being overwhelming.
- */
 function shortId(id) {
     if (!id || id === '0') return '—';
     const s = String(id);
     return s.length > 6 ? '…' + s.slice(-6) : s;
 }
 
-/** esc(str) – HTML-escape a string for safe insertion. */
 function esc(str) {
     if (str == null) return '';
     return String(str)
@@ -51,10 +43,6 @@ function qs(selector, root = document) { return root.querySelector(selector); }
 
 /* ── API fetch helpers ──────────────────────────────────────────────────── */
 
-/**
- * apiGet(url) – fetch JSON from the bot's API.
- * Returns the parsed object, or null on error.
- */
 async function apiGet(url) {
     try {
         const res = await fetch(url);
@@ -67,9 +55,6 @@ async function apiGet(url) {
     }
 }
 
-/**
- * apiPost(url, body) – POST URL-encoded data, return parsed JSON or null.
- */
 async function apiPost(url, body) {
     try {
         const res = await fetch(url, {
@@ -118,7 +103,7 @@ function setStatus(state) {
     const dot   = qs('#status-dot');
     const label = qs('#status-label');
     if (!dot || !label) return;
-    dot.className   = `status-dot ${state}`;
+    dot.className     = `status-dot ${state}`;
     label.textContent = state;
 }
 
@@ -181,8 +166,29 @@ document.addEventListener('click', e => {
     });
 });
 
+/* ── Page transitions ───────────────────────────────────────────────────── */
+(function setupPageTransitions() {
+    // Intercept nav-link clicks to fade out before navigating
+    document.addEventListener('click', e => {
+        const link = e.target.closest('.nav-link');
+        if (!link) return;
+        const href = link.getAttribute('href');
+        if (!href || link.classList.contains('active')) return;
+        e.preventDefault();
+        document.body.classList.remove('loaded');
+        setTimeout(() => { window.location.href = href; }, 310);
+    }, true);
+})();
+
 /* ── Boot ────────────────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
     startFooterClock();
     setStatus('online');
+    // Double rAF ensures the browser has committed the initial opacity:0 before
+    // we add .loaded so the CSS transition actually plays
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            document.body.classList.add('loaded');
+        });
+    });
 });

@@ -3,19 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bot Dashboard</title>
+    <title>Dashboard — AdminVU</title>
     <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="page-dashboard">
 
-    <div class="scanline"></div>
+    <div class="bg-canvas">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+    </div>
 
     <header class="site-header">
         <div class="header-inner">
             <div class="logo">
-                <span class="logo-bracket">[</span>
+                <span class="logo-dot"></span>
                 <span class="logo-text">AdminVU</span>
-                <span class="logo-bracket">]</span>
             </div>
             <nav class="site-nav">
                 <a href="index.html"       class="nav-link active">Dashboard</a>
@@ -34,33 +37,38 @@
     <main class="main-content">
 
         <section class="hero">
-            <p class="hero-eyebrow">// system overview</p>
+            <p class="hero-eyebrow">System Overview</p>
             <h1 class="hero-title">Dashboard</h1>
             <p class="hero-sub">Local admin panel &mdash; accessible only from this machine.</p>
         </section>
 
         <div class="card-grid">
             <div class="card" id="card-uptime">
+                <div class="card-icon">⏱</div>
                 <div class="card-label">Uptime</div>
                 <div class="card-value mono" id="uptime-value">--:--:--</div>
                 <div class="card-sub">since process start</div>
             </div>
             <div class="card" id="card-guilds">
+                <div class="card-icon">🌐</div>
                 <div class="card-label">Guilds</div>
                 <div class="card-value mono" id="guilds-value">&mdash;</div>
                 <div class="card-sub">registered servers</div>
             </div>
             <div class="card" id="card-warnings">
+                <div class="card-icon">⚠️</div>
                 <div class="card-label">Warnings Logged</div>
                 <div class="card-value mono" id="warnings-value">&mdash;</div>
                 <div class="card-sub">all time, all guilds</div>
             </div>
             <div class="card" id="card-tickets">
+                <div class="card-icon">🎫</div>
                 <div class="card-label">Open Tickets</div>
                 <div class="card-value mono" id="tickets-value">&mdash;</div>
                 <div class="card-sub">unresolved</div>
             </div>
             <div class="card" id="card-propagation">
+                <div class="card-icon">📡</div>
                 <div class="card-label">Propagation Alerts</div>
                 <div class="card-value mono" id="prop-value">&mdash;</div>
                 <div class="card-sub">cross-server events total</div>
@@ -69,8 +77,8 @@
 
         <section class="log-section">
             <div class="log-header">
-                <span class="log-title">// recent activity</span>
-                <button class="log-clear-btn" id="log-clear">clear</button>
+                <span class="log-title">Recent Activity</span>
+                <button class="log-clear-btn" id="log-clear">Clear</button>
             </div>
             <div class="log-body" id="log-body">
                 <div class="log-line log-info">

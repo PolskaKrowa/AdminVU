@@ -3,18 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tickets — Bot Dashboard</title>
+    <title>Tickets — AdminVU</title>
     <link rel="stylesheet" href="style.css">
 </head>
-<body>
-    <div class="scanline"></div>
+<body class="page-tickets">
+
+    <div class="bg-canvas">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+    </div>
 
     <header class="site-header">
         <div class="header-inner">
             <div class="logo">
-                <span class="logo-bracket">[</span>
+                <span class="logo-dot"></span>
                 <span class="logo-text">AdminVU</span>
-                <span class="logo-bracket">]</span>
             </div>
             <nav class="site-nav">
                 <a href="index.html"       class="nav-link">Dashboard</a>
@@ -33,7 +37,7 @@
     <main class="main-content">
 
         <section class="hero">
-            <p class="hero-eyebrow">// support tickets</p>
+            <p class="hero-eyebrow">Support Tickets</p>
             <h1 class="hero-title">Tickets</h1>
             <p class="hero-sub">Live view of all support tickets across every server.</p>
         </section>
@@ -106,8 +110,8 @@
     let currentStatus = 'all';
     let currentGuild  = '';
 
-    const STATUS_CLASS = ['status-open','status-progress','status-pending',
-                          'status-resolved','status-closed'];
+    const STATUS_CLASS   = ['status-open','status-progress','status-pending',
+                             'status-resolved','status-closed'];
     const PRIORITY_CLASS = ['pri-low','pri-medium','pri-high','pri-urgent'];
 
     async function loadGuilds() {
@@ -133,8 +137,8 @@
         hideDrawer();
 
         const params = new URLSearchParams();
-        if (currentGuild)              params.set('guild_id', currentGuild);
-        if (currentStatus !== 'all')   params.set('status',   currentStatus);
+        if (currentGuild)            params.set('guild_id', currentGuild);
+        if (currentStatus !== 'all') params.set('status',   currentStatus);
 
         const data = await apiGet('/api/tickets?' + params.toString());
         if (!data) { status.textContent = 'Failed to load data.'; return; }
@@ -149,7 +153,7 @@
             const tr = document.createElement('tr');
             tr.className = 'clickable-row';
             tr.dataset.ticketId = t.id;
-            const sc = STATUS_CLASS[t.status]   || '';
+            const sc = STATUS_CLASS[t.status]    || '';
             const pc = PRIORITY_CLASS[t.priority] || '';
             tr.innerHTML = `
                 <td class="mono muted">${t.id}</td>
@@ -240,11 +244,9 @@
             </div>
         </div>`;
 
-        /* Notes */
         const notes = t.notes || [];
+        html += `<div class="notes-section"><div class="notes-title">Staff Notes${notes.length ? ` (${notes.length})` : ''}</div>`;
         if (notes.length > 0) {
-            html += `<div class="notes-section">
-                <div class="notes-title">// staff notes (${notes.length})</div>`;
             notes.forEach(n => {
                 html += `
                 <div class="note-card ${n.is_pinned ? 'note-pinned' : ''}">
@@ -256,10 +258,10 @@
                     <div class="note-content">${esc(n.content)}</div>
                 </div>`;
             });
-            html += '</div>';
         } else {
-            html += '<div class="notes-section"><div class="notes-empty">No staff notes.</div></div>';
+            html += '<div class="notes-empty">No staff notes on this ticket.</div>';
         }
+        html += '</div>';
 
         body.innerHTML = html;
     }

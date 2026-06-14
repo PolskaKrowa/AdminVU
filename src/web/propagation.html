@@ -3,18 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Propagation — Bot Dashboard</title>
+    <title>Propagation — AdminVU</title>
     <link rel="stylesheet" href="style.css">
 </head>
-<body>
-    <div class="scanline"></div>
+<body class="page-propagation">
+
+    <div class="bg-canvas">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+    </div>
 
     <header class="site-header">
         <div class="header-inner">
             <div class="logo">
-                <span class="logo-bracket">[</span>
+                <span class="logo-dot"></span>
                 <span class="logo-text">AdminVU</span>
-                <span class="logo-bracket">]</span>
             </div>
             <nav class="site-nav">
                 <a href="index.html"       class="nav-link">Dashboard</a>
@@ -33,28 +37,26 @@
     <main class="main-content">
 
         <section class="hero">
-            <p class="hero-eyebrow">// propagation</p>
+            <p class="hero-eyebrow">Propagation</p>
             <h1 class="hero-title">Cross-Server Alerts</h1>
             <p class="hero-sub">Manage opt-in servers, review propagated warnings, and block bad actors.</p>
         </section>
 
-        <!-- Two-column layout: guilds list + events log -->
         <div class="split-layout">
 
             <!-- Left: Opted-in guilds -->
             <div class="split-pane" id="pane-guilds">
                 <div class="pane-header">
-                    <span class="pane-title">// opted-in servers</span>
+                    <span class="pane-title">Opted-in Servers</span>
                     <button class="btn-refresh small" id="guilds-refresh">↺</button>
                 </div>
                 <div id="guilds-list">
                     <div class="pane-loading">Loading servers…</div>
                 </div>
 
-                <!-- Block a server manually -->
                 <div class="pane-divider"></div>
                 <div class="pane-header">
-                    <span class="pane-title">// block a server</span>
+                    <span class="pane-title">Block a Server</span>
                 </div>
                 <div class="block-form">
                     <input class="filter-input" id="block-guild-id"
@@ -69,7 +71,7 @@
             <!-- Right: Events log -->
             <div class="split-pane split-pane-wide" id="pane-events">
                 <div class="pane-header">
-                    <span class="pane-title">// alert history</span>
+                    <span class="pane-title">Alert History</span>
                     <div class="pane-actions">
                         <input class="filter-input small" id="event-user-filter"
                                placeholder="Filter by user ID…" type="text" />
@@ -105,7 +107,7 @@
 
         <!-- Blocked servers panel -->
         <div class="section-header">
-            <span class="section-title">// blocked servers</span>
+            <span class="section-title">Blocked Servers</span>
             <button class="btn-refresh small" id="blocked-refresh">↺</button>
         </div>
         <div id="blocked-status" class="table-status" style="display:none">Loading…</div>
@@ -139,8 +141,6 @@
     let evOffset     = 0;
     let evUserFilter = '';
 
-    /* ── Helpers ───────────────────────────────────────────────────── */
-
     function severityBadge(sev) {
         const rows = [
             ['sev-none', '—'],
@@ -153,7 +153,6 @@
         return `<span class="sev-badge ${cls}">${label}</span>`;
     }
 
-    /* Show an inline message inside #block-feedback (auto-hides after 4 s). */
     function showFeedback(msg, isError) {
         const el = document.getElementById('block-feedback');
         if (!el) return;
@@ -163,8 +162,6 @@
         clearTimeout(el._timer);
         el._timer = setTimeout(() => { el.style.display = 'none'; }, 4000);
     }
-
-    /* ── Opted-in guilds ───────────────────────────────────────────── */
 
     async function loadGuilds() {
         const container = document.getElementById('guilds-list');
@@ -207,8 +204,6 @@
             </div>`;
         }).join('');
     }
-
-    /* ── Alert events ──────────────────────────────────────────────── */
 
     async function loadEvents() {
         const tbody  = document.getElementById('events-tbody');
@@ -265,8 +260,6 @@
             `page ${Math.floor(evOffset / EV_PAGE_SIZE) + 1}`;
     }
 
-    /* ── Blocked servers ───────────────────────────────────────────── */
-
     async function loadBlocked() {
         const tbody  = document.getElementById('blocked-tbody');
         const status = document.getElementById('blocked-status');
@@ -292,12 +285,9 @@
             </tr>`).join('');
     }
 
-    /* ── Block / unblock ───────────────────────────────────────────── */
-
-    /* Called from quick-block buttons in the guild rows. */
     function promptBlock(guildId) {
         const reason = prompt(`Reason for blocking ${guildId} (leave blank to skip):`);
-        if (reason === null) return; /* user cancelled */
+        if (reason === null) return;
         blockGuild(guildId, reason);
     }
 
@@ -325,8 +315,6 @@
             showFeedback(`❌ Failed to unblock ${guildId}.`, true);
         }
     }
-
-    /* ── Event bindings ────────────────────────────────────────────── */
 
     document.getElementById('guilds-refresh')
         .addEventListener('click', loadGuilds);
@@ -363,7 +351,6 @@
     document.getElementById('ev-next')
         .addEventListener('click', () => { evOffset += EV_PAGE_SIZE; loadEvents(); });
 
-    /* ── Boot (scripts are at bottom of body — DOM is already ready) ─ */
     loadGuilds();
     loadEvents();
     loadBlocked();

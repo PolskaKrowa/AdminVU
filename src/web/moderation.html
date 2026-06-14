@@ -3,25 +3,29 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Moderation — Bot Dashboard</title>
+    <title>Moderation — AdminVU</title>
     <link rel="stylesheet" href="style.css">
 </head>
-<body>
-    <div class="scanline"></div>
+<body class="page-moderation">
+
+    <div class="bg-canvas">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+    </div>
 
     <header class="site-header">
         <div class="header-inner">
             <div class="logo">
-                <span class="logo-bracket">[</span>
+                <span class="logo-dot"></span>
                 <span class="logo-text">AdminVU</span>
-                <span class="logo-bracket">]</span>
             </div>
             <nav class="site-nav">
-                <a href="index.html"      class="nav-link">Dashboard</a>
-                <a href="moderation.html" class="nav-link active">Moderation</a>
-                <a href="propagation.html"class="nav-link">Propagation</a>
-                <a href="messaging.html"  class="nav-link">Messaging</a>
-                <a href="tickets.html"    class="nav-link">Tickets</a>
+                <a href="index.html"       class="nav-link">Dashboard</a>
+                <a href="moderation.html"  class="nav-link active">Moderation</a>
+                <a href="propagation.html" class="nav-link">Propagation</a>
+                <a href="messaging.html"   class="nav-link">Messaging</a>
+                <a href="tickets.html"     class="nav-link">Tickets</a>
             </nav>
             <div class="status-badge">
                 <span class="status-dot" id="status-dot"></span>
@@ -33,7 +37,7 @@
     <main class="main-content">
 
         <section class="hero">
-            <p class="hero-eyebrow">// moderation</p>
+            <p class="hero-eyebrow">Moderation</p>
             <h1 class="hero-title">Mod Logs</h1>
             <p class="hero-sub">All moderation actions recorded across every server.</p>
         </section>
@@ -67,15 +71,15 @@
             <button class="btn-refresh" id="refresh-btn">↺ Refresh</button>
         </div>
 
-        <!-- Warnings sub-section: user lookup -->
+        <!-- User warning lookup -->
         <div class="sub-section" id="warning-lookup">
             <div class="sub-section-header">
-                <span class="sub-section-title">// user warning lookup</span>
+                <span class="sub-section-title">User Warning Lookup</span>
             </div>
             <div class="lookup-row">
                 <input class="filter-input" id="user-id-input"
                        placeholder="Paste a user ID…" type="text" />
-                <button class="btn-primary" id="lookup-btn">Lookup</button>
+                <button class="btn-primary" id="lookup-btn">Look up</button>
             </div>
             <div id="warning-results"></div>
         </div>
@@ -180,7 +184,6 @@
         status.style.display = 'none';
         table.style.display  = 'table';
 
-        // Pagination controls
         const prevBtn  = document.getElementById('prev-btn');
         const nextBtn  = document.getElementById('next-btn');
         const pageInfo = document.getElementById('page-info');
