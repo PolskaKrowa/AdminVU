@@ -17,8 +17,9 @@ add_executable(discord_bot
     modules/factcheck.c
     modules/propagation.c
     modules/fun.c
+    modules/components_v2.c
     modules/messaging.c
-    modules/personaplex_bridge.c
+#    modules/personaplex_bridge.c
 )
 
 target_link_libraries(discord_bot
@@ -28,7 +29,7 @@ target_link_libraries(discord_bot
     pthread
     m
     sqlite3
-    websockets
+    ${LIB_WEBSOCKETS_LIBRARIES}
     sodium
 )
 
@@ -37,4 +38,5 @@ target_include_directories(discord_bot PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/asm
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/chess/include
+    ${LIB_WEBSOCKETS_INCLUDE_DIRS}
 )

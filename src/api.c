@@ -1147,6 +1147,112 @@ static int handle_send_message(Database *db, const char *body,
     return 200;
 }
 
+/* ── POST /api/send-components-v2 ──────────────────────────────────────── */
+/*
+ * Accepts a URL-encoded body with three required fields:
+ *   guild_id    – target guild snowflake (for logging)
+ *   channel_id  – target channel snowflake
+ *   components  – JSON array string of Components V2 component objects
+ *                 (the raw value of the "components" key, e.g.
+ *                  '[{"type":10,"content":"Hello!"}]')
+ *
+ * The `components` value is embedded directly into the IS_COMPONENTS_V2
+ * payload (flag 1<<15) and POSTed to Discord via libcurl, bypassing Orca's
+ * typed struct layer exactly as handle_send_message() does for plain text.
+ *
+ * This endpoint is for dashboard-driven sends where the component tree is
+ * already built on the client side.  For bot-internal sends, use the
+ * CV2Msg builder API (cv2_msg_new / cv2_add_text / ... / cv2_send).
+ */
+static int handle_send_components_v2(Database *db, const char *body,
+                                       size_t body_len, JB *j) {
+    (void)db;   /* not used for this route */
+
+    char guild_id_buf[64]     = {0};
+    char channel_id_buf[64]   = {0};
+    /* Components JSON can be large; give it generous room.
+     * Discord's payload cap is well above 8 KB in practice for components. */
+    char *components_buf = calloc(1, 16384);
+    if (!components_buf) {
+        jb_raw(j, "{\"error\":\"OOM allocating components buffer\"}");
+        return 500;
+    }
+
+    /* ── Parse body fields ─────────────────────────────────────────────── */
+    if (!get_body_param(body, body_len, "guild_id",
+                        guild_id_buf, sizeof guild_id_buf)
+            || !guild_id_buf[0]) {
+        jb_raw(j, "{\"error\":\"missing guild_id\"}");
+        free(components_buf);
+        return 400;
+    }
+
+    if (!get_body_param(body, body_len, "channel_id",
+                        channel_id_buf, sizeof channel_id_buf)
+            || !channel_id_buf[0]) {
+        jb_raw(j, "{\"error\":\"missing channel_id\"}");
+        free(components_buf);
+        return 400;
+    }
+
+    if (!get_body_param(body, body_len, "components",
+                        components_buf, 16384)
+            || !components_buf[0]) {
+        jb_raw(j, "{\"error\":\"missing components\"}");
+        free(components_buf);
+        return 400;
+    }
+
+    /* Basic sanity check: the value must start with '['. */
+    if (components_buf[0] != '[') {
+        jb_raw(j, "{\"error\":\"components must be a JSON array\"}");
+        free(components_buf);
+        return 400;
+    }
+
+    sqlite3_int64 guild_id   = atoll(guild_id_buf);
+    sqlite3_int64 channel_id = atoll(channel_id_buf);
+
+    /* ── Build the Components V2 envelope ────────────────────────────────
+     * {"flags":32768,"components":<components_buf>}
+     * ------------------------------------------------------------------- */
+    /* 32 bytes overhead for {"flags":32768,"components":} + NUL */
+    size_t clen  = strlen(components_buf);
+    size_t total = clen + 48;
+    char  *payload = malloc(total);
+    if (!payload) {
+        jb_raw(j, "{\"error\":\"OOM building payload\"}");
+        free(components_buf);
+        return 500;
+    }
+    snprintf(payload, total, "{\"flags\":32768,\"components\":%s}",
+             components_buf);
+    free(components_buf);
+
+    /* ── Dispatch via the bot's cv2 send helper ──────────────────────────
+     * We use the extern cv2_send_raw() shim rather than constructing a
+     * CV2Msg, since the component JSON is already assembled by the caller.
+     * ------------------------------------------------------------------- */
+    extern int bot_send_cv2_raw(sqlite3_int64 guild_id,
+                                 sqlite3_int64 channel_id,
+                                 const char   *json_payload);
+
+    int rc = bot_send_cv2_raw(guild_id, channel_id, payload);
+    free(payload);
+
+    if (rc != 0) {
+        jb_raw(j, "{\"error\":\"failed to send components v2 message\"}");
+        return 500;
+    }
+
+    jb_raw(j, "{\"ok\":true,\"guild_id\":");
+    jb_u64str(j, guild_id);
+    jb_raw(j, ",\"channel_id\":");
+    jb_u64str(j, channel_id);
+    jb_raw(j, "}");
+    return 200;
+}
+
 /* ── Router ─────────────────────────────────────────────────────────────── */
 
 int api_handle(Database *db,
@@ -1199,6 +1305,9 @@ int api_handle(Database *db,
 
     if (is_post && strcmp(path, "/api/send-message") == 0)
         return handle_send_message(db, body, body_len, &j);
+
+    if (is_post && strcmp(path, "/api/send-components-v2") == 0)
+        return handle_send_components_v2(db, body, body_len, &j);
 
     if (is_get && strcmp(path, "/api/tickets") == 0)
         return handle_tickets(db, query, &j);

@@ -17,6 +17,8 @@ pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
 # pthreads – required for off-thread slash-command registration and HTTP server
 find_package(Threads REQUIRED)
 
+pkg_check_modules(LIB_WEBSOCKETS REQUIRED libwebsockets)
+
 # Find Orca/Discord library manually
 # Check common installation paths
 find_path(ORCA_INCLUDE_DIR 
