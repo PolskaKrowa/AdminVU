@@ -42,11 +42,14 @@
  */
 
 #include "propagation.h"
+#include "database_propagation.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <unistd.h>
 
 /* ── Tunables ────────────────────────────────────────────────────────────── */
 
@@ -69,24 +72,43 @@ static uint64_t        g_self_guild  = 0;
  */
 static int64_t g_last_block_version = -1;
 
+/*
+ * In-memory cache of guild IDs the dashboard has blocked from receiving
+ * propagation alerts.  This is the "shared-state refresh path" between
+ * api.c (which writes to propagation_blocked_guilds + bumps
+ * propagation_state_version on every block/unblock) and propagation.c
+ * (which previously had to hit the DB on every single guild check during
+ * a /propagate broadcast).  The cache is refreshed by
+ * propagation_poll_tick(), which runs periodically on a dedicated thread
+ * started from propagation_module_init().
+ */
+#define MAX_BLOCKED_GUILD_CACHE 512
+static pthread_mutex_t g_blocked_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t        g_blocked_cache[MAX_BLOCKED_GUILD_CACHE];
+static int              g_blocked_cache_count = 0;
+
+/* How often the background thread re-syncs dashboard state (seconds). */
+#define PROPAGATION_POLL_INTERVAL_SECS 5
+
 /* ── Permission helpers ──────────────────────────────────────────────────── */
 
 /*
  * Returns true if the dashboard operator has blocked this guild from
  * receiving propagation alerts via POST /api/propagation/block.
- * Queries propagation_blocked_guilds directly since the database_propagation
- * layer has no wrapper for this table (it is dashboard-only).
+ *
+ * Reads from the in-memory cache populated by propagation_poll_tick(), so
+ * this is a cheap lookup even when /propagate is broadcasting to dozens of
+ * opted-in guilds.  The cache itself is refreshed at least every
+ * PROPAGATION_POLL_INTERVAL_SECS seconds and immediately reflects dashboard
+ * block/unblock actions without requiring a bot restart.
  */
 static bool is_dashboard_blocked(uint64_t guild_id) {
-    if (!g_db || !g_db->db) return false;
-    sqlite3_stmt *st;
-    const char *sql =
-        "SELECT 1 FROM propagation_blocked_guilds WHERE guild_id = ? LIMIT 1;";
-    if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) != SQLITE_OK)
-        return false;
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)guild_id);
-    bool blocked = (sqlite3_step(st) == SQLITE_ROW);
-    sqlite3_finalize(st);
+    pthread_mutex_lock(&g_blocked_cache_lock);
+    bool blocked = false;
+    for (int i = 0; i < g_blocked_cache_count; i++) {
+        if (g_blocked_cache[i] == guild_id) { blocked = true; break; }
+    }
+    pthread_mutex_unlock(&g_blocked_cache_lock);
     return blocked;
 }
 
@@ -114,21 +136,42 @@ static bool is_guild_prop_blocked(uint64_t guild_id) {
 }
 
 /*
- * propagation_poll_tick – call from the bot's main/timer loop (e.g. every
- * 5 seconds).  Reads propagation_state_version and logs whenever the
- * dashboard has made a block/unblock change that the bot should pick up.
+ * propagation_poll_tick – refreshes the in-memory blocked-guild cache from
+ * propagation_blocked_guilds and logs whenever propagation_state_version has
+ * changed (i.e. the dashboard made a block/unblock change).
  *
- * Because is_dashboard_blocked() queries the DB on every call there is no
- * in-memory cache to invalidate here; the log line is the primary signal.
- * If a local cache is added later, flush it inside the `if` branch below.
+ * Called once at startup (synchronously, so the cache is warm before the
+ * first /propagate can run) and then repeatedly by
+ * propagation_poll_thread() every PROPAGATION_POLL_INTERVAL_SECS seconds.
+ * This is the shared-state refresh path between api.c and propagation.c:
+ * dashboard block/unblock actions are picked up live, without a restart.
  */
 void propagation_poll_tick(void) {
     if (!g_db || !g_db->db) return;
 
+    /* ── Refresh the blocked-guild cache. ───────────────────────────── */
+    uint64_t fresh[MAX_BLOCKED_GUILD_CACHE];
+    int      fresh_count = 0;
+
     sqlite3_stmt *st;
-    const char *sql =
+    const char *blocked_sql = "SELECT guild_id FROM propagation_blocked_guilds;";
+    if (sqlite3_prepare_v2(g_db->db, blocked_sql, -1, &st, NULL) == SQLITE_OK) {
+        while (fresh_count < MAX_BLOCKED_GUILD_CACHE
+               && sqlite3_step(st) == SQLITE_ROW) {
+            fresh[fresh_count++] = (uint64_t)sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+    }
+
+    pthread_mutex_lock(&g_blocked_cache_lock);
+    memcpy(g_blocked_cache, fresh, (size_t)fresh_count * sizeof(uint64_t));
+    g_blocked_cache_count = fresh_count;
+    pthread_mutex_unlock(&g_blocked_cache_lock);
+
+    /* ── Log dashboard-state version changes for visibility. ─────────── */
+    const char *ver_sql =
         "SELECT version FROM propagation_state_version WHERE id = 1;";
-    if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) != SQLITE_OK)
+    if (sqlite3_prepare_v2(g_db->db, ver_sql, -1, &st, NULL) != SQLITE_OK)
         return;
 
     int64_t ver = g_last_block_version;
@@ -138,11 +181,21 @@ void propagation_poll_tick(void) {
 
     if (ver != g_last_block_version) {
         printf("[propagation] Block state version changed "
-               "%" PRId64 " → %" PRId64 " — picking up dashboard changes.\n",
-               g_last_block_version, ver);
+               "%" PRId64 " → %" PRId64 " — picked up %d blocked guild(s) "
+               "from the dashboard.\n",
+               g_last_block_version, ver, fresh_count);
         g_last_block_version = ver;
-        /* Future: flush any in-memory guild-block cache here. */
     }
+}
+
+/* Background thread: periodically re-syncs dashboard state. */
+static void *propagation_poll_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        sleep(PROPAGATION_POLL_INTERVAL_SECS);
+        propagation_poll_tick();
+    }
+    return NULL;
 }
 
 /*
@@ -272,6 +325,7 @@ static void build_alert_message(char                    *buf,
              "%s **CROSS-SERVER ALERT** – %s\n"
              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
              "A moderator in another participating server has reported behaviour that may affect other communities.\n\n"
+             "**Category:** %s %s\n"
              "**User:** <@%" PRIu64 "> (`%" PRIu64 "`)\n"
              "**Reason:** %s\n"
              "**Evidence:** %s\n"
@@ -279,7 +333,7 @@ static void build_alert_message(char                    *buf,
              "**Reported by:** <@%" PRIu64 "> (ID: `%" PRIu64 "`)\n"
              "**Time:** %s\n"
              "**Alert ID:** `#%" PRId64 "`\n"
-             "**Severity:** %s %s  |  **Confirmations:** %d server(s)\n"
+             "**Severity:** %s %s  |  **Confirmations:** %d server(s)  |  **Corroborations:** %d\n"
              "**Reports:** %d\n"
              "%s"
              "\n```\n"
@@ -291,6 +345,8 @@ static void build_alert_message(char                    *buf,
              "and quote Alert ID #%" PRId64 ".",
              severity_emoji((PropagationSeverity)ev->severity),
              severity_name ((PropagationSeverity)ev->severity),
+             propagation_category_emoji(ev->category),
+             propagation_category_name (ev->category),
              ev->target_user_id, ev->target_user_id,
              ev->reason       ? ev->reason       : "*(no reason provided)*",
              ev->evidence_url ? ev->evidence_url : "*(no URL provided)*",
@@ -303,6 +359,7 @@ static void build_alert_message(char                    *buf,
              severity_emoji((PropagationSeverity)ev->severity),
              severity_name ((PropagationSeverity)ev->severity),
              ev->weighted_confirmation_score,
+             ev->corroboration_count,
              ev->report_count,
              appeal_line ? appeal_line : "",
              ev->id);
@@ -412,9 +469,9 @@ static void broadcast_appeal_update(struct discord         *client,
     if (g_db && g_db->db) {
         sqlite3_stmt *st;
         const char *sql =
-            "SELECT pn.message_id, pc.channel_id"
+            "SELECT pn.message_id, pc.notification_channel"
             " FROM propagation_notifications pn"
-            " LEFT JOIN propagation_config pc ON pc.guild_id = pn.guild_id"
+            " LEFT JOIN propagation_guild_config pc ON pc.guild_id = pn.guild_id"
             " WHERE pn.event_id = ?;";
         if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_int64(st, 1, propagation_id);
@@ -446,6 +503,70 @@ static void broadcast_appeal_update(struct discord         *client,
     notify_central(client, msg);
 }
 
+/* ── Post severity/corroboration updates to all notified guilds ─────────── */
+/*
+ * Called when a moderator in another guild corroborates an existing alert
+ * (see handle_propagate's corroboration path).  Edits every notified
+ * guild's alert embed in place with the refreshed severity/score so the
+ * channel doesn't get a brand-new alert message — this is the fix for
+ * "confirmations require multiple propagation warnings... causes clutter".
+ */
+static void broadcast_corroboration_update(struct discord         *client,
+                                            int64_t                 propagation_id,
+                                            const PropagationEvent *ev,
+                                            GuildTrustLevel         source_trust,
+                                            uint64_t                corroborating_guild_id) {
+    char base_msg[2048];
+    build_alert_message(base_msg, sizeof(base_msg), ev, source_trust, NULL);
+
+    char full_msg[2200];
+    snprintf(full_msg, sizeof(full_msg),
+             "%s\n\n"
+             "📡 **New corroboration received** from another participating "
+             "server (guild `%" PRIu64 "`).  This is now corroboration "
+             "**#%d** for this alert.",
+             base_msg, corroborating_guild_id, ev->corroboration_count);
+
+    if (g_db && g_db->db) {
+        sqlite3_stmt *st;
+        const char *sql =
+            "SELECT pn.message_id, pc.notification_channel"
+            " FROM propagation_notifications pn"
+            " LEFT JOIN propagation_guild_config pc ON pc.guild_id = pn.guild_id"
+            " WHERE pn.event_id = ?;";
+        if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, propagation_id);
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                uint64_t msg_id = (uint64_t)sqlite3_column_int64(st, 0);
+                uint64_t ch_id  = (uint64_t)sqlite3_column_int64(st, 1);
+                if (!ch_id) continue;
+
+                if (msg_id) {
+                    struct discord_edit_message_params edit_p = {
+                        .content = full_msg,
+                    };
+                    discord_edit_message(client, ch_id, msg_id, &edit_p, NULL);
+                } else {
+                    post_to_channel(client, ch_id, full_msg);
+                }
+            }
+            sqlite3_finalize(st);
+        }
+    }
+
+    char central_msg[512];
+    snprintf(central_msg, sizeof(central_msg),
+             "📡 **Corroboration recorded – Alert #%" PRId64 "**\n"
+             "Confirming server: `%" PRIu64 "`\n"
+             "Updated severity: %s %s | Score: %d | Corroborations: %d",
+             propagation_id, corroborating_guild_id,
+             severity_emoji((PropagationSeverity)ev->severity),
+             severity_name ((PropagationSeverity)ev->severity),
+             ev->weighted_confirmation_score,
+             ev->corroboration_count);
+    notify_central(client, central_msg);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════ */
 /*  Command handlers                                                          */
 /* ══════════════════════════════════════════════════════════════════════════ */
@@ -475,6 +596,7 @@ static void handle_propagate(struct discord                  *client,
     const char *user_id_str  = get_option(event, "user");
     const char *reason       = get_option(event, "reason");
     const char *evidence_url = get_option(event, "evidence");
+    const char *category_str = get_option(event, "category");
     const char *confirm      = get_option(event, "confirm");
 
     if (!user_id_str) {
@@ -487,16 +609,55 @@ static void handle_propagate(struct discord                  *client,
                        "(screenshot, video link, etc.).");
         return;
     }
+
+    /*
+     * Restrict propagation to its two legitimate use-cases.  This is
+     * enforced as a required `category` option (with fixed choices, so the
+     * moderator can't type anything else) rather than left to the `reason`
+     * free-text field, which was too easy to misuse for ordinary
+     * single-server moderation decisions.
+     */
+    PropagationCategory category;
+    if (!category_str) {
+        send_ephemeral(client, event,
+                       "❌ You must select a **category**.\n\n"
+                       "Cross-server propagation exists for exactly two "
+                       "situations:\n"
+                       "🔓 **Compromised account** — the user's account is "
+                       "suspected of being hijacked/compromised.\n"
+                       "🌐 **Cross-server harm** — something this user did here "
+                       "may reasonably affect members of other communities "
+                       "(raiding, scams, predatory behaviour, etc.).\n\n"
+                       "Ordinary single-server moderation decisions (rule "
+                       "violations that only affect this server) should "
+                       "**not** be propagated.");
+        return;
+    } else if (strcmp(category_str, "compromised_account") == 0) {
+        category = PROP_CATEGORY_COMPROMISED_ACCOUNT;
+    } else if (strcmp(category_str, "cross_server_harm") == 0) {
+        category = PROP_CATEGORY_CROSS_SERVER_HARM;
+    } else {
+        send_ephemeral(client, event,
+                       "❌ Invalid category. Choose either "
+                       "\"Compromised account\" or \"Cross-server harm\".");
+        return;
+    }
+
     if (!confirm || strcmp(confirm, CONFIRM_PHRASE) != 0) {
-        char notice[512];
+        char notice[768];
         snprintf(notice, sizeof(notice),
                  "❌ **Confirmation required.**\n\n"
                  "Cross-server alerts are serious.  They notify moderators "
                  "in every opted-in server where the target user is a member.\n\n"
+                 "This system exists **only** for: %s **Compromised accounts** "
+                 "and %s **Cross-server harm** — not for routine single-server "
+                 "moderation.\n\n"
                  "**Misusing this system will result in your permanent removal "
                  "from it.**\n\n"
                  "To proceed, set the `confirm` option to exactly:\n"
-                 "```\n" CONFIRM_PHRASE "\n```");
+                 "```\n" CONFIRM_PHRASE "\n```",
+                 propagation_category_emoji(PROP_CATEGORY_COMPROMISED_ACCOUNT),
+                 propagation_category_emoji(PROP_CATEGORY_CROSS_SERVER_HARM));
         send_ephemeral(client, event, notice);
         return;
     }
@@ -508,12 +669,104 @@ static void handle_propagate(struct discord                  *client,
         return;
     }
 
+    /*
+     * ── Corroboration check ──────────────────────────────────────────
+     * If this user already has an active (non-vindicated) alert, merge
+     * this report into it as a corroboration instead of firing a brand
+     * new cross-server broadcast.  Without this, a user who is a member
+     * of many servers would generate a fresh flood of alert messages to
+     * every opted-in server every time a *different* server's moderator
+     * also reported them — cluttering channels with many near-duplicate
+     * alerts about the same person.
+     */
+    int64_t active_id = db_find_active_alert_for_user(g_db, target_id);
+    if (active_id > 0) {
+        PropagationEvent existing = { 0 };
+        if (db_get_propagation_event_by_id(g_db, active_id, &existing) == 0) {
+            if (existing.source_guild_id == event->guild_id) {
+                char notice[256];
+                snprintf(notice, sizeof(notice),
+                         "ℹ️ Your server already has an active alert "
+                         "(`#%" PRId64 "`) against this user.  Use "
+                         "`/propagate-report` if you believe that alert needs "
+                         "correction, rather than filing a duplicate.",
+                         active_id);
+                send_ephemeral(client, event, notice);
+                db_free_propagation_event(&existing);
+                return;
+            }
+
+            if (db_guild_has_corroborated(g_db, active_id, event->guild_id)) {
+                char notice[256];
+                snprintf(notice, sizeof(notice),
+                         "ℹ️ Your server has already corroborated alert "
+                         "`#%" PRId64 "` against this user.  No further "
+                         "action is needed.",
+                         active_id);
+                send_ephemeral(client, event, notice);
+                db_free_propagation_event(&existing);
+                return;
+            }
+
+            int64_t corrob_id = db_add_propagation_corroboration(
+                g_db, active_id, event->guild_id, moderator_id, reason, evidence_url);
+
+            if (corrob_id > 0) {
+                PropagationSeverity new_sev = db_recompute_severity(g_db, active_id);
+
+                PropagationEvent refreshed = { 0 };
+                db_get_propagation_event_by_id(g_db, active_id, &refreshed);
+                GuildTrustLevel orig_source_trust =
+                    db_get_guild_trust(g_db, refreshed.source_guild_id);
+
+                broadcast_corroboration_update(client, active_id, &refreshed,
+                                                orig_source_trust, event->guild_id);
+
+                char ack[384];
+                snprintf(ack, sizeof(ack),
+                         "✅ This user already has an active cross-server alert "
+                         "(`#%" PRId64 "`).  Your report has been merged in as "
+                         "**corroboration #%d** instead of creating a duplicate "
+                         "alert.\n"
+                         "Updated severity: %s %s.",
+                         active_id, refreshed.corroboration_count,
+                         severity_emoji(new_sev), severity_name(new_sev));
+                send_ephemeral(client, event, ack);
+
+                if (new_sev >= SEVERITY_HIGH) {
+                    char central_msg[1024];
+                    snprintf(central_msg, sizeof(central_msg),
+                             "🚨 **High-severity propagation alert (via corroboration)**\n"
+                             "Alert ID: `#%" PRId64 "`\n"
+                             "Severity: %s %s\n"
+                             "Target: `%" PRIu64 "`\n"
+                             "Corroborating guild: `%" PRIu64 "`\n"
+                             "Total corroborations: %d",
+                             active_id,
+                             severity_emoji(new_sev), severity_name(new_sev),
+                             refreshed.target_user_id,
+                             event->guild_id,
+                             refreshed.corroboration_count);
+                    notify_central(client, central_msg);
+                }
+
+                db_free_propagation_event(&refreshed);
+                db_free_propagation_event(&existing);
+                return;
+            }
+        }
+        db_free_propagation_event(&existing);
+        /* Fall through and create a new alert if corroboration failed
+         * for an unexpected reason (e.g. db error). */
+    }
+
     int64_t event_id = db_add_propagation_event(g_db,
                                                  target_id,
                                                  event->guild_id,
                                                  moderator_id,
                                                  reason,
-                                                 evidence_url);
+                                                 evidence_url,
+                                                 category);
     if (event_id < 0) {
         send_ephemeral(client, event,
                        "❌ Database error: failed to store the propagation event.  "
@@ -688,18 +941,32 @@ static void handle_pair(struct discord                  *client,
         return;
     }
 
-    /* Give the staff server PARTNER trust automatically. */
-    db_set_guild_trust(g_db, staff_id, TRUST_PARTNER, admin_id,
-                       "Automatic PARTNER trust – paired staff server");
+    /*
+     * Give the staff server a modest TRUSTED bump — being registered as a
+     * paired staff server for a community proves the pair exists, but does
+     * NOT by itself establish the kind of track record that should grant
+     * full ⭐ Partner credibility.  Granting PARTNER automatically here was
+     * the "source authenticity is too generous" issue: it let a bad actor
+     * who controls both a main and a staff server instantly make their own
+     * propagated warnings look maximally credible.  Verified/Partner status
+     * must now be granted deliberately via /propagate-trust by the central
+     * administration server, after a track record is established.
+     */
+    db_set_guild_trust(g_db, staff_id, TRUST_TRUSTED, admin_id,
+                       "Automatic TRUSTED status – paired staff server "
+                       "(Verified/Partner requires manual /propagate-trust review)");
 
     db_register_known_guild(g_db, main_id);
     db_register_known_guild(g_db, staff_id);
 
-    char msg[256];
+    char msg[384];
     snprintf(msg, sizeof(msg),
              "✅ Guild pair registered.\n"
              "Main: `%" PRIu64 "` ↔ Staff: `%" PRIu64 "`\n"
-             "The staff server has been granted ⭐ Partner trust automatically.",
+             "The staff server has been granted 🔵 Trusted status automatically.\n"
+             "⭐ Verified/Partner status is **not** granted automatically — it "
+             "must be assigned deliberately via `/propagate-trust` once the "
+             "server has an established track record.",
              main_id, staff_id);
     send_ephemeral(client, event, msg);
 
@@ -1231,15 +1498,25 @@ static void handle_central(struct discord                  *client,
         return;
     }
 
-    /* Also give the central guild PARTNER trust automatically. */
-    db_set_guild_trust(g_db, central_guild, TRUST_PARTNER, admin_id,
-                       "Automatic PARTNER trust – central admin guild");
+    /*
+     * Grant the central guild VERIFIED status automatically — it is the
+     * designated oversight server, so some elevated trust is reasonable —
+     * but stop short of ⭐ Partner.  No command in this module grants
+     * Partner automatically any more; it is reserved for a deliberate
+     * /propagate-trust action so that "Partner" remains a meaningful signal
+     * of an established track record rather than something a newly
+     * configured pair of servers gets for free.
+     */
+    db_set_guild_trust(g_db, central_guild, TRUST_VERIFIED, admin_id,
+                       "Automatic VERIFIED status – central admin guild "
+                       "(Partner requires manual /propagate-trust review)");
 
-    char msg[256];
+    char msg[320];
     snprintf(msg, sizeof(msg),
              "✅ Central administration server set.\n"
              "Guild: `%" PRIu64 "` | Channel: <#%" PRIu64 ">\n"
-             "That guild has been granted ⭐ Partner trust automatically.",
+             "That guild has been granted ✅ Verified status automatically.\n"
+             "⭐ Partner status can be assigned via `/propagate-trust` if warranted.",
              central_guild, central_channel);
     send_ephemeral(client, event, msg);
 
@@ -1372,6 +1649,24 @@ void register_propagation_commands(struct discord *client,
         .description = "URL to evidence (screenshot, video, etc.) — required",
         .required    = true,
     };
+    static struct discord_application_command_option_choice prop_cat_choice_compromised = {
+        .name  = "Compromised account (account hijacked / acting suspiciously)",
+        .value = "compromised_account",
+    };
+    static struct discord_application_command_option_choice prop_cat_choice_cross_server = {
+        .name  = "Cross-server harm (action here may affect other communities)",
+        .value = "cross_server_harm",
+    };
+    static struct discord_application_command_option_choice *prop_cat_choices[] = {
+        &prop_cat_choice_compromised, &prop_cat_choice_cross_server, NULL
+    };
+    static struct discord_application_command_option prop_category = {
+        .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
+        .name        = "category",
+        .description = "Why is this being propagated? (the ONLY two valid use-cases)",
+        .required    = true,
+        .choices     = prop_cat_choices,
+    };
     static struct discord_application_command_option prop_confirm = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "confirm",
@@ -1379,7 +1674,7 @@ void register_propagation_commands(struct discord *client,
         .required    = true,
     };
     static struct discord_application_command_option *prop_opts[] = {
-        &prop_user, &prop_reason, &prop_evidence, &prop_confirm, NULL
+        &prop_user, &prop_reason, &prop_evidence, &prop_category, &prop_confirm, NULL
     };
     static struct discord_create_guild_application_command_params prop_params = {
         .type        = DISCORD_APPLICATION_COMMAND_CHAT_INPUT,
@@ -1643,14 +1938,24 @@ void propagation_module_init(struct discord *client,
         db_register_known_guild(db, self_guild_id);
 
     /*
-     * Seed g_last_block_version so the first propagation_poll_tick() call
-     * prints the initial version rather than spuriously reporting a change.
+     * Seed g_last_block_version and warm the blocked-guild cache so the
+     * very first /propagate already respects dashboard blocks, then start
+     * the background thread that keeps the cache in sync going forward.
      */
     g_last_block_version = -1;
     propagation_poll_tick();
 
+    pthread_t poll_tid;
+    if (pthread_create(&poll_tid, NULL, propagation_poll_thread, NULL) == 0) {
+        pthread_detach(poll_tid);
+        printf("[propagation] Started background poll thread "
+               "(every %d s) to sync dashboard block/unblock state.\n",
+               PROPAGATION_POLL_INTERVAL_SECS);
+    } else {
+        fprintf(stderr, "[propagation] WARNING: failed to start poll thread; "
+                        "dashboard block/unblock changes will require a restart.\n");
+    }
+
     printf("[propagation] Propagation module initialised "
            "(self=%" PRIu64 ").\n", self_guild_id);
-    printf("[propagation] Call propagation_poll_tick() from your main loop "
-           "every ~5 s to pick up dashboard block/unblock changes live.\n");
 }

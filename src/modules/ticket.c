@@ -1732,7 +1732,7 @@ void on_ticket_message(struct discord *client,
         /* Edit the staff-channel message, preserving the [#N] **name:** header. */
         char indexed[2048];
         snprintf(indexed, sizeof indexed,
-                 "`[#%d]` **%s:** %s *(edited)*",
+                 "`%d` **%s:** %s *(edited)*",
                  idx, orig_author ? orig_author : "Staff", new_safe);
         struct discord_edit_message_params ep = { .content = indexed };
         discord_edit_message(g_client, event->channel_id, old_msg_id, &ep, NULL);
@@ -1884,7 +1884,7 @@ void on_ticket_message(struct discord *client,
             /* Edit to prepend the index badge so staff can reference it. */
             char indexed[2048];
             snprintf(indexed, sizeof indexed,
-                     "`[#%d]` **%s:** %s", idx, author_name, safe);
+                     "`%d` **%s:** %s", idx, author_name, safe);
             struct discord_edit_message_params ep = { .content = indexed };
             discord_edit_message(g_client, event->channel_id,
                                  posted_msg.id, &ep, NULL);

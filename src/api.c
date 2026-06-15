@@ -491,17 +491,17 @@ static int handle_prop_guilds(Database *db, JB *j) {
      */
     const char *sql =
         "SELECT g.guild_id,"
-        "       pc.channel_id,"
+        "       pc.notification_channel,"
         "       COALESCE(pc.opted_in, 0) AS opted_in,"
         "       CASE WHEN pb.guild_id IS NOT NULL THEN 1 ELSE 0 END AS is_blocked,"
         "       pb.reason    AS block_reason,"
         "       pb.blocked_at"
         " FROM ("
-        "   SELECT guild_id FROM propagation_config"
+        "   SELECT guild_id FROM propagation_guild_config"
         "   UNION"
         "   SELECT guild_id FROM propagation_blocked_guilds"
         " ) g"
-        " LEFT JOIN propagation_config         pc ON pc.guild_id = g.guild_id"
+        " LEFT JOIN propagation_guild_config    pc ON pc.guild_id = g.guild_id"
         " LEFT JOIN propagation_blocked_guilds pb ON pb.guild_id = g.guild_id"
         " ORDER BY g.guild_id;";
 
@@ -575,6 +575,7 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
      *           4=reason  5=evidence_url  6=timestamp
      *           7=severity  8=report_count  9=weighted_confirmation_score
      *           10=notified_count  11=appeal_status (NULL if no appeal)
+     *           12=category 13=corroboration_count
      *
      * IDs are serialised as JSON strings to preserve JS integer precision
      * for 64-bit snowflakes — this includes the alert id itself.
@@ -585,7 +586,8 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
              "       pe.moderator_id, pe.reason, pe.evidence_url, pe.timestamp,"
              "       pe.severity, pe.report_count, pe.weighted_confirmation_score,"
              "       COUNT(DISTINCT pn.guild_id) AS notified_count,"
-             "       pa.status AS appeal_status"
+             "       pa.status AS appeal_status,"
+             "       pe.category, pe.corroboration_count"
              " FROM propagation_events pe"
              " LEFT JOIN propagation_notifications pn ON pn.event_id = pe.id"
              " LEFT JOIN propagation_appeals pa ON pa.propagation_id = pe.id"
@@ -621,9 +623,11 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
         jb_printf(j, ",\"notified_count\":%d",                sqlite3_column_int(s, 10));
         /* appeal_status is NULL when no appeal has been filed. */
         if (sqlite3_column_type(s, 11) == SQLITE_NULL)
-            jb_raw(j, ",\"appeal_status\":null}");
+            jb_raw(j, ",\"appeal_status\":null");
         else
-            jb_printf(j, ",\"appeal_status\":%d}", sqlite3_column_int(s, 11));
+            jb_printf(j, ",\"appeal_status\":%d", sqlite3_column_int(s, 11));
+        jb_printf(j, ",\"category\":%d",              sqlite3_column_int(s, 12));
+        jb_printf(j, ",\"corroboration_count\":%d}",  sqlite3_column_int(s, 13));
     }
     sqlite3_finalize(s);
     jb_raw(j, "]}");

@@ -101,6 +101,22 @@ const char *appeal_status_emoji(AppealStatus a) {
     }
 }
 
+const char *propagation_category_name(PropagationCategory c) {
+    switch (c) {
+        case PROP_CATEGORY_COMPROMISED_ACCOUNT: return "Compromised Account";
+        case PROP_CATEGORY_CROSS_SERVER_HARM:   return "Cross-Server Harm";
+        default:                                return "Unknown";
+    }
+}
+
+const char *propagation_category_emoji(PropagationCategory c) {
+    switch (c) {
+        case PROP_CATEGORY_COMPROMISED_ACCOUNT: return "🔓";
+        case PROP_CATEGORY_CROSS_SERVER_HARM:   return "🌐";
+        default:                                return "❔";
+    }
+}
+
 /* ── Trust weight for severity calculation ───────────────────────────────── */
 
 static int trust_weight(GuildTrustLevel t) {
@@ -136,15 +152,46 @@ int db_propagation_init(Database *db) {
         "  timestamp                   INTEGER NOT NULL,"
         "  severity                    INTEGER NOT NULL DEFAULT 0,"
         "  weighted_confirmation_score INTEGER NOT NULL DEFAULT 0,"
-        "  report_count                INTEGER NOT NULL DEFAULT 0"
+        "  report_count                INTEGER NOT NULL DEFAULT 0,"
+        "  category                    INTEGER NOT NULL DEFAULT 0,"
+        "  corroboration_count         INTEGER NOT NULL DEFAULT 0"
         ");"
 
-        /* Which guilds have received which alerts. */
+        /*
+         * Which guilds have received which alerts.
+         *
+         * message_id stores the Discord message ID of the posted alert so
+         * broadcast_appeal_update() and corroboration updates can edit the
+         * embed in place rather than posting a follow-up. This schema must
+         * stay identical to the one created by api_init() in api.c — both
+         * use CREATE TABLE IF NOT EXISTS against the same table, and
+         * whichever runs first wins.
+         */
         "CREATE TABLE IF NOT EXISTS propagation_notifications ("
+        "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  event_id    INTEGER NOT NULL,"
+        "  guild_id    INTEGER NOT NULL,"
+        "  message_id  INTEGER NOT NULL DEFAULT 0,"
+        "  notified_at INTEGER DEFAULT (strftime('%s','now')),"
+        "  UNIQUE(event_id, guild_id)"
+        ");"
+
+        /*
+         * Corroborations: when a moderator in another guild independently
+         * reports the SAME user that an existing alert already covers, the
+         * new report is merged into the existing alert as a corroboration
+         * instead of firing a brand-new cross-server broadcast. This keeps
+         * a single alert thread per bad actor instead of cluttering every
+         * opted-in server with repeat alerts.
+         */
+        "CREATE TABLE IF NOT EXISTS propagation_corroborations ("
         "  id             INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  propagation_id INTEGER NOT NULL,"
         "  guild_id       INTEGER NOT NULL,"
-        "  notified_at    INTEGER NOT NULL,"
+        "  moderator_id   INTEGER NOT NULL,"
+        "  reason         TEXT,"
+        "  evidence_url   TEXT,"
+        "  created_at     INTEGER NOT NULL,"
         "  FOREIGN KEY(propagation_id) REFERENCES propagation_events(id),"
         "  UNIQUE(propagation_id, guild_id)"
         ");"
@@ -230,6 +277,22 @@ int db_propagation_init(Database *db) {
         sqlite3_free(err);
         return -1;
     }
+
+    /*
+     * Schema migrations for databases created before these columns were
+     * introduced. sqlite3_exec returns an error if the column already
+     * exists; silently ignore it.
+     */
+    sqlite3_exec(DB(db),
+        "ALTER TABLE propagation_events ADD COLUMN category INTEGER NOT NULL DEFAULT 0;",
+        NULL, NULL, NULL);
+    sqlite3_exec(DB(db),
+        "ALTER TABLE propagation_events ADD COLUMN corroboration_count INTEGER NOT NULL DEFAULT 0;",
+        NULL, NULL, NULL);
+    sqlite3_exec(DB(db),
+        "ALTER TABLE propagation_notifications ADD COLUMN message_id INTEGER NOT NULL DEFAULT 0;",
+        NULL, NULL, NULL);
+
     printf("[prop-db] Propagation tables ready.\n");
     return 0;
 }
@@ -241,11 +304,12 @@ int64_t db_add_propagation_event(Database   *db,
                                   uint64_t    source_guild_id,
                                   uint64_t    moderator_id,
                                   const char *reason,
-                                  const char *evidence_url) {
+                                  const char *evidence_url,
+                                  PropagationCategory category) {
     const char *sql =
         "INSERT INTO propagation_events "
-        "(target_user_id, source_guild_id, moderator_id, reason, evidence_url, timestamp) "
-        "VALUES (?, ?, ?, ?, ?, ?);";
+        "(target_user_id, source_guild_id, moderator_id, reason, evidence_url, timestamp, category) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(DB(db), sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -260,6 +324,7 @@ int64_t db_add_propagation_event(Database   *db,
     sqlite3_bind_text (stmt, 4, reason       ? reason       : "", -1, SQLITE_STATIC);
     sqlite3_bind_text (stmt, 5, evidence_url ? evidence_url : "", -1, SQLITE_STATIC);
     sqlite3_bind_int64(stmt, 6, (int64_t)time(NULL));
+    sqlite3_bind_int  (stmt, 7, (int)category);
 
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -274,9 +339,16 @@ int64_t db_add_propagation_event(Database   *db,
 int db_record_propagation_notification(Database *db,
                                         int64_t   propagation_id,
                                         uint64_t  guild_id) {
+    /*
+     * NOTE: the propagation_notifications table (created identically by
+     * api_init() and db_propagation_init()) uses the column name
+     * `event_id`, not `propagation_id` — the parameter name here refers
+     * to the propagation_events.id being notified about, but the column
+     * it is stored in is `event_id`.
+     */
     const char *sql =
         "INSERT OR IGNORE INTO propagation_notifications "
-        "(propagation_id, guild_id, notified_at) VALUES (?, ?, ?);";
+        "(event_id, guild_id, notified_at) VALUES (?, ?, ?);";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(DB(db), sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -295,10 +367,15 @@ PropagationSeverity db_recompute_severity(Database *db, int64_t propagation_id) 
     /*
      * Walk every notified guild for this event, look up its trust level,
      * sum the weights, derive a severity, and write it back.
+     *
+     * Corroborating guilds (independent reports of the same user merged
+     * into this alert via db_add_propagation_corroboration) count towards
+     * the score too — each corroboration represents another community
+     * independently confirming the same bad actor.
      */
     const char *list_sql =
         "SELECT guild_id FROM propagation_notifications "
-        "WHERE propagation_id = ?;";
+        "WHERE event_id = ?;";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(DB(db), list_sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -313,6 +390,20 @@ PropagationSeverity db_recompute_severity(Database *db, int64_t propagation_id) 
         total_score += trust_weight(t);
     }
     sqlite3_finalize(stmt);
+
+    const char *corrob_sql =
+        "SELECT guild_id FROM propagation_corroborations "
+        "WHERE propagation_id = ?;";
+
+    if (sqlite3_prepare_v2(DB(db), corrob_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, propagation_id);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            uint64_t gid = (uint64_t)sqlite3_column_int64(stmt, 0);
+            GuildTrustLevel t = db_get_guild_trust(db, gid);
+            total_score += trust_weight(t);
+        }
+        sqlite3_finalize(stmt);
+    }
 
     PropagationSeverity sev = score_to_severity(total_score);
 
@@ -349,6 +440,8 @@ static void populate_event_from_stmt(PropagationEvent *e, sqlite3_stmt *stmt) {
     e->severity                    = sqlite3_column_int  (stmt, 7);
     e->weighted_confirmation_score = sqlite3_column_int  (stmt, 8);
     e->report_count                = sqlite3_column_int  (stmt, 9);
+    e->category                    = (PropagationCategory)sqlite3_column_int(stmt, 10);
+    e->corroboration_count         = sqlite3_column_int  (stmt, 11);
 }
 
 int db_get_propagation_events(Database          *db,
@@ -361,7 +454,8 @@ int db_get_propagation_events(Database          *db,
     const char *sql =
         "SELECT id, target_user_id, source_guild_id, moderator_id, "
         "       reason, evidence_url, timestamp, severity, "
-        "       weighted_confirmation_score, report_count "
+        "       weighted_confirmation_score, report_count, "
+        "       category, corroboration_count "
         "FROM propagation_events "
         "WHERE target_user_id = ? "
         "ORDER BY timestamp DESC;";
@@ -396,7 +490,8 @@ int db_get_propagation_event_by_id(Database         *db,
     const char *sql =
         "SELECT id, target_user_id, source_guild_id, moderator_id, "
         "       reason, evidence_url, timestamp, severity, "
-        "       weighted_confirmation_score, report_count "
+        "       weighted_confirmation_score, report_count, "
+        "       category, corroboration_count "
         "FROM propagation_events WHERE id = ? LIMIT 1;";
 
     sqlite3_stmt *stmt = NULL;
@@ -905,6 +1000,124 @@ bool db_is_staff_guild(Database *db, uint64_t guild_id) {
         return false;
 
     sqlite3_bind_int64(stmt, 1, (int64_t)guild_id);
+    bool found = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/* ── Corroborations ──────────────────────────────────────────────────────── */
+
+/*
+ * Returns the most recent propagation_events.id raised against
+ * target_user_id that has NOT had an appeal approved, or -1 if no such
+ * alert exists / on error.
+ */
+int64_t db_find_active_alert_for_user(Database *db, uint64_t target_user_id) {
+    const char *sql =
+        "SELECT pe.id FROM propagation_events pe "
+        "WHERE pe.target_user_id = ? "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM propagation_appeals pa "
+        "  WHERE pa.propagation_id = pe.id AND pa.status = ?"
+        ") "
+        "ORDER BY pe.timestamp DESC LIMIT 1;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(DB(db), sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_int64(stmt, 1, (int64_t)target_user_id);
+    sqlite3_bind_int  (stmt, 2, (int)APPEAL_APPROVED);
+
+    int64_t found = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        found = sqlite3_column_int64(stmt, 0);
+
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+/*
+ * Records that a moderator in `guild_id` independently reported the same
+ * user that propagation_id already covers.  Bumps propagation_events
+ * .corroboration_count.  Returns the new corroboration row ID, -1 on
+ * error, or -1 if this guild has already corroborated this alert
+ * (UNIQUE(propagation_id, guild_id)).
+ */
+int64_t db_add_propagation_corroboration(Database   *db,
+                                          int64_t     propagation_id,
+                                          uint64_t    guild_id,
+                                          uint64_t    moderator_id,
+                                          const char *reason,
+                                          const char *evidence_url) {
+    const char *sql =
+        "INSERT OR IGNORE INTO propagation_corroborations "
+        "(propagation_id, guild_id, moderator_id, reason, evidence_url, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(DB(db), sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+
+    sqlite3_bind_int64(stmt, 1, propagation_id);
+    sqlite3_bind_int64(stmt, 2, (int64_t)guild_id);
+    sqlite3_bind_int64(stmt, 3, (int64_t)moderator_id);
+    sqlite3_bind_text (stmt, 4, reason       ? reason       : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text (stmt, 5, evidence_url ? evidence_url : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 6, (int64_t)time(NULL));
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE)
+        return -1;
+
+    /* sqlite3_changes() is 0 if the INSERT OR IGNORE hit the UNIQUE
+     * constraint (this guild already corroborated this alert). */
+    if (sqlite3_changes(DB(db)) == 0)
+        return -1;
+
+    int64_t new_id = (int64_t)sqlite3_last_insert_rowid(DB(db));
+
+    const char *bump =
+        "UPDATE propagation_events SET corroboration_count = corroboration_count + 1 "
+        "WHERE id = ?;";
+    if (sqlite3_prepare_v2(DB(db), bump, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, propagation_id);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+
+    return new_id;
+}
+
+int db_get_corroboration_count(Database *db, int64_t propagation_id) {
+    const char *sql =
+        "SELECT corroboration_count FROM propagation_events WHERE id = ? LIMIT 1;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(DB(db), sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int64(stmt, 1, propagation_id);
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+bool db_guild_has_corroborated(Database *db, int64_t propagation_id, uint64_t guild_id) {
+    const char *sql =
+        "SELECT 1 FROM propagation_corroborations "
+        "WHERE propagation_id = ? AND guild_id = ? LIMIT 1;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(DB(db), sql, -1, &stmt, NULL) != SQLITE_OK)
+        return false;
+
+    sqlite3_bind_int64(stmt, 1, propagation_id);
+    sqlite3_bind_int64(stmt, 2, (int64_t)guild_id);
     bool found = (sqlite3_step(stmt) == SQLITE_ROW);
     sqlite3_finalize(stmt);
     return found;

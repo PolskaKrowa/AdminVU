@@ -43,6 +43,11 @@ typedef enum {
     SEVERITY_CRITICAL    = 4
 } PropagationSeverity;
 
+typedef enum {
+    PROP_CATEGORY_COMPROMISED_ACCOUNT = 0,
+    PROP_CATEGORY_CROSS_SERVER_HARM = 1,
+} PropagationCategory;
+
 const char *severity_name (PropagationSeverity s);
 const char *severity_emoji(PropagationSeverity s);
 const char *severity_colour_hex(PropagationSeverity s); /* informational */
@@ -83,6 +88,8 @@ typedef struct {
     PropagationSeverity severity;
     int                 weighted_confirmation_score;
     int                 report_count;
+    PropagationCategory category;
+    int                 corroboration_count;
 } PropagationEvent;
 
 typedef struct {
@@ -106,7 +113,8 @@ int64_t db_add_propagation_event(Database   *db,
                                   uint64_t    source_guild_id,
                                   uint64_t    moderator_id,
                                   const char *reason,
-                                  const char *evidence_url);
+                                  const char *evidence_url,
+                                  PropagationCategory c);
 
 int db_record_propagation_notification(Database *db,
                                         int64_t   propagation_id,
@@ -208,3 +216,17 @@ int db_register_guild_pair(Database *db, uint64_t main_guild_id,
                            uint64_t staff_guild_id, uint64_t registered_by);
 uint64_t db_get_staff_guild_for(Database *db, uint64_t main_guild_id);
 bool db_is_staff_guild(Database *db, uint64_t guild_id);
+
+const char *propagation_category_emoji(PropagationCategory c);
+const char *propagation_category_name(PropagationCategory c);
+int64_t db_find_active_alert_for_user(Database *db, uint64_t target_user_id);
+int db_record_propagation_notification(Database *db,
+                                        int64_t   propagation_id,
+                                        uint64_t  guild_id);
+bool db_guild_has_corroborated(Database *db, int64_t propagation_id, uint64_t guild_id);
+int64_t db_add_propagation_corroboration(Database   *db,
+                                          int64_t     propagation_id,
+                                          uint64_t    guild_id,
+                                          uint64_t    moderator_id,
+                                          const char *reason,
+                                          const char *evidence_url);
