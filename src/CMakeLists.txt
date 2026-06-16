@@ -43,3 +43,8 @@ target_include_directories(discord_bot PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/chess/include
     ${LIB_WEBSOCKETS_INCLUDE_DIRS}
 )
+
+add_compile_definitions(
+    FACTCHECK_OLLAMA_MODEL="ministral-3:8b"
+    FACTCHECK_OLLAMA_URL="http://localhost:11434/api/generate"
+)
