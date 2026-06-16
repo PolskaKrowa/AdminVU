@@ -107,12 +107,17 @@
     <script>
     /* ── Tickets page logic ──────────────────────────────────────────── */
 
-    let currentStatus = 'all';
-    let currentGuild  = '';
+    let currentStatus   = 'all';
+    let currentGuild    = '';
+    let currentTicketId = null;
+    let chatPollTimer   = null;
+    let chatMode        = 'chat'; /* 'chat' | 'archive' */
 
     const STATUS_CLASS   = ['status-open','status-progress','status-pending',
-                             'status-resolved','status-closed'];
+                            'status-resolved','status-closed'];
     const PRIORITY_CLASS = ['pri-low','pri-medium','pri-high','pri-urgent'];
+    const STATUS_NAMES   = ['Open','In Progress','Pending','Resolved','Closed'];
+    const PRIORITY_NAMES = ['Low','Medium','High','Urgent'];
 
     async function loadGuilds() {
         const guilds = await apiGet('/api/guilds');
@@ -137,8 +142,8 @@
         hideDrawer();
 
         const params = new URLSearchParams();
-        if (currentGuild)            params.set('guild_id', currentGuild);
-        if (currentStatus !== 'all') params.set('status',   currentStatus);
+        if (currentGuild)              params.set('guild_id', currentGuild);
+        if (currentStatus !== 'all')   params.set('status',   currentStatus);
 
         const data = await apiGet('/api/tickets?' + params.toString());
         if (!data) { status.textContent = 'Failed to load data.'; return; }
@@ -165,21 +170,23 @@
                         ? shortId(t.assigned_to)
                         : '<span class="unassigned">—</span>'}
                 </td>
-                <td><span class="badge ${sc}">${t.status_name}</span></td>
-                <td><span class="badge ${pc}">${t.priority_name}</span></td>
+                <td><span class="badge ${sc}">${t.status_name || STATUS_NAMES[t.status] || '?'}</span></td>
+                <td><span class="badge ${pc}">${t.priority_name || PRIORITY_NAMES[t.priority] || '?'}</span></td>
                 <td class="mono muted">${fmtTs(t.created_at)}</td>
             `;
-            tr.addEventListener('click', () => openTicket(t.id));
+            tr.addEventListener('click', () => openTicket(t.id, t.status));
             tbody.appendChild(tr);
         });
 
         status.style.display = 'none';
         table.style.display  = 'table';
-        appendLog(`Loaded ${data.length} tickets.`, LogLevel.OK);
     }
 
     /* ── Ticket detail drawer ──────────────────────────────────────────── */
-    async function openTicket(id) {
+    async function openTicket(id, statusHint) {
+        currentTicketId = id;
+        chatMode        = 'chat';
+
         const drawer = document.getElementById('detail-drawer');
         const title  = document.getElementById('drawer-title');
         const body   = document.getElementById('drawer-body');
@@ -196,56 +203,61 @@
 
         const sc = STATUS_CLASS[t.status]    || '';
         const pc = PRIORITY_CLASS[t.priority] || '';
+        const isClosed = (t.status === 4);
 
+        /* ── Metadata panel ── */
         let html = `
         <div class="detail-grid">
-            <div class="detail-row">
-                <span class="detail-label">Subject</span>
-                <span class="detail-value">${esc(t.subject || '—')}</span>
-            </div>
-            <div class="detail-row">
-                <span class="detail-label">Server</span>
-                <span class="detail-value mono">${t.guild_id}</span>
-            </div>
-            <div class="detail-row">
-                <span class="detail-label">Opened by</span>
-                <span class="detail-value mono">${t.opener_id}</span>
-            </div>
-            <div class="detail-row">
-                <span class="detail-label">Assigned to</span>
+            <div class="detail-row"><span class="detail-label">Subject</span>
+                <span class="detail-value">${esc(t.subject || '—')}</span></div>
+            <div class="detail-row"><span class="detail-label">Server</span>
+                <span class="detail-value mono">${t.guild_id}</span></div>
+            <div class="detail-row"><span class="detail-label">Opened by</span>
+                <span class="detail-value mono">${t.opener_id}</span></div>
+            <div class="detail-row"><span class="detail-label">Assigned to</span>
                 <span class="detail-value mono">
                     ${t.assigned_to && t.assigned_to !== '0' ? t.assigned_to : '—'}
+                </span></div>
+            <div class="detail-row"><span class="detail-label">Status</span>
+                <span class="detail-value"><span class="badge ${sc}">${t.status_name || STATUS_NAMES[t.status]}</span></span></div>
+            <div class="detail-row"><span class="detail-label">Priority</span>
+                <span class="detail-value"><span class="badge ${pc}">${t.priority_name || PRIORITY_NAMES[t.priority]}</span></span></div>
+            <div class="detail-row"><span class="detail-label">Outcome</span>
+                <span class="detail-value">${esc(t.outcome_name || '—')}</span></div>
+            ${t.outcome_notes ? `<div class="detail-row"><span class="detail-label">Outcome notes</span>
+                <span class="detail-value">${esc(t.outcome_notes)}</span></div>` : ''}
+            <div class="detail-row"><span class="detail-label">Created</span>
+                <span class="detail-value mono">${fmtTs(t.created_at)}</span></div>
+            <div class="detail-row"><span class="detail-label">Updated</span>
+                <span class="detail-value mono">${fmtTs(t.updated_at)}</span></div>
+        </div>`;
+
+        /* ── Live chat / archive toggle button ── */
+        const chatBtnLabel = isClosed ? '📄 View Archive' : '💬 Live Chat';
+        html += `
+        <div class="chat-toggle-bar">
+            <button class="btn-chat-toggle" id="chat-toggle-btn" onclick="toggleChat(${id}, ${isClosed})">
+                ${chatBtnLabel}
+            </button>
+        </div>
+
+        <!-- Chat / archive pane — hidden until the button is clicked -->
+        <div id="chat-pane" style="display:none">
+            <div class="chat-header">
+                <span class="chat-header-label" id="chat-header-label">
+                    ${isClosed ? '📄 Ticket Archive' : '💬 Live Chat'}
                 </span>
+                ${!isClosed ? '<span class="chat-live-dot">● live</span>' : ''}
             </div>
-            <div class="detail-row">
-                <span class="detail-label">Status</span>
-                <span class="detail-value"><span class="badge ${sc}">${t.status_name}</span></span>
-            </div>
-            <div class="detail-row">
-                <span class="detail-label">Priority</span>
-                <span class="detail-value"><span class="badge ${pc}">${t.priority_name}</span></span>
-            </div>
-            <div class="detail-row">
-                <span class="detail-label">Outcome</span>
-                <span class="detail-value">${esc(t.outcome_name)}</span>
-            </div>
-            ${t.outcome_notes ? `
-            <div class="detail-row">
-                <span class="detail-label">Outcome notes</span>
-                <span class="detail-value">${esc(t.outcome_notes)}</span>
-            </div>` : ''}
-            <div class="detail-row">
-                <span class="detail-label">Created</span>
-                <span class="detail-value mono">${fmtTs(t.created_at)}</span>
-            </div>
-            <div class="detail-row">
-                <span class="detail-label">Updated</span>
-                <span class="detail-value mono">${fmtTs(t.updated_at)}</span>
+            <div class="chat-messages" id="chat-messages">
+                <div class="chat-loading">Loading messages…</div>
             </div>
         </div>`;
 
+        /* Notes */
         const notes = t.notes || [];
-        html += `<div class="notes-section"><div class="notes-title">Staff Notes${notes.length ? ` (${notes.length})` : ''}</div>`;
+        html += `<div class="notes-section">
+            <div class="notes-title">Staff Notes (${notes.length})</div>`;
         if (notes.length > 0) {
             notes.forEach(n => {
                 html += `
@@ -266,7 +278,115 @@
         body.innerHTML = html;
     }
 
+    /* ── Chat / archive toggle ─────────────────────────────────────────── */
+    function toggleChat(ticketId, isClosed) {
+        const pane = document.getElementById('chat-pane');
+        const btn  = document.getElementById('chat-toggle-btn');
+        if (!pane) return;
+
+        if (pane.style.display === 'none') {
+            pane.style.display = 'block';
+            if (isClosed) {
+                btn.textContent = '✕ Close Archive';
+                loadArchive(ticketId);
+            } else {
+                btn.textContent = '✕ Close Chat';
+                loadChat(ticketId);
+                startChatPoll(ticketId);
+            }
+        } else {
+            pane.style.display = 'none';
+            btn.textContent = isClosed ? '📄 View Archive' : '💬 Live Chat';
+            stopChatPoll();
+        }
+    }
+
+    async function loadChat(ticketId) {
+        const el = document.getElementById('chat-messages');
+        if (!el) return;
+        const data = await apiGet(`/api/tickets/${ticketId}/chat`);
+        if (!data) { el.innerHTML = '<div class="chat-error">Failed to load.</div>'; return; }
+
+        const msgs = data.messages || [];
+        if (msgs.length === 0) {
+            el.innerHTML = '<div class="chat-empty">No messages yet.</div>';
+            return;
+        }
+
+        const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+        el.innerHTML = msgs.map(m => {
+            const dir = m.direction || 'system';
+            const classes = {user:'chat-msg-user', staff:'chat-msg-staff', system:'chat-msg-system'};
+            const prefix  = {user:'👤 User', staff:'🛡️ Staff', system:'⚙️ System'};
+            return `<div class="chat-msg ${classes[dir] || 'chat-msg-system'}">
+                <div class="chat-msg-meta">
+                    <span class="chat-dir">${prefix[dir] || dir}</span>
+                    <span class="chat-ts muted">${fmtTs(m.created_at)}</span>
+                </div>
+                <div class="chat-msg-body">${esc(m.content || '')}</div>
+            </div>`;
+        }).join('');
+
+        if (atBottom) el.scrollTop = el.scrollHeight;
+    }
+
+    async function loadArchive(ticketId) {
+        const el = document.getElementById('chat-messages');
+        if (!el) return;
+        el.innerHTML = '<div class="chat-loading">Loading archive…</div>';
+
+        /* Archive is served as raw HTML — open it in a new tab for the
+         * full self-contained experience (with inline images). */
+        window.open(`/api/tickets/${ticketId}/archive`, `ticket-archive-${ticketId}`);
+        el.innerHTML = '<div class="chat-empty">Archive opened in a new tab. '
+            + `<a href="/api/tickets/${ticketId}/archive" target="_blank">Open again</a></div>`;
+    }
+
+    function startChatPoll(ticketId) {
+        stopChatPoll();
+        chatPollTimer = setInterval(() => loadChat(ticketId), 5000);
+    }
+
+    function stopChatPoll() {
+        if (chatPollTimer) { clearInterval(chatPollTimer); chatPollTimer = null; }
+    }
+
+    /* ── SSE: refresh ticket row + chat pane on ticket_chat events ───── */
+    if (window.EventSource) {
+        const es = new EventSource('/api/tickets/events');
+        es.onmessage = (e) => {
+            try {
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'ticket_chat' && msg.ticket_id === currentTicketId) {
+                    /* Append single message without a full reload. */
+                    const el = document.getElementById('chat-messages');
+                    if (el && document.getElementById('chat-pane')?.style.display !== 'none') {
+                        const dir = msg.direction || 'system';
+                        const classes = {user:'chat-msg-user',staff:'chat-msg-staff',system:'chat-msg-system'};
+                        const prefix  = {user:'👤 User',staff:'🛡️ Staff',system:'⚙️ System'};
+                        const div = document.createElement('div');
+                        div.className = `chat-msg ${classes[dir] || 'chat-msg-system'}`;
+                        div.innerHTML = `
+                            <div class="chat-msg-meta">
+                                <span class="chat-dir">${prefix[dir] || dir}</span>
+                                <span class="chat-ts muted">${fmtTs(msg.created_at)}</span>
+                            </div>
+                            <div class="chat-msg-body">${esc(msg.content || '')}</div>`;
+                        el.appendChild(div);
+                        el.scrollTop = el.scrollHeight;
+                    }
+                } else if (msg.type === 'ticket_chat') {
+                    /* A different ticket was updated — refresh the list to
+                     * reflect any status/priority changes on the row. */
+                    loadTickets();
+                }
+            } catch (_) {}
+        };
+    }
+
     function hideDrawer() {
+        stopChatPoll();
+        currentTicketId = null;
         document.getElementById('detail-drawer').style.display = 'none';
     }
 

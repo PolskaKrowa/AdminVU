@@ -7,6 +7,7 @@
 
 #include "http_server.h"
 #include "api.h"
+#include "modules/ticket.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1020,7 +1021,99 @@ static int handle_ticket_log(Database *db, const char *path, JB *j) {
     return 200;
 }
 
-/* ── GET /api/guilds/<guild_id>/channels ────────────────────────────────── */
+/* ── GET /api/tickets/<id>/chat ─────────────────────────────────────────── */
+
+/*
+ * Returns the ordered message history for a single ticket from
+ * ticket_messages.  Used by the dashboard's "live chat" view while the
+ * ticket is open (polled every few seconds alongside SSE events), and as
+ * the source for the archive button on closed tickets (see /archive below).
+ */
+static int handle_ticket_chat(Database *db, const char *path, JB *j) {
+    const char *after_tickets = path + strlen("/api/tickets/");
+    int ticket_id = atoi(after_tickets);
+    if (ticket_id <= 0) {
+        jb_raw(j, "{\"error\":\"invalid ticket id\"}");
+        return 400;
+    }
+
+    const char *sql =
+        "SELECT id, direction, author_id, author_name, content, created_at"
+        " FROM ticket_messages WHERE ticket_id = ?"
+        " ORDER BY created_at ASC, id ASC;";
+
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &s, NULL) != SQLITE_OK) {
+        jb_raw(j, "{\"error\":\"db error\"}");
+        return 500;
+    }
+    sqlite3_bind_int(s, 1, ticket_id);
+
+    jb_printf(j, "{\"ticket_id\":%d,\"messages\":[", ticket_id);
+    int first = 1;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        if (!first) jb_raw(j, ",");
+        first = 0;
+        jb_printf(j, "{\"id\":%lld", (long long)sqlite3_column_int64(s, 0));
+        jb_raw(j, ",\"direction\":"); jb_str(j, (const char *)sqlite3_column_text(s, 1));
+        jb_raw(j, ",\"author_id\":"); jb_u64str(j, (uint64_t)sqlite3_column_int64(s, 2));
+        jb_raw(j, ",\"author_name\":"); jb_str(j, (const char *)sqlite3_column_text(s, 3));
+        jb_raw(j, ",\"content\":"); jb_str(j, (const char *)sqlite3_column_text(s, 4));
+        jb_printf(j, ",\"created_at\":%lld}", (long long)sqlite3_column_int64(s, 5));
+    }
+    sqlite3_finalize(s);
+    jb_raw(j, "]}");
+    return 200;
+}
+
+/* ── GET /api/tickets/<id>/archive ─────────────────────────────────────── */
+
+/*
+ * Serves the pre-rendered HTML archive for a closed ticket.
+ * Returns the HTML directly rather than JSON (Content-Type: text/html).
+ *
+ * If the ticket is still open (no entry in ticket_archives yet), renders
+ * a live snapshot via ticket_render_archive_html().
+ */
+static int handle_ticket_archive(Database *db, const char *path, JB *j,
+                                  char **content_type_out) {
+    const char *after_tickets = path + strlen("/api/tickets/");
+    int ticket_id = atoi(after_tickets);
+    if (ticket_id <= 0) {
+        jb_raw(j, "<h1>Invalid ticket ID</h1>");
+        return 400;
+    }
+
+    /* Try pre-rendered archive first. */
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(db->db,
+            "SELECT html FROM ticket_archives WHERE ticket_id = ? LIMIT 1;",
+            -1, &s, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(s, 1, ticket_id);
+        if (sqlite3_step(s) == SQLITE_ROW) {
+            const char *html = (const char *)sqlite3_column_text(s, 0);
+            if (html) {
+                jb_raw(j, html);
+                sqlite3_finalize(s);
+                if (content_type_out) *content_type_out = "text/html; charset=utf-8";
+                return 200;
+            }
+        }
+        sqlite3_finalize(s);
+    }
+
+    /* Fall back to live render (ticket still open, or archive wasn't stored). */
+    char *html = ticket_render_archive_html(db, ticket_id);
+    if (!html) {
+        jb_raw(j, "<h1>Ticket not found or no messages yet.</h1>");
+        if (content_type_out) *content_type_out = "text/html; charset=utf-8";
+        return 404;
+    }
+    jb_raw(j, html);
+    free(html);
+    if (content_type_out) *content_type_out = "text/html; charset=utf-8";
+    return 200;
+}
 
 static int handle_channels(Database *db, const char *path, JB *j) {
     /* Extract guild_id from path "/api/guilds/<guild_id>/channels" */
@@ -1151,6 +1244,22 @@ static int handle_send_message(Database *db, const char *body,
     return 200;
 }
 
+/* ── Response Content-Type helper ─────────────────────────────────────────
+ *
+ * Non-JSON endpoints (currently only /api/tickets/<id>/archive) call
+ * api_set_response_content_type() so http_server.c can set the right header.
+ * Reset to NULL at the top of every api_handle() call.
+ * ── */
+
+static const char *g_response_content_type = NULL;
+
+void api_set_response_content_type(const char *ct) {
+    g_response_content_type = ct;
+}
+
+const char *api_get_response_content_type(void) {
+    return g_response_content_type ? g_response_content_type : "application/json";
+
 /* ── POST /api/send-components-v2 ──────────────────────────────────────── */
 /*
  * Accepts a URL-encoded body with three required fields:
@@ -1263,6 +1372,11 @@ int api_handle(Database *db,
                const char *method, const char *path,
                const char *query,  const char *body, size_t body_len,
                char *out_buf, size_t out_size) {
+    /* Reset the per-call content-type override so callers always get a
+     * valid value from api_get_response_content_type() regardless of call
+     * order. */
+    g_response_content_type = NULL;
+
     JB j = { .buf = out_buf, .pos = 0, .cap = out_size, .truncated = 0 };
     out_buf[0] = '\0';
 
@@ -1324,6 +1438,28 @@ int api_handle(Database *db,
     if (is_get && strncmp(path, "/api/tickets/", 13) == 0
                && strstr(path + 13, "/log") != NULL)
         return handle_ticket_log(db, path, &j);
+
+    /* /api/tickets/<id>/chat — live message history (user/staff/system). */
+    if (is_get && strncmp(path, "/api/tickets/", 13) == 0
+               && strstr(path + 13, "/chat") != NULL)
+        return handle_ticket_chat(db, path, &j);
+
+    /* /api/tickets/<id>/archive — full HTML transcript. */
+    if (is_get && strncmp(path, "/api/tickets/", 13) == 0
+               && strstr(path + 13, "/archive") != NULL) {
+        char *ct = NULL;
+        int status = handle_ticket_archive(db, path, &j, &ct);
+        if (ct) {
+            /* Signal text/html to the caller — api_handle sets the
+             * Content-Type header.  Abuse the JB buffer as a plain
+             * string: it already contains raw HTML. */
+            /* NOTE: the caller (api_handle) reads j.buf and the return
+             * value; it must set Content-Type: text/html in this case.
+             * We communicate via a static thread-local flag. */
+            api_set_response_content_type(ct);
+        }
+        return status;
+    }
 
     if (is_get && strncmp(path, "/api/tickets/", 13) == 0)
         return handle_ticket_detail(db, path, &j);

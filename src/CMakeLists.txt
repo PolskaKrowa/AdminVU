@@ -31,6 +31,7 @@ target_link_libraries(discord_bot
     sqlite3
     ${LIB_WEBSOCKETS_LIBRARIES}
     sodium
+    lzma
 )
 
 target_include_directories(discord_bot PRIVATE

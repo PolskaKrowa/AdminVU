@@ -43,6 +43,7 @@
 
 #include "propagation.h"
 #include "database_propagation.h"
+#include "ticket.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1545,10 +1546,13 @@ void on_propagation_interaction(struct discord                  *client,
          * "Open Linked Ticket" button posted alongside every alert embed.
          * custom_id format: "prop_ticket:<alert_id>"
          *
-         * Records the intent in propagation_linked_tickets immediately.
-         * The actual ticket channel is created by the ticket module when
-         * the user subsequently runs /ticket open (or if the bot has
-         * slash-command pre-fill support, that flow can be extended here).
+         * Creates a linked support ticket immediately via
+         * ticket_open_for_propagation() (which was previously not called at
+         * all — the button only logged "intent" and told the user to run
+         * /ticket open themselves, which is why auto-ticket creation never
+         * worked).  The ticket_id is then stored in
+         * propagation_linked_tickets so the dashboard can surface both the
+         * alert and its linked ticket together.
          */
         if (strncmp(cid, "prop_ticket:", 12) == 0) {
             int64_t  alert_id = (int64_t)strtoll(cid + 12, NULL, 10);
@@ -1561,42 +1565,68 @@ void on_propagation_interaction(struct discord                  *client,
                 return;
             }
 
-            /* Verify the alert exists and this guild received it. */
+            /* Verify the alert exists. */
             PropagationEvent ev = { 0 };
             if (db_get_propagation_event_by_id(g_db, alert_id, &ev) != 0) {
                 send_ephemeral(client, event, "❌ Alert not found.");
                 return;
             }
-            db_free_propagation_event(&ev);
 
-            /* Record the linked-ticket intent (ticket_id filled in later). */
+            /* Determine the opener's display name for the ticket channel
+             * header (member nick → username → "User"). */
+            const char *uname = "User";
+            if (event->member) {
+                if (event->member->nick && event->member->nick[0])
+                    uname = event->member->nick;
+                else if (event->member->user && event->member->user->username
+                         && event->member->user->username[0])
+                    uname = event->member->user->username;
+            }
+
+            char subject[200];
+            snprintf(subject, sizeof(subject),
+                     "Propagation alert #%" PRId64 " – linked ticket", alert_id);
+
+            int ticket_id = 0;
+            int trc = ticket_open_for_propagation(client, guild_id, user_id,
+                                                   uname, subject, &ticket_id);
+
+            if (trc != 0) {
+                send_ephemeral(client, event,
+                               "❌ Could not open a linked ticket. "
+                               "The ticket system may not be configured for "
+                               "this server — an admin must run `/ticketconfig` first.");
+                db_free_propagation_event(&ev);
+                return;
+            }
+
+            /* Persist the link. */
             if (g_db && g_db->db) {
                 sqlite3_stmt *st;
                 const char *sql =
-                    "INSERT OR IGNORE INTO propagation_linked_tickets"
-                    " (alert_id, guild_id, opener_id)"
-                    " VALUES (?, ?, ?);";
+                    "INSERT OR REPLACE INTO propagation_linked_tickets"
+                    " (alert_id, guild_id, opener_id, ticket_id)"
+                    " VALUES (?, ?, ?, ?);";
                 if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) == SQLITE_OK) {
                     sqlite3_bind_int64(st, 1, alert_id);
                     sqlite3_bind_int64(st, 2, (sqlite3_int64)guild_id);
                     sqlite3_bind_int64(st, 3, (sqlite3_int64)user_id);
+                    sqlite3_bind_int  (st, 4, ticket_id);
                     sqlite3_step(st);
                     sqlite3_finalize(st);
                 }
             }
 
-            /* Instruct the user how to open the ticket. */
             char reply[512];
             snprintf(reply, sizeof(reply),
-                     "🎫 **Open a linked ticket for Alert #%" PRId64 "**\n\n"
-                     "Your intent has been logged.  To open the ticket, run:\n"
-                     "```\n/ticket open subject:Propagation alert #%" PRId64 "\n```\n"
-                     "Include the alert ID in your first message so staff can "
-                     "look it up quickly.\n\n"
-                     "If you are the **warned user** and want to dispute this "
+                     "🎫 **Linked ticket #%d opened for Alert #%" PRId64 ".**\n\n"
+                     "A ticket channel has been created in the staff server. "
+                     "Staff will be in touch shortly.\n\n"
+                     "If you are the **warned user** and wish to dispute this "
                      "alert, use `/propagate-appeal alert_id:%" PRId64 "` instead.",
-                     alert_id, alert_id, alert_id);
+                     ticket_id, alert_id, alert_id);
             send_ephemeral(client, event, reply);
+            db_free_propagation_event(&ev);
             return;
         }
 

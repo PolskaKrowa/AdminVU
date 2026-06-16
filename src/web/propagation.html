@@ -42,6 +42,7 @@
             <p class="hero-sub">Manage opt-in servers, review propagated warnings, and block bad actors.</p>
         </section>
 
+        <!-- Two-column layout: guilds list + events log -->
         <div class="split-layout">
 
             <!-- Left: Opted-in guilds -->
@@ -54,6 +55,7 @@
                     <div class="pane-loading">Loading servers…</div>
                 </div>
 
+                <!-- Block a server manually -->
                 <div class="pane-divider"></div>
                 <div class="pane-header">
                     <span class="pane-title">Block a Server</span>
@@ -85,12 +87,15 @@
                         <tr>
                             <th>ID</th>
                             <th>Severity</th>
+                            <th>Category</th>
                             <th>Time</th>
                             <th>Target</th>
                             <th>Source Server</th>
                             <th>Moderator</th>
                             <th>Notified</th>
+                            <th>Corroborations</th>
                             <th>Reports</th>
+                            <th>Appeal</th>
                             <th>Reason / Evidence</th>
                         </tr>
                     </thead>
@@ -141,6 +146,8 @@
     let evOffset     = 0;
     let evUserFilter = '';
 
+    /* ── Helpers ───────────────────────────────────────────────────── */
+
     function severityBadge(sev) {
         const rows = [
             ['sev-none', '—'],
@@ -153,6 +160,7 @@
         return `<span class="sev-badge ${cls}">${label}</span>`;
     }
 
+    /* Show an inline message inside #block-feedback (auto-hides after 4 s). */
     function showFeedback(msg, isError) {
         const el = document.getElementById('block-feedback');
         if (!el) return;
@@ -162,6 +170,8 @@
         clearTimeout(el._timer);
         el._timer = setTimeout(() => { el.style.display = 'none'; }, 4000);
     }
+
+    /* ── Opted-in guilds ───────────────────────────────────────────── */
 
     async function loadGuilds() {
         const container = document.getElementById('guilds-list');
@@ -185,7 +195,7 @@
                 <div class="guild-info">
                     <span class="guild-id mono">${shortId(g.guild_id)}</span>
                     <span class="guild-full mono muted" title="${g.guild_id}">${g.guild_id}</span>
-                    <span class="guild-channel muted">ch: ${shortId(g.channel_id)}</span>
+                    <span class="guild-channel muted">ch: ${shortId(g.notification_channel)}</span>
                 </div>
                 <div class="guild-badges">
                     <span class="badge ${g.opted_in ? 'badge-ok' : 'badge-muted'}">
@@ -204,6 +214,23 @@
             </div>`;
         }).join('');
     }
+
+    function categoryBadge(cat) {
+        if (cat === 0) return '<span class="cat-badge cat-compromised">🔓 Compromised</span>';
+        if (cat === 1) return '<span class="cat-badge cat-crossserver">🌐 Cross-server</span>';
+        return '<span class="cat-badge cat-unknown">❓ Unknown</span>';
+    }
+
+    function appealBadge(status) {
+        if (status === null || status === undefined)
+            return '<span class="muted">—</span>';
+        const labels = ['⏳ Pending', '🔍 Review', '✅ Approved', '❌ Denied'];
+        const classes = ['badge-warn', 'badge-info', 'badge-ok', 'badge-danger'];
+        const i = Math.max(0, Math.min(3, status));
+        return `<span class="badge ${classes[i]}">${labels[i]}</span>`;
+    }
+
+    /* ── Alert events ──────────────────────────────────────────────── */
 
     async function loadEvents() {
         const tbody  = document.getElementById('events-tbody');
@@ -232,15 +259,19 @@
         rows.forEach(ev => {
             const tr = document.createElement('tr');
             const reportClass = (ev.report_count > 0) ? 'warn-text' : 'muted';
+            const corrob = ev.corroboration_count || 0;
             tr.innerHTML = `
                 <td class="mono muted">#${ev.id}</td>
                 <td>${severityBadge(ev.severity)}</td>
+                <td>${categoryBadge(ev.category)}</td>
                 <td class="mono muted">${fmtTs(ev.timestamp)}</td>
                 <td class="mono copyable" title="${ev.target_user_id}">${shortId(ev.target_user_id)}</td>
                 <td class="mono copyable muted" title="${ev.source_guild_id}">${shortId(ev.source_guild_id)}</td>
                 <td class="mono muted" title="${ev.moderator_id}">${shortId(ev.moderator_id)}</td>
                 <td class="mono">${ev.notified_count ?? 0}</td>
+                <td class="mono ${corrob > 0 ? 'ok-text' : 'muted'}">${corrob}</td>
                 <td class="mono ${reportClass}">${ev.report_count ?? 0}</td>
+                <td>${appealBadge(ev.appeal_status)}</td>
                 <td class="reason-cell">
                     <span>${esc(ev.reason || '—')}</span>
                     ${ev.evidence_url
@@ -259,6 +290,20 @@
         document.getElementById('ev-page-info').textContent =
             `page ${Math.floor(evOffset / EV_PAGE_SIZE) + 1}`;
     }
+
+    /* ── Live polling (every 15 s) so block/unblock changes made by the bot
+     * or another dashboard session are reflected without a manual refresh. ── */
+    let _pollTimer = null;
+    function startPolling() {
+        if (_pollTimer) clearInterval(_pollTimer);
+        _pollTimer = setInterval(() => {
+            loadGuilds();
+            loadEvents();
+            loadBlocked();
+        }, 15000);
+    }
+
+    /* ── Blocked servers ───────────────────────────────────────────── */
 
     async function loadBlocked() {
         const tbody  = document.getElementById('blocked-tbody');
@@ -285,9 +330,12 @@
             </tr>`).join('');
     }
 
+    /* ── Block / unblock ───────────────────────────────────────────── */
+
+    /* Called from quick-block buttons in the guild rows. */
     function promptBlock(guildId) {
         const reason = prompt(`Reason for blocking ${guildId} (leave blank to skip):`);
-        if (reason === null) return;
+        if (reason === null) return; /* user cancelled */
         blockGuild(guildId, reason);
     }
 
@@ -315,6 +363,8 @@
             showFeedback(`❌ Failed to unblock ${guildId}.`, true);
         }
     }
+
+    /* ── Event bindings ────────────────────────────────────────────── */
 
     document.getElementById('guilds-refresh')
         .addEventListener('click', loadGuilds);
@@ -351,9 +401,11 @@
     document.getElementById('ev-next')
         .addEventListener('click', () => { evOffset += EV_PAGE_SIZE; loadEvents(); });
 
+    /* ── Boot (scripts are at bottom of body — DOM is already ready) ─ */
     loadGuilds();
     loadEvents();
     loadBlocked();
+    startPolling();
     </script>
 </body>
 </html>

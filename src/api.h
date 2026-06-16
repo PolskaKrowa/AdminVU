@@ -21,6 +21,8 @@
  *   GET  /api/tickets           ?guild_id=X&status=all
  *   GET  /api/tickets/<id>
  *   GET  /api/tickets/<id>/log
+ *   GET  /api/tickets/<id>/chat      live message history (JSON)
+ *   GET  /api/tickets/<id>/archive   self-contained HTML transcript
  */
 
 #include "database.h"
@@ -56,5 +58,20 @@ int api_handle(Database *db,
                const char *method, const char *path,
                const char *query,  const char *body, size_t body_len,
                char *out_buf, size_t out_size);
+
+/*
+ * api_set_response_content_type / api_get_response_content_type
+ *
+ * When api_handle() serves a non-JSON response (currently only
+ * GET /api/tickets/<id>/archive which returns text/html), it calls
+ * api_set_response_content_type() so the http_server can set the correct
+ * Content-Type header.  The caller must read it immediately after
+ * api_handle() returns and before any other call into this module.
+ *
+ * The default (when unset or after api_handle resets it) is
+ * "application/json".
+ */
+void        api_set_response_content_type(const char *ct);
+const char *api_get_response_content_type(void);
 
 #endif /* API_H */

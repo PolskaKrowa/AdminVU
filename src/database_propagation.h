@@ -63,6 +63,27 @@ typedef enum {
 const char *trust_level_name (GuildTrustLevel t);
 const char *trust_level_badge(GuildTrustLevel t);  /* emoji badge */
 
+/* ── Alert category ──────────────────────────────────────────────────────── */
+/*
+ * Propagation alerts must be restricted to one of two legitimate use-cases:
+ *
+ *   COMPROMISED_ACCOUNT  – the target's account is suspected of being
+ *                           compromised/hijacked (account-security risk).
+ *   CROSS_SERVER_HARM    – the target did something in one server that may
+ *                           reasonably affect members of other communities
+ *                           (raiding, scams, predatory behaviour, etc.).
+ *
+ * The category is required on /propagate and is shown on every alert so
+ * reviewers/appeals can judge whether the propagation was used appropriately.
+ */
+typedef enum {
+    PROP_CATEGORY_COMPROMISED_ACCOUNT = 0,
+    PROP_CATEGORY_CROSS_SERVER_HARM   = 1
+} PropagationCategory;
+
+const char *propagation_category_name(PropagationCategory c);
+const char *propagation_category_emoji(PropagationCategory c);
+
 /* ── Appeal status ───────────────────────────────────────────────────────── */
 typedef enum {
     APPEAL_PENDING      = 0,
@@ -114,7 +135,39 @@ int64_t db_add_propagation_event(Database   *db,
                                   uint64_t    moderator_id,
                                   const char *reason,
                                   const char *evidence_url,
-                                  PropagationCategory c);
+                                  PropagationCategory category);
+
+/*
+ * db_find_active_alert_for_user
+ *
+ * Returns the most recent propagation_events.id raised against
+ * target_user_id that has NOT had an appeal approved (i.e. the user has not
+ * been vindicated for that alert), or -1 if no such alert exists.
+ *
+ * Used by /propagate to decide whether a new report against an
+ * already-flagged user should be merged into the existing alert as a
+ * corroboration rather than firing a brand-new cross-server broadcast.
+ */
+int64_t db_find_active_alert_for_user(Database *db, uint64_t target_user_id);
+
+/*
+ * db_add_propagation_corroboration
+ *
+ * Records that a moderator in `guild_id` independently reported the same
+ * user that an existing alert already covers.  Returns the new
+ * corroboration row ID, or -1 on error / duplicate (one corroboration per
+ * guild per alert).
+ */
+int64_t db_add_propagation_corroboration(Database   *db,
+                                          int64_t     propagation_id,
+                                          uint64_t    guild_id,
+                                          uint64_t    moderator_id,
+                                          const char *reason,
+                                          const char *evidence_url);
+
+int db_get_corroboration_count(Database *db, int64_t propagation_id);
+
+bool db_guild_has_corroborated(Database *db, int64_t propagation_id, uint64_t guild_id);
 
 int db_record_propagation_notification(Database *db,
                                         int64_t   propagation_id,
@@ -216,17 +269,3 @@ int db_register_guild_pair(Database *db, uint64_t main_guild_id,
                            uint64_t staff_guild_id, uint64_t registered_by);
 uint64_t db_get_staff_guild_for(Database *db, uint64_t main_guild_id);
 bool db_is_staff_guild(Database *db, uint64_t guild_id);
-
-const char *propagation_category_emoji(PropagationCategory c);
-const char *propagation_category_name(PropagationCategory c);
-int64_t db_find_active_alert_for_user(Database *db, uint64_t target_user_id);
-int db_record_propagation_notification(Database *db,
-                                        int64_t   propagation_id,
-                                        uint64_t  guild_id);
-bool db_guild_has_corroborated(Database *db, int64_t propagation_id, uint64_t guild_id);
-int64_t db_add_propagation_corroboration(Database   *db,
-                                          int64_t     propagation_id,
-                                          uint64_t    guild_id,
-                                          uint64_t    moderator_id,
-                                          const char *reason,
-                                          const char *evidence_url);

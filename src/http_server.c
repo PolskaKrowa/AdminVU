@@ -223,16 +223,18 @@ static void handle_client(int client_fd, HttpServer *srv) {
                                 body, body_len,
                                 api_buf, sizeof(api_buf));
 
-        const char *mime = "application/json";
+        /* api_handle() sets the response content-type via
+         * api_set_response_content_type() when it returns non-JSON (e.g.
+         * the /api/tickets/<id>/archive HTML endpoint). */
+        const char *mime = api_get_response_content_type();
 
         const char *status_text = "OK";
-        if      (status == 299) { status = 200; mime = "text/html; charset=utf-8"; }
-        else if (status == 400) status_text = "Bad Request";
+        if      (status == 400) status_text = "Bad Request";
         else if (status == 404) status_text = "Not Found";
         else if (status == 500) status_text = "Internal Server Error";
 
         send_response(client_fd, status, status_text,
-                      "application/json",
+                      mime,
                       api_buf, strlen(api_buf));
         return;
     }
