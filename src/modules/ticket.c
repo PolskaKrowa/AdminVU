@@ -1087,6 +1087,8 @@ static size_t base64_encode(const unsigned char *in, size_t in_len,
  * upload limit is 10 MiB; stay comfortably under it). */
 #define MAX_RELAY_ATTACHMENT_BYTES (8 * 1024 * 1024)
 
+#define MAX_RELAY_ATTACHMENTS 10
+
 struct dl_buf { unsigned char *data; size_t len; size_t cap; };
 
 static size_t dl_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
@@ -1245,7 +1247,7 @@ static ORCAcode post_message_with_attachments(u64_snowflake_t channel_id,
     return discord_create_message(g_client, channel_id, &params, out_msg);
 }
 
-
+ /*
  * Inserts a Unicode zero-width space (U+200B, encoded as UTF-8 0xE2 0x80 0x8B)
  * after every '@' so Discord does not resolve @everyone, @here, <@id>, <@&id>.
  * The result is invisible to readers but breaks the mention trigger.
@@ -1747,7 +1749,7 @@ static void close_ticket(struct discord *client,
     }
 
     /* Summary in ticket channel. */
-    char summary[256];
+    char summary[262];
     snprintf(summary, sizeof summary,
              "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
              "🔒 **Ticket #%d closed by %s**\n"

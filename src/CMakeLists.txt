@@ -4,6 +4,8 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
 
+find_package(LibLZMA REQUIRED)
+
 add_executable(discord_bot
     main.c
     env_parser.c
@@ -31,7 +33,7 @@ target_link_libraries(discord_bot
     sqlite3
     ${LIB_WEBSOCKETS_LIBRARIES}
     sodium
-    lzma
+    LibLZMA::LibLZMA
 )
 
 target_include_directories(discord_bot PRIVATE

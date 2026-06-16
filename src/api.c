@@ -1259,6 +1259,7 @@ void api_set_response_content_type(const char *ct) {
 
 const char *api_get_response_content_type(void) {
     return g_response_content_type ? g_response_content_type : "application/json";
+}
 
 /* ── POST /api/send-components-v2 ──────────────────────────────────────── */
 /*

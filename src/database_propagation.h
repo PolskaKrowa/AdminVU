@@ -43,11 +43,6 @@ typedef enum {
     SEVERITY_CRITICAL    = 4
 } PropagationSeverity;
 
-typedef enum {
-    PROP_CATEGORY_COMPROMISED_ACCOUNT = 0,
-    PROP_CATEGORY_CROSS_SERVER_HARM = 1,
-} PropagationCategory;
-
 const char *severity_name (PropagationSeverity s);
 const char *severity_emoji(PropagationSeverity s);
 const char *severity_colour_hex(PropagationSeverity s); /* informational */
