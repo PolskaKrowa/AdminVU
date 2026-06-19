@@ -20,16 +20,20 @@
                 <span class="logo-dot"></span>
                 <span class="logo-text">AdminVU</span>
             </div>
-            <nav class="site-nav">
-                <a href="index.html"       class="nav-link">Dashboard</a>
+            <nav class="site-nav" aria-label="Primary">
+                <a href="index.html"       class="nav-link">Home</a>
+                <a href="dashboard.html"   class="nav-link">Dashboard</a>
                 <a href="moderation.html"  class="nav-link">Moderation</a>
                 <a href="propagation.html" class="nav-link">Propagation</a>
                 <a href="messaging.html"   class="nav-link">Messaging</a>
                 <a href="tickets.html"     class="nav-link active">Tickets</a>
             </nav>
-            <div class="status-badge">
-                <span class="status-dot" id="status-dot"></span>
-                <span class="status-label" id="status-label">connecting…</span>
+            <div class="header-tools">
+                <div class="status-badge">
+                    <span class="status-dot" id="status-dot"></span>
+                    <span class="status-label" id="status-label">connecting…</span>
+                </div>
+                <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
             </div>
         </div>
     </header>
@@ -39,19 +43,22 @@
         <section class="hero">
             <p class="hero-eyebrow">Support Tickets</p>
             <h1 class="hero-title">Tickets</h1>
-            <p class="hero-sub">Live view of all support tickets across every server.</p>
+            <p class="hero-sub">
+                Live view of every support ticket across every server. Click a row to
+                open the detail drawer — metadata, live chat, archive, and staff notes.
+            </p>
         </section>
 
         <!-- Filters -->
         <div class="filter-bar">
             <div class="filter-group">
-                <label class="filter-label">Server</label>
+                <label class="filter-label" for="guild-select">Server</label>
                 <select class="filter-select" id="guild-select">
                     <option value="">All servers</option>
                 </select>
             </div>
             <div class="filter-group">
-                <label class="filter-label">Status</label>
+                <span class="filter-label">Status</span>
                 <div class="tab-bar" id="status-tabs">
                     <button class="tab active" data-status="all">All</button>
                     <button class="tab" data-status="0">Open</button>
@@ -65,7 +72,7 @@
         </div>
 
         <!-- Ticket table -->
-        <div class="table-container">
+        <div class="table-wrap">
             <div class="table-status" id="table-status">Loading…</div>
             <table class="data-table" id="ticket-table" style="display:none">
                 <thead>
@@ -88,7 +95,7 @@
         <div class="detail-drawer" id="detail-drawer" style="display:none">
             <div class="drawer-header">
                 <span class="drawer-title" id="drawer-title">Ticket #—</span>
-                <button class="drawer-close" id="drawer-close">✕</button>
+                <button class="drawer-close" id="drawer-close" aria-label="Close">✕</button>
             </div>
             <div class="drawer-body" id="drawer-body">
                 <!-- Populated by JS -->
@@ -98,9 +105,23 @@
     </main>
 
     <footer class="site-footer">
-        <span>running on <span class="mono">127.0.0.1:8080</span></span>
-        <span class="footer-sep">&middot;</span>
-        <span id="footer-time" class="mono"></span>
+        <div class="footer-inner">
+            <span class="footer-brand">
+                <span class="logo-dot" style="width:8px;height:8px;display:inline-block;"></span>
+                AdminVU
+            </span>
+            <span class="footer-sep">·</span>
+            <span>running locally on <span class="mono">127.0.0.1:8080</span></span>
+            <span class="footer-sep">·</span>
+            <span class="mono" id="footer-time">--:--:--</span>
+            <div class="footer-links">
+                <a href="index.html">Home</a>
+                <a href="dashboard.html">Dashboard</a>
+                <a href="moderation.html">Moderation</a>
+                <a href="propagation.html">Propagation</a>
+                <a href="messaging.html">Messaging</a>
+            </div>
+        </div>
     </footer>
 
     <script src="script.js"></script>
@@ -119,14 +140,18 @@
     const STATUS_NAMES   = ['Open','In Progress','Pending','Resolved','Closed'];
     const PRIORITY_NAMES = ['Low','Medium','High','Urgent'];
 
+    /* Unified /api/guilds shape: { guilds: [ { id, name, warning_count, ticket_count } ] } */
     async function loadGuilds() {
-        const guilds = await apiGet('/api/guilds');
-        if (!guilds) return;
+        const data = await apiGet('/api/guilds');
+        if (!data || !data.guilds) {
+            appendLog('Failed to load guilds', LogLevel.ERROR);
+            return;
+        }
         const sel = document.getElementById('guild-select');
-        guilds.forEach(g => {
+        data.guilds.forEach(g => {
             const opt = document.createElement('option');
-            opt.value = g.guild_id;
-            opt.textContent = `Server ${shortId(g.guild_id)}  (${g.ticket_count} tickets)`;
+            opt.value = g.id;
+            opt.textContent = `${g.name}  (${g.ticket_count ?? 0} tickets)`;
             sel.appendChild(opt);
         });
     }
@@ -136,20 +161,20 @@
         const table  = document.getElementById('ticket-table');
         const status = document.getElementById('table-status');
 
-        status.textContent = 'Loading…';
+        status.textContent   = 'Loading…';
         status.style.display = 'block';
         table.style.display  = 'none';
         hideDrawer();
 
         const params = new URLSearchParams();
-        if (currentGuild)              params.set('guild_id', currentGuild);
-        if (currentStatus !== 'all')   params.set('status',   currentStatus);
+        if (currentGuild)            params.set('guild_id', currentGuild);
+        if (currentStatus !== 'all') params.set('status',   currentStatus);
 
         const data = await apiGet('/api/tickets?' + params.toString());
         if (!data) { status.textContent = 'Failed to load data.'; return; }
 
         if (data.length === 0) {
-            status.textContent = 'No tickets found.';
+            status.textContent = 'No tickets found — try clearing the filters.';
             return;
         }
 
@@ -241,7 +266,6 @@
             </button>
         </div>
 
-        <!-- Chat / archive pane — hidden until the button is clicked -->
         <div id="chat-pane" style="display:none">
             <div class="chat-header">
                 <span class="chat-header-label" id="chat-header-label">
@@ -257,7 +281,7 @@
         /* Notes */
         const notes = t.notes || [];
         html += `<div class="notes-section">
-            <div class="notes-title">Staff Notes (${notes.length})</div>`;
+            <div class="notes-title">📌 Staff Notes (${notes.length})</div>`;
         if (notes.length > 0) {
             notes.forEach(n => {
                 html += `
@@ -271,7 +295,7 @@
                 </div>`;
             });
         } else {
-            html += '<div class="notes-empty">No staff notes on this ticket.</div>';
+            html += '<div class="notes-empty">No staff notes on this ticket yet.</div>';
         }
         html += '</div>';
 
@@ -335,8 +359,7 @@
         if (!el) return;
         el.innerHTML = '<div class="chat-loading">Loading archive…</div>';
 
-        /* Archive is served as raw HTML — open it in a new tab for the
-         * full self-contained experience (with inline images). */
+        /* Archive is served as raw HTML — open it in a new tab. */
         window.open(`/api/tickets/${ticketId}/archive`, `ticket-archive-${ticketId}`);
         el.innerHTML = '<div class="chat-empty">Archive opened in a new tab. '
             + `<a href="/api/tickets/${ticketId}/archive" target="_blank">Open again</a></div>`;
@@ -358,7 +381,6 @@
             try {
                 const msg = JSON.parse(e.data);
                 if (msg.type === 'ticket_chat' && msg.ticket_id === currentTicketId) {
-                    /* Append single message without a full reload. */
                     const el = document.getElementById('chat-messages');
                     if (el && document.getElementById('chat-pane')?.style.display !== 'none') {
                         const dir = msg.direction || 'system';
@@ -376,8 +398,6 @@
                         el.scrollTop = el.scrollHeight;
                     }
                 } else if (msg.type === 'ticket_chat') {
-                    /* A different ticket was updated — refresh the list to
-                     * reflect any status/priority changes on the row. */
                     loadTickets();
                 }
             } catch (_) {}
@@ -387,7 +407,8 @@
     function hideDrawer() {
         stopChatPoll();
         currentTicketId = null;
-        document.getElementById('detail-drawer').style.display = 'none';
+        const drawer = document.getElementById('detail-drawer');
+        if (drawer) drawer.style.display = 'none';
     }
 
     /* ── Event bindings ───────────────────────────────────────────────── */
@@ -410,7 +431,6 @@
 
     /* ── Boot ──────────────────────────────────────────────────────────── */
     document.addEventListener('DOMContentLoaded', () => {
-        startFooterClock();
         setStatus('online');
         loadGuilds();
         loadTickets();

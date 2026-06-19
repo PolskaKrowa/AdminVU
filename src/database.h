@@ -52,6 +52,14 @@ void db_cleanup(Database *db);
 int db_create_user(Database *db, u64_snowflake_t user_id, u64_snowflake_t guild_id);
 bool db_user_exists(Database *db, u64_snowflake_t user_id, u64_snowflake_t guild_id);
 
+// Guild membership tracking (populated from on_guild_create)
+int db_upsert_guild(Database *db, u64_snowflake_t guild_id, const char *name);
+
+// Channel cache (populated from Discord's GET /guilds/{id}/channels on join/refresh)
+int db_clear_guild_channels(Database *db, u64_snowflake_t guild_id);
+int db_upsert_channel(Database *db, u64_snowflake_t channel_id,
+                      u64_snowflake_t guild_id, const char *name, int type);
+
 // Warning operations
 int db_add_warning(Database *db, u64_snowflake_t user_id, u64_snowflake_t guild_id,
                    u64_snowflake_t moderator_id, const char *reason);

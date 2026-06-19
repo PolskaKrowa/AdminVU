@@ -20,16 +20,20 @@
                 <span class="logo-dot"></span>
                 <span class="logo-text">AdminVU</span>
             </div>
-            <nav class="site-nav">
-                <a href="index.html"       class="nav-link">Dashboard</a>
+            <nav class="site-nav" aria-label="Primary">
+                <a href="index.html"       class="nav-link">Home</a>
+                <a href="dashboard.html"   class="nav-link">Dashboard</a>
                 <a href="moderation.html"  class="nav-link">Moderation</a>
                 <a href="propagation.html" class="nav-link active">Propagation</a>
                 <a href="messaging.html"   class="nav-link">Messaging</a>
                 <a href="tickets.html"     class="nav-link">Tickets</a>
             </nav>
-            <div class="status-badge">
-                <span class="status-dot" id="status-dot"></span>
-                <span class="status-label" id="status-label">connecting…</span>
+            <div class="header-tools">
+                <div class="status-badge">
+                    <span class="status-dot" id="status-dot"></span>
+                    <span class="status-label" id="status-label">connecting…</span>
+                </div>
+                <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
             </div>
         </div>
     </header>
@@ -39,7 +43,10 @@
         <section class="hero">
             <p class="hero-eyebrow">Propagation</p>
             <h1 class="hero-title">Cross-Server Alerts</h1>
-            <p class="hero-sub">Manage opt-in servers, review propagated warnings, and block bad actors.</p>
+            <p class="hero-sub">
+                Manage opt-in servers, review propagated warnings, and block bad actors
+                across every community that's chosen to listen in.
+            </p>
         </section>
 
         <!-- Two-column layout: guilds list + events log -->
@@ -48,8 +55,8 @@
             <!-- Left: Opted-in guilds -->
             <div class="split-pane" id="pane-guilds">
                 <div class="pane-header">
-                    <span class="pane-title">Opted-in Servers</span>
-                    <button class="btn-refresh small" id="guilds-refresh">↺</button>
+                    <span class="pane-title">📡 Opted-in Servers</span>
+                    <button class="btn-refresh small" id="guilds-refresh" aria-label="Refresh">↺</button>
                 </div>
                 <div id="guilds-list">
                     <div class="pane-loading">Loading servers…</div>
@@ -58,7 +65,7 @@
                 <!-- Block a server manually -->
                 <div class="pane-divider"></div>
                 <div class="pane-header">
-                    <span class="pane-title">Block a Server</span>
+                    <span class="pane-title">⛔ Block a Server</span>
                 </div>
                 <div class="block-form">
                     <input class="filter-input" id="block-guild-id"
@@ -73,34 +80,36 @@
             <!-- Right: Events log -->
             <div class="split-pane split-pane-wide" id="pane-events">
                 <div class="pane-header">
-                    <span class="pane-title">Alert History</span>
+                    <span class="pane-title">🔔 Alert History</span>
                     <div class="pane-actions">
                         <input class="filter-input small" id="event-user-filter"
                                placeholder="Filter by user ID…" type="text" />
-                        <button class="btn-refresh small" id="events-refresh">↺</button>
+                        <button class="btn-refresh small" id="events-refresh" aria-label="Refresh">↺</button>
                     </div>
                 </div>
 
-                <div id="events-status" class="table-status">Loading…</div>
-                <table class="data-table" id="events-table" style="display:none">
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>Severity</th>
-                            <th>Category</th>
-                            <th>Time</th>
-                            <th>Target</th>
-                            <th>Source Server</th>
-                            <th>Moderator</th>
-                            <th>Notified</th>
-                            <th>Corroborations</th>
-                            <th>Reports</th>
-                            <th>Appeal</th>
-                            <th>Reason / Evidence</th>
-                        </tr>
-                    </thead>
-                    <tbody id="events-tbody"></tbody>
-                </table>
+                <div class="table-wrap">
+                    <div id="events-status" class="table-status">Loading…</div>
+                    <table class="data-table" id="events-table" style="display:none">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Severity</th>
+                                <th>Category</th>
+                                <th class="col-time">Time</th>
+                                <th class="col-id">Target</th>
+                                <th class="col-id">Source Server</th>
+                                <th class="col-id">Moderator</th>
+                                <th>Notified</th>
+                                <th>Corroborations</th>
+                                <th>Reports</th>
+                                <th>Appeal</th>
+                                <th class="col-reason">Reason / Evidence</th>
+                            </tr>
+                        </thead>
+                        <tbody id="events-tbody"></tbody>
+                    </table>
+                </div>
 
                 <div class="pagination" id="events-pagination">
                     <button class="btn-page" id="ev-prev" disabled>← Prev</button>
@@ -112,30 +121,46 @@
 
         <!-- Blocked servers panel -->
         <div class="section-header">
-            <span class="section-title">Blocked Servers</span>
-            <button class="btn-refresh small" id="blocked-refresh">↺</button>
+            <span class="section-title">⛔ Blocked Servers</span>
+            <button class="btn-refresh small" id="blocked-refresh" aria-label="Refresh">↺</button>
         </div>
-        <div id="blocked-status" class="table-status" style="display:none">Loading…</div>
-        <table class="data-table" id="blocked-table">
-            <thead>
-                <tr>
-                    <th>Server ID</th>
-                    <th>Blocked At</th>
-                    <th>Reason</th>
-                    <th>Action</th>
-                </tr>
-            </thead>
-            <tbody id="blocked-tbody">
-                <tr><td colspan="4" class="empty-row">No servers are currently blocked.</td></tr>
-            </tbody>
-        </table>
+        <div class="table-wrap">
+            <div id="blocked-status" class="table-status" style="display:none">Loading…</div>
+            <table class="data-table" id="blocked-table">
+                <thead>
+                    <tr>
+                        <th class="col-id">Server ID</th>
+                        <th class="col-time">Blocked At</th>
+                        <th class="col-reason">Reason</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="blocked-tbody">
+                    <tr><td colspan="4" class="empty-row">No servers are currently blocked.</td></tr>
+                </tbody>
+            </table>
+        </div>
 
     </main>
 
     <footer class="site-footer">
-        <span>running on <span class="mono">127.0.0.1:8080</span></span>
-        <span class="footer-sep">&middot;</span>
-        <span id="footer-time" class="mono"></span>
+        <div class="footer-inner">
+            <span class="footer-brand">
+                <span class="logo-dot" style="width:8px;height:8px;display:inline-block;"></span>
+                AdminVU
+            </span>
+            <span class="footer-sep">·</span>
+            <span>running locally on <span class="mono">127.0.0.1:8080</span></span>
+            <span class="footer-sep">·</span>
+            <span class="mono" id="footer-time">--:--:--</span>
+            <div class="footer-links">
+                <a href="index.html">Home</a>
+                <a href="dashboard.html">Dashboard</a>
+                <a href="moderation.html">Moderation</a>
+                <a href="messaging.html">Messaging</a>
+                <a href="tickets.html">Tickets</a>
+            </div>
+        </div>
     </footer>
 
     <script src="script.js"></script>
@@ -147,7 +172,6 @@
     let evUserFilter = '';
 
     /* ── Helpers ───────────────────────────────────────────────────── */
-
     function severityBadge(sev) {
         const rows = [
             ['sev-none', '—'],
@@ -160,7 +184,21 @@
         return `<span class="sev-badge ${cls}">${label}</span>`;
     }
 
-    /* Show an inline message inside #block-feedback (auto-hides after 4 s). */
+    function categoryBadge(cat) {
+        if (cat === 0) return '<span class="cat-badge cat-compromised">🔓 Compromised</span>';
+        if (cat === 1) return '<span class="cat-badge cat-crossserver">🌐 Cross-server</span>';
+        return '<span class="cat-badge cat-unknown">❓ Unknown</span>';
+    }
+
+    function appealBadge(status) {
+        if (status === null || status === undefined)
+            return '<span class="muted">—</span>';
+        const labels  = ['⏳ Pending', '🔍 Review', '✅ Approved', '❌ Denied'];
+        const classes = ['badge-warn', 'badge-info', 'badge-ok', 'badge-danger'];
+        const i = Math.max(0, Math.min(3, status));
+        return `<span class="badge ${classes[i]}">${labels[i]}</span>`;
+    }
+
     function showFeedback(msg, isError) {
         const el = document.getElementById('block-feedback');
         if (!el) return;
@@ -171,8 +209,7 @@
         el._timer = setTimeout(() => { el.style.display = 'none'; }, 4000);
     }
 
-    /* ── Opted-in guilds ───────────────────────────────────────────── */
-
+    /* ── Opted-in guilds (NOTE: /api/propagation/guilds is a BARE array) ─ */
     async function loadGuilds() {
         const container = document.getElementById('guilds-list');
         container.innerHTML = '<div class="pane-loading">Loading…</div>';
@@ -184,7 +221,7 @@
         }
         if (guilds.length === 0) {
             container.innerHTML =
-                '<div class="pane-empty">No servers have configured propagation yet.</div>';
+                '<div class="pane-empty">No servers have opted into propagation yet.<br>Add the bot & enable propagation in a server to see it here.</div>';
             return;
         }
 
@@ -195,7 +232,7 @@
                 <div class="guild-info">
                     <span class="guild-id mono">${shortId(g.guild_id)}</span>
                     <span class="guild-full mono muted" title="${g.guild_id}">${g.guild_id}</span>
-                    <span class="guild-channel muted">ch: ${shortId(g.notification_channel)}</span>
+                    <span class="guild-channel muted">notify ch: ${shortId(g.notification_channel)}</span>
                 </div>
                 <div class="guild-badges">
                     <span class="badge ${g.opted_in ? 'badge-ok' : 'badge-muted'}">
@@ -205,33 +242,15 @@
                 </div>
                 <div class="guild-actions">
                     ${blocked
-                        ? `<button class="btn-sm btn-ok"
-                            onclick="unblockGuild('${g.guild_id}')">Unblock</button>`
-                        : `<button class="btn-sm btn-danger-sm"
-                            onclick="promptBlock('${g.guild_id}')">Block</button>`
+                        ? `<button class="btn-sm btn-ok" onclick="unblockGuild('${g.guild_id}')">Unblock</button>`
+                        : `<button class="btn-sm btn-danger-sm" onclick="promptBlock('${g.guild_id}')">Block</button>`
                     }
                 </div>
             </div>`;
         }).join('');
     }
 
-    function categoryBadge(cat) {
-        if (cat === 0) return '<span class="cat-badge cat-compromised">🔓 Compromised</span>';
-        if (cat === 1) return '<span class="cat-badge cat-crossserver">🌐 Cross-server</span>';
-        return '<span class="cat-badge cat-unknown">❓ Unknown</span>';
-    }
-
-    function appealBadge(status) {
-        if (status === null || status === undefined)
-            return '<span class="muted">—</span>';
-        const labels = ['⏳ Pending', '🔍 Review', '✅ Approved', '❌ Denied'];
-        const classes = ['badge-warn', 'badge-info', 'badge-ok', 'badge-danger'];
-        const i = Math.max(0, Math.min(3, status));
-        return `<span class="badge ${classes[i]}">${labels[i]}</span>`;
-    }
-
     /* ── Alert events ──────────────────────────────────────────────── */
-
     async function loadEvents() {
         const tbody  = document.getElementById('events-tbody');
         const table  = document.getElementById('events-table');
@@ -275,8 +294,7 @@
                 <td class="reason-cell">
                     <span>${esc(ev.reason || '—')}</span>
                     ${ev.evidence_url
-                        ? `<a class="evidence-link" href="${esc(ev.evidence_url)}"
-                            target="_blank" rel="noopener">🔗 evidence</a>`
+                        ? `<a class="evidence-link" href="${esc(ev.evidence_url)}" target="_blank" rel="noopener">🔗 evidence</a>`
                         : ''}
                 </td>`;
             tbody.appendChild(tr);
@@ -291,20 +309,7 @@
             `page ${Math.floor(evOffset / EV_PAGE_SIZE) + 1}`;
     }
 
-    /* ── Live polling (every 15 s) so block/unblock changes made by the bot
-     * or another dashboard session are reflected without a manual refresh. ── */
-    let _pollTimer = null;
-    function startPolling() {
-        if (_pollTimer) clearInterval(_pollTimer);
-        _pollTimer = setInterval(() => {
-            loadGuilds();
-            loadEvents();
-            loadBlocked();
-        }, 15000);
-    }
-
     /* ── Blocked servers ───────────────────────────────────────────── */
-
     async function loadBlocked() {
         const tbody  = document.getElementById('blocked-tbody');
         const status = document.getElementById('blocked-status');
@@ -325,14 +330,11 @@
                 <td class="mono copyable" title="${b.guild_id}">${b.guild_id}</td>
                 <td class="mono muted">${fmtTs(b.blocked_at)}</td>
                 <td class="reason-cell">${esc(b.reason || '—')}</td>
-                <td><button class="btn-sm btn-ok"
-                        onclick="unblockGuild('${b.guild_id}')">Unblock</button></td>
+                <td><button class="btn-sm btn-ok" onclick="unblockGuild('${b.guild_id}')">Unblock</button></td>
             </tr>`).join('');
     }
 
     /* ── Block / unblock ───────────────────────────────────────────── */
-
-    /* Called from quick-block buttons in the guild rows. */
     function promptBlock(guildId) {
         const reason = prompt(`Reason for blocking ${guildId} (leave blank to skip):`);
         if (reason === null) return; /* user cancelled */
@@ -340,8 +342,7 @@
     }
 
     async function blockGuild(guildId, reason) {
-        const body = `guild_id=${encodeURIComponent(guildId)}`
-                + `&reason=${encodeURIComponent(reason || '')}`;
+        const body = `guild_id=${encodeURIComponent(guildId)}&reason=${encodeURIComponent(reason || '')}`;
         const res  = await apiPost('/api/propagation/block', body);
         if (res && res.ok) {
             showFeedback(`✅ Server ${guildId} blocked.`, false);
@@ -364,48 +365,51 @@
         }
     }
 
-    /* ── Event bindings ────────────────────────────────────────────── */
-
-    document.getElementById('guilds-refresh')
-        .addEventListener('click', loadGuilds);
-
-    document.getElementById('events-refresh')
-        .addEventListener('click', () => { evOffset = 0; loadEvents(); });
-
-    document.getElementById('blocked-refresh')
-        .addEventListener('click', loadBlocked);
-
-    document.getElementById('event-user-filter')
-        .addEventListener('keydown', e => {
-            if (e.key !== 'Enter') return;
-            evUserFilter = e.target.value.trim();
-            evOffset = 0;
+    /* ── Live polling (every 15s) ──────────────────────────────────── */
+    let _pollTimer = null;
+    function startPolling() {
+        if (_pollTimer) clearInterval(_pollTimer);
+        _pollTimer = setInterval(() => {
+            loadGuilds();
             loadEvents();
-        });
+            loadBlocked();
+        }, 15000);
+    }
 
-    document.getElementById('block-btn')
-        .addEventListener('click', () => {
-            const guildId = document.getElementById('block-guild-id').value.trim();
-            const reason  = document.getElementById('block-reason').value.trim();
-            if (!guildId) { showFeedback('Please enter a server ID.', true); return; }
-            document.getElementById('block-guild-id').value = '';
-            document.getElementById('block-reason').value   = '';
-            blockGuild(guildId, reason);
-        });
+    /* ── Event bindings ────────────────────────────────────────────── */
+    document.getElementById('guilds-refresh').addEventListener('click', loadGuilds);
+    document.getElementById('events-refresh').addEventListener('click', () => { evOffset = 0; loadEvents(); });
+    document.getElementById('blocked-refresh').addEventListener('click', loadBlocked);
 
-    document.getElementById('ev-prev')
-        .addEventListener('click', () => {
-            if (evOffset >= EV_PAGE_SIZE) { evOffset -= EV_PAGE_SIZE; loadEvents(); }
-        });
+    document.getElementById('event-user-filter').addEventListener('keydown', e => {
+        if (e.key !== 'Enter') return;
+        evUserFilter = e.target.value.trim();
+        evOffset = 0;
+        loadEvents();
+    });
 
-    document.getElementById('ev-next')
-        .addEventListener('click', () => { evOffset += EV_PAGE_SIZE; loadEvents(); });
+    document.getElementById('block-btn').addEventListener('click', () => {
+        const guildId = document.getElementById('block-guild-id').value.trim();
+        const reason  = document.getElementById('block-reason').value.trim();
+        if (!guildId) { showFeedback('Please enter a server ID.', true); return; }
+        document.getElementById('block-guild-id').value = '';
+        document.getElementById('block-reason').value   = '';
+        blockGuild(guildId, reason);
+    });
 
-    /* ── Boot (scripts are at bottom of body — DOM is already ready) ─ */
-    loadGuilds();
-    loadEvents();
-    loadBlocked();
-    startPolling();
+    document.getElementById('ev-prev').addEventListener('click', () => {
+        if (evOffset >= EV_PAGE_SIZE) { evOffset -= EV_PAGE_SIZE; loadEvents(); }
+    });
+    document.getElementById('ev-next').addEventListener('click', () => { evOffset += EV_PAGE_SIZE; loadEvents(); });
+
+    /* ── Boot ──────────────────────────────────────────────────────── */
+    document.addEventListener('DOMContentLoaded', () => {
+        setStatus('online');
+        loadGuilds();
+        loadEvents();
+        loadBlocked();
+        startPolling();
+    });
     </script>
 </body>
 </html>

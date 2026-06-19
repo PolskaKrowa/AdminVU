@@ -3,10 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard — AdminVU</title>
+    <title>AdminVU — Relax, we'll handle the issues.</title>
+    <meta name="description" content="AdminVU is a laid-back Discord moderation bot: warn/kick/ban/timeout, cross-server propagation alerts, support tickets, broadcast messaging, plus fun commands and a satirical fact-check module.">
     <link rel="stylesheet" href="style.css">
 </head>
-<body class="page-dashboard">
+<body class="page-landing">
 
     <div class="bg-canvas">
         <div class="orb orb-1"></div>
@@ -20,100 +21,250 @@
                 <span class="logo-dot"></span>
                 <span class="logo-text">AdminVU</span>
             </div>
-            <nav class="site-nav">
-                <a href="index.html"       class="nav-link active">Dashboard</a>
+            <nav class="site-nav" aria-label="Primary">
+                <a href="index.html"       class="nav-link active">Home</a>
+                <a href="dashboard.html"   class="nav-link">Dashboard</a>
                 <a href="moderation.html"  class="nav-link">Moderation</a>
                 <a href="propagation.html" class="nav-link">Propagation</a>
                 <a href="messaging.html"   class="nav-link">Messaging</a>
                 <a href="tickets.html"     class="nav-link">Tickets</a>
             </nav>
-            <div class="status-badge">
-                <span class="status-dot" id="status-dot"></span>
-                <span class="status-label" id="status-label">connecting…</span>
+            <div class="header-tools">
+                <div class="status-badge">
+                    <span class="status-dot" id="status-dot"></span>
+                    <span class="status-label" id="status-label">connecting…</span>
+                </div>
+                <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
             </div>
         </div>
     </header>
 
-    <main class="main-content">
+    <main>
 
-        <section class="hero">
-            <p class="hero-eyebrow">System Overview</p>
-            <h1 class="hero-title">Dashboard</h1>
-            <p class="hero-sub">Local admin panel &mdash; accessible only from this machine.</p>
-        </section>
+        <!-- ── Hero ────────────────────────────────────────────── -->
+        <section class="main-content" style="padding-top:1rem;">
 
-        <div class="card-grid">
-            <div class="card" id="card-uptime">
-                <div class="card-icon">⏱</div>
-                <div class="card-label">Uptime</div>
-                <div class="card-value mono" id="uptime-value">--:--:--</div>
-                <div class="card-sub">since process start</div>
-            </div>
-            <div class="card" id="card-guilds">
-                <div class="card-icon">🌐</div>
-                <div class="card-label">Guilds</div>
-                <div class="card-value mono" id="guilds-value">&mdash;</div>
-                <div class="card-sub">registered servers</div>
-            </div>
-            <div class="card" id="card-warnings">
-                <div class="card-icon">⚠️</div>
-                <div class="card-label">Warnings Logged</div>
-                <div class="card-value mono" id="warnings-value">&mdash;</div>
-                <div class="card-sub">all time, all guilds</div>
-            </div>
-            <div class="card" id="card-tickets">
-                <div class="card-icon">🎫</div>
-                <div class="card-label">Open Tickets</div>
-                <div class="card-value mono" id="tickets-value">&mdash;</div>
-                <div class="card-sub">unresolved</div>
-            </div>
-            <div class="card" id="card-propagation">
-                <div class="card-icon">📡</div>
-                <div class="card-label">Propagation Alerts</div>
-                <div class="card-value mono" id="prop-value">&mdash;</div>
-                <div class="card-sub">cross-server events total</div>
-            </div>
-        </div>
+            <section class="landing-hero">
+                <p class="hero-eyebrow">Discord moderation, handled.</p>
+                <h1 class="hero-title">Relax — <span class="accent">we'll handle</span><br>the issues.</h1>
+                <p class="hero-sub">
+                    AdminVU is a laid-back moderation bot that takes the load off your mods.
+                    Serious tools for the staff team, fun commands for the members, and a
+                    cross-server alert net that quietly watches your back.
+                </p>
+                <div class="hero-cta-row" style="justify-content:center;">
+                    <a href="dashboard.html" class="btn-primary">🛠 Open the Control Panel</a>
+                    <a href="#how-it-works" class="btn-secondary">See how it works</a>
+                </div>
 
-        <section class="log-section">
-            <div class="log-header">
-                <span class="log-title">Recent Activity</span>
-                <button class="log-clear-btn" id="log-clear">Clear</button>
-            </div>
-            <div class="log-body" id="log-body">
-                <div class="log-line log-info">
-                    <span class="log-time" id="init-time"></span>
-                    <span class="log-msg">Dashboard initialised. Waiting for data&hellip;</span>
+                <!-- Bot mock / preview card -->
+                <div class="hero-mock" aria-hidden="true">
+                    <div class="hero-mock-row">
+                        <span class="mock-dot"></span>
+                        <span>🛡️ <strong>warn</strong> @spammer — excessive caps</span>
+                        <span class="badge badge-warn">⚠️ Warn</span>
+                    </div>
+                    <div class="hero-mock-row">
+                        <span class="mock-dot amber"></span>
+                        <span>📡 propagation alert · corroborated by 3 servers</span>
+                        <span class="badge badge-info">📡 Shared</span>
+                    </div>
+                    <div class="hero-mock-row">
+                        <span class="mock-dot"></span>
+                        <span>🎫 new ticket: <em>"Can I get role color changed?"</em></span>
+                        <span class="badge badge-ok">Open</span>
+                    </div>
+                    <div class="hero-mock-row">
+                        <span class="mock-dot amber"></span>
+                        <span>🎉 trivia · <strong>mirageowl</strong> won +12 points</span>
+                        <span class="badge badge-muted">fun</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ── Stats strip ─────────────────────────────────── -->
+            <div class="stats-strip" id="stats-strip">
+                <div class="stat-pill">
+                    <div class="stat-num" id="stat-guilds">—</div>
+                    <div class="stat-label">Guilds served</div>
+                </div>
+                <div class="stat-pill">
+                    <div class="stat-num amber" id="stat-warnings">—</div>
+                    <div class="stat-label">Warnings logged</div>
+                </div>
+                <div class="stat-pill">
+                    <div class="stat-num" id="stat-tickets">—</div>
+                    <div class="stat-label">Open tickets</div>
+                </div>
+                <div class="stat-pill">
+                    <div class="stat-num amber" id="uptime-value">00:00:00</div>
+                    <div class="stat-label">Bot uptime</div>
                 </div>
             </div>
+
+            <!-- ── Features grid ───────────────────────────────── -->
+            <section class="section-block" id="features">
+                <div class="section-heading">
+                    <h2>Everything your server needs, in one calm bot.</h2>
+                    <p>Serious moderation, cross-server awareness, and the fun stuff too. Pick what you need — AdminVU handles the rest.</p>
+                </div>
+                <div class="features-grid">
+
+                    <a href="moderation.html" class="feature-card" style="text-decoration:none;color:inherit;">
+                        <div class="feature-icon">🛡️</div>
+                        <h3>Moderation</h3>
+                        <p>Warn, kick, ban, and timeout — all logged, all accountable. Full mod-log history, per-user warning lookup, and clean exports.</p>
+                        <span class="feature-link">Open mod logs →</span>
+                    </a>
+
+                    <a href="propagation.html" class="feature-card" style="text-decoration:none;color:inherit;">
+                        <div class="feature-icon amber">📡</div>
+                        <h3>Propagation</h3>
+                        <p>A cross-server alert net. When one community flags a bad actor, opted-in servers get a heads-up — quietly, with corroboration.</p>
+                        <span class="feature-link">Manage propagation →</span>
+                    </a>
+
+                    <a href="messaging.html" class="feature-card" style="text-decoration:none;color:inherit;">
+                        <div class="feature-icon info">📨</div>
+                        <h3>Messaging</h3>
+                        <p>Broadcast announcements or DM-style messages to any channel your bot can reach, with a live preview and the 2000-char guardrail built in.</p>
+                        <span class="feature-link">Send a message →</span>
+                    </a>
+
+                    <a href="tickets.html" class="feature-card" style="text-decoration:none;color:inherit;">
+                        <div class="feature-icon purple">🎫</div>
+                        <h3>Tickets</h3>
+                        <p>Support tickets with live chat, staff notes, priority, status workflow, and a searchable archive. Members get heard; mods stay sane.</p>
+                        <span class="feature-link">View tickets →</span>
+                    </a>
+
+                    <div class="feature-card">
+                        <div class="feature-icon amber">🎉</div>
+                        <h3>Fun</h3>
+                        <p>Trivia, jokes, 8ball, dice, rock-paper-scissors and more. Members deserve a break too — AdminVU keeps the vibe light between the serious bits.</p>
+                    </div>
+
+                    <div class="feature-card">
+                        <div class="feature-icon">🧐</div>
+                        <h3>Fact-Check</h3>
+                        <p>A satirical, lovingly-cynical fact-check module that calls out bold claims with a friendly wink. Use with care — and a sense of humor.</p>
+                    </div>
+
+                </div>
+            </section>
+
+            <!-- ── How it works ────────────────────────────────── -->
+            <section class="section-block" id="how-it-works">
+                <div class="section-heading">
+                    <h2>How it works</h2>
+                    <p>Three steps. No spreadsheets, no onboarding call, no panic.</p>
+                </div>
+                <div class="steps-grid">
+                    <div class="step-card">
+                        <div class="step-num">01</div>
+                        <h3>Add the bot</h3>
+                        <p>Invite AdminVU to your server with the usual Discord permissions. It boots up, says hi, and starts watching — that's it.</p>
+                    </div>
+                    <div class="step-card">
+                        <div class="step-num">02</div>
+                        <h3>Set up your servers</h3>
+                        <p>Open the local control panel, pick which servers opt into propagation, set your notification channels, and you're configured.</p>
+                    </div>
+                    <div class="step-card">
+                        <div class="step-num">03</div>
+                        <h3>We handle the rest</h3>
+                        <p>Warnings get logged, bad actors get propagated, tickets get tracked, members get trivia. You get to relax.</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ── Built for mods, loved by members ─────────────── -->
+            <section class="section-block">
+                <div class="section-heading">
+                    <h2>Built for mods, loved by members.</h2>
+                    <p>One bot, two audiences — and it speaks both languages fluently.</p>
+                </div>
+                <div class="dual-highlight">
+                    <div class="dual-card mods">
+                        <div class="dual-eyebrow">🛡️ For moderators</div>
+                        <h3>Serious tools, zero drama.</h3>
+                        <p>Everything you need to keep a community healthy, with the audit trail to back it up.</p>
+                        <ul>
+                            <li>Warn / kick / ban / timeout with reasons</li>
+                            <li>Cross-server propagation alerts</li>
+                            <li>Per-user warning history lookup</li>
+                            <li>Live ticket chat + staff notes</li>
+                            <li>Broadcast messaging with preview</li>
+                            <li>Full mod-log search & pagination</li>
+                        </ul>
+                    </div>
+                    <div class="dual-card members">
+                        <div class="dual-eyebrow">🎉 For members</div>
+                        <h3>Fun commands, friendly tone.</h3>
+                        <p>The bot's not just a bouncer — it's part of the community. Trivia nights, dad jokes, dice rolls, and a wink.</p>
+                        <ul>
+                            <li>Trivia, jokes, 8ball, dice, rps</li>
+                            <li>Open a support ticket in one click</li>
+                            <li>Get fair, transparent warnings</li>
+                            <li>Satirical fact-check for bold claims</li>
+                            <li>Laid-back, never clinical responses</li>
+                            <li>Respectful, accountable moderation</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ── CTA band ─────────────────────────────────────── -->
+            <section class="cta-band">
+                <h2>Ready to chill? 🌿</h2>
+                <p>Open the local control panel and see what AdminVU's been quietly handling for you.</p>
+                <a href="dashboard.html" class="btn-primary">🛠 Open the Control Panel</a>
+            </section>
+
         </section>
 
     </main>
 
     <footer class="site-footer">
-        <span>running on <span class="mono">127.0.0.1:8080</span></span>
-        <span class="footer-sep">&middot;</span>
-        <span id="footer-time" class="mono"></span>
+        <div class="footer-inner">
+            <span class="footer-brand">
+                <span class="logo-dot" style="width:8px;height:8px;display:inline-block;"></span>
+                AdminVU
+            </span>
+            <span class="footer-sep">·</span>
+            <span>running locally on <span class="mono">127.0.0.1:8080</span></span>
+            <span class="footer-sep">·</span>
+            <span class="mono" id="footer-time">--:--:--</span>
+            <div class="footer-links">
+                <a href="dashboard.html">Dashboard</a>
+                <a href="moderation.html">Moderation</a>
+                <a href="propagation.html">Propagation</a>
+                <a href="messaging.html">Messaging</a>
+                <a href="tickets.html">Tickets</a>
+            </div>
+        </div>
     </footer>
 
     <script src="script.js"></script>
     <script>
-    async function refreshStatus() {
+    /* ── Landing page: pull live stats from /api/status ─────── */
+    async function refreshStats() {
         const data = await apiGet('/api/status');
         if (!data) { setStatus('offline'); return; }
         setStatus('online');
-        setCardValue('card-guilds',      data.guild_count);
-        setCardValue('card-warnings',    data.warning_count);
-        setCardValue('card-tickets',     data.open_tickets);
-        setCardValue('card-propagation', data.propagation_events);
-        appendLog('Status refreshed.', LogLevel.OK);
+
+        const $g = qs('#stat-guilds');
+        const $w = qs('#stat-warnings');
+        const $t = qs('#stat-tickets');
+        if ($g) $g.textContent = data.guild_count ?? 0;
+        if ($w) $w.textContent = data.warning_count ?? 0;
+        if ($t) $t.textContent = data.open_tickets ?? 0;
     }
 
     document.addEventListener('DOMContentLoaded', () => {
-        startFooterClock();
         startUptimeClock();
-        refreshStatus();
-        setInterval(refreshStatus, 15000);
+        refreshStats();
+        setInterval(refreshStats, 15000);
     });
     </script>
 </body>

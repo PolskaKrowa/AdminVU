@@ -44,7 +44,28 @@ static const char *CREATE_TABLES_SQL =
     "    expires_at INTEGER NOT NULL,"
     "    created_at INTEGER DEFAULT (strftime('%s', 'now')),"
     "    UNIQUE (user_id, guild_id)"
-    ");";
+    ");"
+    ""
+    /* Guilds the bot is a member of. Populated from on_guild_create so
+     * /api/guilds can list servers even before any moderation/warnings/
+     * tickets have been logged. */
+    "CREATE TABLE IF NOT EXISTS guilds ("
+    "    guild_id INTEGER PRIMARY KEY,"
+    "    name TEXT NOT NULL DEFAULT '',"
+    "    joined_at INTEGER NOT NULL DEFAULT 0"
+    ");"
+    ""
+    /* Channel cache populated by messaging_refresh_guild_channels() from
+     * Discord's GET /guilds/{id}/channels (text channels: type 0 = text,
+     * 5 = announcement).  Queried by GET /api/guilds/<id>/channels. */
+    "CREATE TABLE IF NOT EXISTS channels ("
+    "    id INTEGER PRIMARY KEY,"
+    "    guild_id INTEGER NOT NULL,"
+    "    name TEXT NOT NULL DEFAULT '',"  
+    "    type INTEGER NOT NULL DEFAULT 0,"
+    "    updated_at INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_channels_guild ON channels(guild_id);";
 
 int db_init(Database *db, const char *path) {
     db->db_path = path;
@@ -74,6 +95,72 @@ void db_cleanup(Database *db) {
         sqlite3_close(db->db);
         db->db = NULL;
     }
+}
+
+int db_upsert_guild(Database *db, u64_snowflake_t guild_id, const char *name) {
+    if (!db || !db->db || guild_id == 0) return -1;
+    const char *sql =
+        "INSERT INTO guilds (guild_id, name, joined_at) VALUES (?, ?, strftime('%s','now'))"
+        " ON CONFLICT(guild_id) DO UPDATE SET name = excluded.name;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_upsert_guild prepare failed: %s\n", sqlite3_errmsg(db->db));
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)guild_id);
+    sqlite3_bind_text(stmt, 2, name ? name : "", -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "db_upsert_guild step failed: %s\n", sqlite3_errmsg(db->db));
+        return -1;
+    }
+    return 0;
+}
+
+int db_clear_guild_channels(Database *db, u64_snowflake_t guild_id) {
+    if (!db || !db->db || guild_id == 0) return -1;
+    const char *sql = "DELETE FROM channels WHERE guild_id = ?;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_clear_guild_channels prepare failed: %s\n", sqlite3_errmsg(db->db));
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)guild_id);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "db_clear_guild_channels step failed: %s\n", sqlite3_errmsg(db->db));
+        return -1;
+    }
+    return 0;
+}
+
+int db_upsert_channel(Database *db, u64_snowflake_t channel_id,
+                      u64_snowflake_t guild_id, const char *name, int type) {
+    if (!db || !db->db || channel_id == 0 || guild_id == 0) return -1;
+    const char *sql =
+        "INSERT INTO channels (id, guild_id, name, type, updated_at)"
+        " VALUES (?, ?, ?, ?, strftime('%s','now'))"
+        " ON CONFLICT(id) DO UPDATE SET"
+        "   guild_id=excluded.guild_id, name=excluded.name,"
+        "   type=excluded.type, updated_at=strftime('%s','now');";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "db_upsert_channel prepare failed: %s\n", sqlite3_errmsg(db->db));
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)guild_id);
+    sqlite3_bind_text(stmt, 3, name ? name : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, type);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "db_upsert_channel step failed: %s\n", sqlite3_errmsg(db->db));
+        return -1;
+    }
+    return 0;
 }
 
 int db_create_user(Database *db, u64_snowflake_t user_id, u64_snowflake_t guild_id) {

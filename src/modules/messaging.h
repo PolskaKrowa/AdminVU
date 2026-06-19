@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <sqlite3.h>
 #include <orca/discord.h>
+#include "database.h"
 #include "components_v2.h"
 
 /* ---------------------------------------------------------------------------
@@ -77,5 +78,26 @@ int bot_send_message(sqlite3_int64 guild_id,
 int bot_send_cv2_message(sqlite3_int64 guild_id,
                           sqlite3_int64 channel_id,
                           CV2Msg       *msg);
+
+/* ---------------------------------------------------------------------------
+ * messaging_refresh_guild_channels / messaging_refresh_guild_channels_async
+ *
+ * Fetch the guild's real channel list from Discord's REST API
+ * (GET /guilds/{guild_id}/channels) and cache the sendable text channels
+ * (type 0 = text, 5 = announcement) in the channels table.  Clears any
+ * previously-cached channels for the guild first.
+ *
+ * The synchronous variant blocks for the duration of one HTTP GET (typically
+ * < 1 s) and is safe to call from any thread.  The async variant spawns a
+ * detached pthread so callers on the gateway / HTTP thread are not blocked.
+ *
+ * Returns (sync): the number of channels stored, or -1 on error.
+ * Returns (async): void — failure is logged from the worker thread.
+ *
+ * Requires messaging_module_init() to have been called first (it stores the
+ * bot token used for the REST Authorization header).
+ * --------------------------------------------------------------------------- */
+int  messaging_refresh_guild_channels(Database *db, u64_snowflake_t guild_id);
+void messaging_refresh_guild_channels_async(Database *db, u64_snowflake_t guild_id);
 
 #endif /* MESSAGING_H */

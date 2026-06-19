@@ -235,8 +235,18 @@ void on_message_create(struct discord *client,
 
 static void on_guild_create_handler(struct discord *client,
                                     const struct discord_guild *guild) {
-    if (guild && guild->id)
-        propagation_on_guild_register(guild->id);
+    if (!guild || !guild->id) return;
+    /* Persist this guild so /api/guilds can list servers the bot is in,
+     * even before any moderation/warnings/tickets have been logged. */
+    db_upsert_guild(&g_database, guild->id, guild->name ? guild->name : "");
+    propagation_on_guild_register(guild->id);
+    /* Fetch & cache this guild's real channels in the background so the
+     * dashboard Messaging page can list sendable channels (replaces the
+     * old synthetic "general" fallback that caused discord_create_message
+     * to fail with a fake channel_id == guild_id). */
+    messaging_refresh_guild_channels_async(&g_database, guild->id);
+    printf("[main] Tracking guild %" PRIu64 " (%s)\n",
+           (uint64_t)guild->id, guild->name ? guild->name : "(unnamed)");
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */

@@ -20,16 +20,20 @@
                 <span class="logo-dot"></span>
                 <span class="logo-text">AdminVU</span>
             </div>
-            <nav class="site-nav">
-                <a href="index.html"       class="nav-link">Dashboard</a>
+            <nav class="site-nav" aria-label="Primary">
+                <a href="index.html"       class="nav-link">Home</a>
+                <a href="dashboard.html"   class="nav-link">Dashboard</a>
                 <a href="moderation.html"  class="nav-link active">Moderation</a>
                 <a href="propagation.html" class="nav-link">Propagation</a>
                 <a href="messaging.html"   class="nav-link">Messaging</a>
                 <a href="tickets.html"     class="nav-link">Tickets</a>
             </nav>
-            <div class="status-badge">
-                <span class="status-dot" id="status-dot"></span>
-                <span class="status-label" id="status-label">connecting…</span>
+            <div class="header-tools">
+                <div class="status-badge">
+                    <span class="status-dot" id="status-dot"></span>
+                    <span class="status-label" id="status-label">connecting…</span>
+                </div>
+                <button class="theme-toggle" aria-label="Toggle theme">☀️</button>
             </div>
         </div>
     </header>
@@ -39,33 +43,28 @@
         <section class="hero">
             <p class="hero-eyebrow">Moderation</p>
             <h1 class="hero-title">Mod Logs</h1>
-            <p class="hero-sub">All moderation actions recorded across every server.</p>
+            <p class="hero-sub">
+                Every warn, kick, ban and timeout — recorded across every server.
+                Filter, search, and pull up a user's warning history in seconds.
+            </p>
         </section>
 
         <!-- Filters -->
         <div class="filter-bar">
             <div class="filter-group">
-                <label class="filter-label">Server</label>
+                <label class="filter-label" for="guild-select">Server</label>
                 <select class="filter-select" id="guild-select">
                     <option value="">All servers</option>
                 </select>
             </div>
             <div class="filter-group">
-                <label class="filter-label">Action</label>
+                <span class="filter-label">Action</span>
                 <div class="tab-bar" id="action-tabs">
                     <button class="tab active" data-action="all">All</button>
-                    <button class="tab" data-action="0">
-                        <span class="tab-emoji">⚠️</span> Warn
-                    </button>
-                    <button class="tab" data-action="1">
-                        <span class="tab-emoji">👢</span> Kick
-                    </button>
-                    <button class="tab" data-action="2">
-                        <span class="tab-emoji">🔨</span> Ban
-                    </button>
-                    <button class="tab" data-action="3">
-                        <span class="tab-emoji">🔇</span> Timeout
-                    </button>
+                    <button class="tab" data-action="0"><span class="tab-emoji">⚠️</span> Warn</button>
+                    <button class="tab" data-action="1"><span class="tab-emoji">👢</span> Kick</button>
+                    <button class="tab" data-action="2"><span class="tab-emoji">🔨</span> Ban</button>
+                    <button class="tab" data-action="3"><span class="tab-emoji">🔇</span> Timeout</button>
                 </div>
             </div>
             <button class="btn-refresh" id="refresh-btn">↺ Refresh</button>
@@ -74,18 +73,19 @@
         <!-- User warning lookup -->
         <div class="sub-section" id="warning-lookup">
             <div class="sub-section-header">
-                <span class="sub-section-title">User Warning Lookup</span>
+                <span class="sub-section-title">🔎 User Warning Lookup</span>
             </div>
             <div class="lookup-row">
                 <input class="filter-input" id="user-id-input"
-                       placeholder="Paste a user ID…" type="text" />
+                       placeholder="Paste a user ID to look up their warning history…"
+                       type="text" />
                 <button class="btn-primary" id="lookup-btn">Look up</button>
             </div>
             <div id="warning-results"></div>
         </div>
 
         <!-- Mod log table -->
-        <div class="table-container" id="log-table-container">
+        <div class="table-wrap" id="log-table-container">
             <div class="table-status" id="table-status">Loading…</div>
             <table class="data-table" id="log-table" style="display:none">
                 <thead>
@@ -111,30 +111,49 @@
     </main>
 
     <footer class="site-footer">
-        <span>running on <span class="mono">127.0.0.1:8080</span></span>
-        <span class="footer-sep">&middot;</span>
-        <span id="footer-time" class="mono"></span>
+        <div class="footer-inner">
+            <span class="footer-brand">
+                <span class="logo-dot" style="width:8px;height:8px;display:inline-block;"></span>
+                AdminVU
+            </span>
+            <span class="footer-sep">·</span>
+            <span>running locally on <span class="mono">127.0.0.1:8080</span></span>
+            <span class="footer-sep">·</span>
+            <span class="mono" id="footer-time">--:--:--</span>
+            <div class="footer-links">
+                <a href="index.html">Home</a>
+                <a href="dashboard.html">Dashboard</a>
+                <a href="propagation.html">Propagation</a>
+                <a href="messaging.html">Messaging</a>
+                <a href="tickets.html">Tickets</a>
+            </div>
+        </div>
     </footer>
 
     <script src="script.js"></script>
     <script>
-    /* ── Page-specific logic ─────────────────────────────────────────── */
+    /* ── Moderation page logic ──────────────────────────────────────── */
 
     const PAGE_SIZE = 50;
     let currentOffset = 0;
     let currentAction = 'all';
     let currentGuild  = '';
 
+    /* Unified /api/guilds shape: { guilds: [ { id, name, warning_count, ticket_count } ] } */
     async function loadGuilds() {
-        const guilds = await apiGet('/api/guilds');
-        if (!guilds) return;
+        const data = await apiGet('/api/guilds');
+        if (!data || !data.guilds) {
+            appendLog('Failed to load guilds', LogLevel.ERROR);
+            return;
+        }
         const sel = document.getElementById('guild-select');
-        guilds.forEach(g => {
+        data.guilds.forEach(g => {
             const opt = document.createElement('option');
-            opt.value = g.guild_id;
-            opt.textContent = `Server ${shortId(g.guild_id)}  (${g.warning_count} warns)`;
+            opt.value = g.id;
+            opt.textContent = `${g.name}  (${g.warning_count ?? 0} warns)`;
             sel.appendChild(opt);
         });
+        appendLog(`Loaded ${data.guilds.length} servers`, LogLevel.OK);
     }
 
     async function loadLogs() {
@@ -142,7 +161,7 @@
         const table  = document.getElementById('log-table');
         const status = document.getElementById('table-status');
 
-        status.textContent = 'Loading…';
+        status.textContent   = 'Loading…';
         status.style.display = 'block';
         table.style.display  = 'none';
 
@@ -150,8 +169,8 @@
             limit:  PAGE_SIZE,
             offset: currentOffset,
         });
-        if (currentGuild)              params.set('guild_id', currentGuild);
-        if (currentAction !== 'all')   params.set('action',   currentAction);
+        if (currentGuild)            params.set('guild_id', currentGuild);
+        if (currentAction !== 'all') params.set('action',   currentAction);
 
         const data = await apiGet('/api/mod-logs?' + params.toString());
         if (!data) {
@@ -161,7 +180,7 @@
 
         const rows = data.items || [];
         if (rows.length === 0) {
-            status.textContent = 'No records found.';
+            status.textContent = 'No records found — clear the filters and try again?';
             return;
         }
 
@@ -176,7 +195,7 @@
                 <td class="mono copyable" title="${row.user_id}">${shortId(row.user_id)}</td>
                 <td class="mono copyable muted" title="${row.moderator_id}">${shortId(row.moderator_id)}</td>
                 <td class="mono muted" title="${row.guild_id}">${shortId(row.guild_id)}</td>
-                <td class="reason-cell">${esc(row.reason || '—') }</td>
+                <td class="reason-cell">${esc(row.reason || '—')}</td>
             `;
             tbody.appendChild(tr);
         });
@@ -198,7 +217,10 @@
     async function lookupWarnings() {
         const userId  = document.getElementById('user-id-input').value.trim();
         const results = document.getElementById('warning-results');
-        if (!userId) return;
+        if (!userId) {
+            results.innerHTML = '<div class="lookup-error">Please enter a user ID first.</div>';
+            return;
+        }
 
         results.innerHTML = '<div class="lookup-loading">Searching…</div>';
 
@@ -211,13 +233,14 @@
             return;
         }
         if (data.length === 0) {
-            results.innerHTML = `<div class="lookup-empty">No warnings found for ${esc(userId)}.</div>`;
+            results.innerHTML = `<div class="lookup-empty">No warnings found for <span class="mono">${esc(userId)}</span>. 🌿</div>`;
             return;
         }
 
         let html = `<div class="lookup-count">${data.length} warning${data.length !== 1 ? 's' : ''} found</div>`;
-        html += '<table class="data-table"><thead><tr>'
-              + '<th>Time</th><th>Server</th><th>Moderator</th><th>Reason</th>'
+        html += '<div class="table-wrap"><table class="data-table"><thead><tr>'
+              + '<th class="col-time">Time</th><th class="col-id">Server</th>'
+              + '<th class="col-id">Moderator</th><th class="col-reason">Reason</th>'
               + '</tr></thead><tbody>';
         data.forEach(w => {
             html += `<tr>
@@ -227,11 +250,12 @@
                 <td class="reason-cell">${esc(w.reason || '—')}</td>
             </tr>`;
         });
-        html += '</tbody></table>';
+        html += '</tbody></table></div>';
         results.innerHTML = html;
+        appendLog(`Found ${data.length} warnings for user ${shortId(userId)}`, LogLevel.OK);
     }
 
-    /* ── Event bindings ──────────────────────────────────────────────── */
+    /* ── Event bindings ─────────────────────────────────────────────── */
     document.getElementById('guild-select').addEventListener('change', e => {
         currentGuild  = e.target.value;
         currentOffset = 0;
@@ -265,9 +289,8 @@
         currentOffset += PAGE_SIZE; loadLogs();
     });
 
-    /* ── Boot ─────────────────────────────────────────────────────────── */
+    /* ── Boot ────────────────────────────────────────────────────────── */
     document.addEventListener('DOMContentLoaded', () => {
-        startFooterClock();
         setStatus('online');
         loadGuilds();
         loadLogs();

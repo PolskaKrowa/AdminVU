@@ -326,8 +326,36 @@ static int handle_status(Database *db, JB *j) {
 /* ── /api/guilds ─────────────────────────────────────────────────────────── */
 
 static int handle_guilds(Database *db, JB *j) {
-    /* Union of all known guild IDs, with per-guild warning + ticket counts */
-    const char *sql =
+    /*
+     * Union of all known guild IDs (from mod_logs / warnings / tickets),
+     * with per-guild warning + ticket counts.  The messaging page expects
+     * an OBJECT of the shape  { "guilds": [ { "id", "guild_id", "name",
+     * "warning_count", "ticket_count" } ] } — that is what we emit here.
+     *
+     * The `name` column comes from an optional `guilds(guild_id, name)`
+     * table.  We first try to prepare the query WITH the guilds join; if
+     * that fails (table doesn't exist) we re-prepare a query WITHOUT the
+     * join and synthesise "Server <guild_id>" for every row instead.
+     */
+    const char *sql_with_names =
+        "SELECT g.guild_id,"
+        "       COALESCE(w.cnt,0) AS warn_cnt,"
+        "       COALESCE(t.cnt,0) AS tkt_cnt,"
+        "       guilds.name        AS name"
+        " FROM ("
+        "   SELECT guild_id FROM guilds"
+        "   UNION SELECT DISTINCT guild_id FROM mod_logs"
+        "   UNION SELECT DISTINCT guild_id FROM warnings"
+        "   UNION SELECT DISTINCT guild_id FROM tickets"
+        " ) AS g"
+        " LEFT JOIN (SELECT guild_id, COUNT(*) AS cnt FROM warnings GROUP BY guild_id) w"
+        "   ON w.guild_id = g.guild_id"
+        " LEFT JOIN (SELECT guild_id, COUNT(*) AS cnt FROM tickets GROUP BY guild_id) t"
+        "   ON t.guild_id = g.guild_id"
+        " LEFT JOIN guilds ON guilds.guild_id = g.guild_id"
+        " ORDER BY guilds.name, g.guild_id;";
+
+    const char *sql_no_names =
         "SELECT g.guild_id,"
         "       COALESCE(w.cnt,0) AS warn_cnt,"
         "       COALESCE(t.cnt,0) AS tkt_cnt"
@@ -342,24 +370,49 @@ static int handle_guilds(Database *db, JB *j) {
         "   ON t.guild_id = g.guild_id"
         " ORDER BY g.guild_id;";
 
-    sqlite3_stmt *s;
-    if (sqlite3_prepare_v2(db->db, sql, -1, &s, NULL) != SQLITE_OK) {
+    sqlite3_stmt *s = NULL;
+    int have_names = 0;
+    if (sqlite3_prepare_v2(db->db, sql_with_names, -1, &s, NULL) == SQLITE_OK) {
+        have_names = 1;
+    } else if (sqlite3_prepare_v2(db->db, sql_no_names, -1, &s, NULL) != SQLITE_OK) {
+        /* Both preparations failed — treat as a fatal db error. */
         jb_raw(j, "{\"error\":\"db error\"}");
         return 500;
     }
 
-    jb_raw(j, "[");
+    jb_raw(j, "{\"guilds\":[");
     int first = 1;
     while (sqlite3_step(s) == SQLITE_ROW) {
         if (!first) jb_raw(j, ",");
         first = 0;
-        jb_raw(j, "{\"guild_id\":");
-        jb_u64str(j, sqlite3_column_int64(s, 0));
+
+        sqlite3_int64 guild_id = sqlite3_column_int64(s, 0);
+        int warn_cnt = sqlite3_column_int(s, 1);
+        int tkt_cnt  = sqlite3_column_int(s, 2);
+
+        /* name column is only present when we used the with-names query. */
+        const char *name = have_names
+            ? (const char *)sqlite3_column_text(s, 3)
+            : NULL;
+
+        char name_buf[128];
+        if (!name || !name[0]) {
+            snprintf(name_buf, sizeof name_buf,
+                     "Server %lld", (long long)guild_id);
+            name = name_buf;
+        }
+
+        jb_raw(j, "{\"id\":");
+        jb_u64str(j, guild_id);
+        jb_raw(j, ",\"guild_id\":");
+        jb_u64str(j, guild_id);
+        jb_raw(j, ",\"name\":");
+        jb_str(j, name);
         jb_printf(j, ",\"warning_count\":%d,\"ticket_count\":%d}",
-                  sqlite3_column_int(s, 1), sqlite3_column_int(s, 2));
+                  warn_cnt, tkt_cnt);
     }
     sqlite3_finalize(s);
-    jb_raw(j, "]");
+    jb_raw(j, "]}");
     return 200;
 }
 
@@ -1134,51 +1187,74 @@ static int handle_channels(Database *db, const char *path, JB *j) {
     sqlite3_int64 guild_id = atoll(guild_id_str);
 
     /*
-     * Query for all text channels in this guild.
-     * This assumes a channels table exists with (id, guild_id, name, type).
-     * Adjust the query based on your actual schema.
+     * Query the cached channels for this guild.  The channels table is
+     * populated by messaging_refresh_guild_channels() (called from
+     * on_guild_create and POST /api/guilds/<id>/refresh-channels).
+     *
+     * If the table doesn't exist (e.g. a very old database that hasn't been
+     * migrated), we return an EMPTY channel list — NOT a synthetic "general"
+     * channel.  The old fallback (id = guild_id, name = "general") produced
+     * a fake channel_id that discord_create_message() always rejected with
+     * ORCAcode 1, breaking the Messaging page end-to-end.
      */
-    const char *sql =
-        "SELECT DISTINCT "
-        "       COALESCE(c.id, CAST(? AS INTEGER)) AS id,"
-        "       COALESCE(c.guild_id, ?) AS guild_id,"
-        "       COALESCE(c.name, 'general') AS name,"
-        "       COALESCE(c.type, 0) AS type"
-        " FROM ("
-        "   SELECT DISTINCT guild_id FROM mod_logs WHERE guild_id = ?"
-        " ) g"
-        " LEFT JOIN channels c ON c.guild_id = g.guild_id"
-        " ORDER BY c.name;";
-
-    sqlite3_stmt *s;
+    const char *sql = "SELECT id, guild_id, name, type FROM channels"
+                      " WHERE guild_id = ? ORDER BY name;";
+    sqlite3_stmt *s = NULL;
     if (sqlite3_prepare_v2(db->db, sql, -1, &s, NULL) != SQLITE_OK) {
-        /* If channels table doesn't exist, return empty but valid response */
+        /* channels table missing — return an empty list (NOT a fake channel). */
         jb_raw(j, "{\"channels\":[]}");
         return 200;
     }
-
     sqlite3_bind_int64(s, 1, guild_id);
-    sqlite3_bind_int64(s, 2, guild_id);
-    sqlite3_bind_int64(s, 3, guild_id);
 
     jb_raw(j, "{\"channels\":[");
     int first = 1;
-    int found_rows = 0;
-
     while (sqlite3_step(s) == SQLITE_ROW) {
-        found_rows++;
         if (!first) jb_raw(j, ",");
         first = 0;
-        jb_raw(j, "{\"id\":");
-        jb_u64str(j, sqlite3_column_int64(s, 0));
-        jb_raw(j, ",\"guild_id\":");
-        jb_u64str(j, sqlite3_column_int64(s, 1));
-        jb_raw(j, ",\"name\":");
-        jb_str(j, (const char *)sqlite3_column_text(s, 2));
+        jb_raw(j, "{\"id\":");       jb_u64str(j, sqlite3_column_int64(s, 0));
+        jb_raw(j, ",\"guild_id\":"); jb_u64str(j, sqlite3_column_int64(s, 1));
+        jb_raw(j, ",\"name\":");     jb_str(j, (const char *)sqlite3_column_text(s, 2));
         jb_printf(j, ",\"type\":%d}", sqlite3_column_int(s, 3));
     }
     sqlite3_finalize(s);
     jb_raw(j, "]}");
+    return 200;
+}
+
+/*
+ * handle_refresh_channels
+ *
+ * POST /api/guilds/<guild_id>/refresh-channels
+ *
+ * Kicks off a background refresh of the guild's cached channel list (a REST
+ * GET to Discord's /guilds/{id}/channels).  Returns immediately so the
+ * single-threaded HTTP server isn't blocked on a curl call.  The dashboard
+ * can re-poll GET /api/guilds/<id>/channels shortly afterwards to see the
+ * updated list.
+ */
+static int handle_refresh_channels(Database *db, const char *path, JB *j) {
+    const char *after_guilds = path + strlen("/api/guilds/");
+    char guild_id_str[64] = {0};
+    const char *p = after_guilds;
+    int i = 0;
+    while (*p && *p != '/' && i < 63) guild_id_str[i++] = *p++;
+    guild_id_str[i] = '\0';
+    if (!guild_id_str[0]) { jb_raw(j, "{\"error\":\"missing guild_id\"}"); return 400; }
+
+    sqlite3_int64 guild_id = atoll(guild_id_str);
+    if (guild_id == 0) { jb_raw(j, "{\"error\":\"invalid guild_id\"}"); return 400; }
+
+    /* Kick off a background refresh so we don't block the (single-threaded)
+     * HTTP server on a curl GET. The dashboard can re-poll /channels shortly
+     * after to see the updated list. */
+    extern void messaging_refresh_guild_channels_async(Database *db,
+                                                       u64_snowflake_t guild_id);
+    messaging_refresh_guild_channels_async(db, (u64_snowflake_t)guild_id);
+
+    jb_raw(j, "{\"ok\":true,\"message\":\"refreshing channels in the background\",\"guild_id\":");
+    jb_u64str(j, guild_id);
+    jb_raw(j, "}");
     return 200;
 }
 
@@ -1394,6 +1470,12 @@ int api_handle(Database *db,
     if (is_get && strncmp(path, "/api/guilds/", 12) == 0
                && strstr(path + 12, "/channels") != NULL)
         return handle_channels(db, path, &j);
+
+    /* POST /api/guilds/<guild_id>/refresh-channels — manually re-sync a
+     * guild's cached channel list from Discord's REST API (non-blocking). */
+    if (is_post && strncmp(path, "/api/guilds/", 12) == 0
+               && strstr(path + 12, "/refresh-channels") != NULL)
+        return handle_refresh_channels(db, path, &j);
 
     if (is_get && strcmp(path, "/api/mod-logs") == 0)
         return handle_mod_logs(db, query, &j);
