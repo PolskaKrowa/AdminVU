@@ -273,6 +273,23 @@ static void handle_ban_command(struct discord *client,
 }
 
 /* ---------------------------------------------------------------------------
+ * discard_curl_body — libcurl WRITEFUNCTION callback that throws the response
+ * body away.  Used by patch_member_timeout() because we only care about the
+ * HTTP status code, not the body.
+ *
+ * Replaces the previous (technically UB) cast of fwrite() to libcurl's
+ * callback type — fwrite's signature is
+ *     size_t fwrite(const void *, size_t, size_t, FILE *)
+ * while libcurl expects
+ *     size_t (*)(char *, size_t, size_t, void *)
+ * so the const qualification of the first argument differs.
+ * --------------------------------------------------------------------------- */
+static size_t discard_curl_body(char *ptr, size_t size, size_t nmemb, void *ud) {
+    (void)ptr; (void)ud;
+    return size * nmemb;
+}
+
+/* ---------------------------------------------------------------------------
  * patch_member_timeout
  *
  * Issues a PATCH /guilds/{guild}/members/{user} directly via libcurl,
@@ -311,10 +328,9 @@ static ORCAcode patch_member_timeout(u64_snowflake_t guild_id,
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    headers);
-    /* Silence response body – we only care about the status code. */
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-                     (curl_write_callback)(void *)fwrite);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, stderr);
+    /* Discard the response body — we only need the HTTP status code. */
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  discard_curl_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     NULL);
 
     CURLcode res      = curl_easy_perform(curl);
     long     http_code = 0;

@@ -102,6 +102,43 @@ static void send_str(int fd, const char *s) {
     send_all(fd, s, strlen(s));
 }
 
+/*
+ * Case-insensitive substring search — portable replacement for
+ * strcasestr() which is a GNU extension and not available everywhere.
+ *
+ * Returns a pointer to the first occurrence of `needle` inside `haystack`
+ * (matching case-insensitively), or NULL if not found.
+ */
+static const char *ci_strstr(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !*needle) return haystack;
+    size_t nlen = strlen(needle);
+    for (; *haystack; haystack++) {
+        if (strncasecmp(haystack, needle, nlen) == 0)
+            return haystack;
+    }
+    return NULL;
+}
+
+/*
+ * Portable replacement for memmem() (a GNU extension).
+ *
+ * Returns a pointer to the first occurrence of `needle` (length `nlen`)
+ * inside `haystack` (length `hlen`), or NULL if not found.
+ *
+ * Used by the HTTP request reader to locate the "\r\n\r\n" header
+ * terminator inside a binary buffer that may contain embedded NUL bytes
+ * (it normally doesn't, but binary-safe search is cheap insurance).
+ */
+static const char *find_substring(const char *haystack, size_t hlen,
+                                   const char *needle, size_t nlen) {
+    if (!haystack || !needle || nlen == 0 || hlen < nlen) return NULL;
+    for (size_t i = 0; i + nlen <= hlen; i++) {
+        if (memcmp(haystack + i, needle, nlen) == 0)
+            return haystack + i;
+    }
+    return NULL;
+}
+
 /* ── Response builders ──────────────────────────────────────────────────── */
 
 static void send_response(int fd, int status, const char *status_text,
@@ -160,15 +197,59 @@ static void serve_file(int fd, const char *filepath) {
 /* ── Request handling ───────────────────────────────────────────────────── */
 
 static void handle_client(int client_fd, HttpServer *srv) {
-    /* Read the full request into a buffer. */
-    char req[8192] = { 0 };
+    /*
+     * Read the full request into a buffer.
+     *
+     * The buffer must be large enough to hold any POST body the dashboard
+     * might send — the Components V2 endpoint (POST /api/send-components-v2)
+     * allocates a 16 KB `components` field on the API side, so we need at
+     * least that much room here plus HTTP headers.  32 KB comfortably
+     * covers a full components-v2 payload while still being a reasonable
+     * per-request stack allocation.
+     *
+     * The previous 8 KB buffer would silently truncate large components-v2
+     * POST bodies — the API would then reject them as "missing components"
+     * because the URL-decoded value ended up empty or partial.
+     *
+     * The previous recv loop ALSO broke out the moment it saw the
+     * "\r\n\r\n" header terminator — meaning that if the POST body arrived
+     * in a separate TCP packet from the headers (which is common for
+     * larger payloads), the body was never read at all.  We now keep
+     * reading until either we've consumed Content-Length bytes after the
+     * header terminator, OR the client closes the connection.
+     */
+    static char req[32768] = { 0 };
     size_t total = 0;
+    size_t header_end_offset = 0;  /* 0 until "\r\n\r\n" is seen */
+    size_t content_length    = 0;
+
     while (total < sizeof(req) - 1) {
         ssize_t n = recv(client_fd, req + total, sizeof(req) - 1 - total, 0);
         if (n <= 0) break;
         total += (size_t)n;
-        /* Stop once we have the header separator */
-        if (memmem(req, total, "\r\n\r\n", 4)) break;
+        req[total] = '\0';
+
+        /* Detect end-of-headers exactly once. */
+        if (header_end_offset == 0) {
+            const char *he = find_substring(req, total, "\r\n\r\n", 4);
+            if (he) {
+                header_end_offset = (size_t)(he - req) + 4;
+
+                /* Parse Content-Length so we know how much body to expect. */
+                const char *cl = ci_strstr(req, "Content-Length:");
+                if (cl) {
+                    cl += strlen("Content-Length:");
+                    while (*cl == ' ' || *cl == '\t') cl++;
+                    content_length = (size_t)strtoul(cl, NULL, 10);
+                }
+            }
+        }
+
+        /* Stop once we've read the full body (or there is no body). */
+        if (header_end_offset != 0) {
+            size_t body_have = total - header_end_offset;
+            if (body_have >= content_length) break;
+        }
     }
     req[total] = '\0';
     if (total == 0) return;
@@ -201,7 +282,7 @@ static void handle_client(int client_fd, HttpServer *srv) {
     const char *body     = NULL;
     size_t      body_len = 0;
     {
-        char *sep = memmem(req, total, "\r\n\r\n", 4);
+        const char *sep = find_substring(req, total, "\r\n\r\n", 4);
         if (sep) {
             body     = sep + 4;
             body_len = total - (size_t)(body - req);

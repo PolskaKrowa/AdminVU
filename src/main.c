@@ -331,11 +331,21 @@ int main(int argc, char *argv[]) {
     printf("Starting bot...\n");
     discord_run(client);
 
-    /* Cleanup */
+    /*
+     * ── Shutdown ordering ─────────────────────────────────────────────
+     * Background threads (HTTP server, propagation poll thread) MUST be
+     * stopped BEFORE the database is closed — otherwise they can race
+     * with sqlite3_close() and crash on a freed handle.
+     *
+     * Previous code closed the DB first and only then called
+     * http_server_stop(); that left a window in which the dashboard
+     * thread could still call api_handle() on a closed db pointer.
+     */
     discord_cleanup(client);
+    propagation_module_shutdown();
+    http_server_stop(&g_http_server);
     db_cleanup(&g_database);
     cleanup_env();
-    http_server_stop(&g_http_server);
     printf("Bot shut down successfully\n");
 
     return EXIT_SUCCESS;

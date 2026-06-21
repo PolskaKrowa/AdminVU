@@ -91,6 +91,19 @@ static int              g_blocked_cache_count = 0;
 /* How often the background thread re-syncs dashboard state (seconds). */
 #define PROPAGATION_POLL_INTERVAL_SECS 5
 
+/*
+ * g_poll_running is set to 1 by propagation_module_init() and cleared by
+ * propagation_module_shutdown().  The background thread checks it on every
+ * iteration and exits when it sees 0, so a normal SIGINT/SIGTERM shutdown
+ * no longer leaves the thread reading from a closed sqlite3 handle.
+ *
+ * Accessed atomically — no mutex needed because the only writer is
+ * propagation_module_shutdown() and the only reader is the poll thread.
+ */
+static volatile int g_poll_running = 0;
+static pthread_t    g_poll_tid     = { 0 };
+static int          g_poll_started = 0;
+
 /* ── Permission helpers ──────────────────────────────────────────────────── */
 
 /*
@@ -192,8 +205,16 @@ void propagation_poll_tick(void) {
 /* Background thread: periodically re-syncs dashboard state. */
 static void *propagation_poll_thread(void *arg) {
     (void)arg;
-    for (;;) {
-        sleep(PROPAGATION_POLL_INTERVAL_SECS);
+    /*
+     * Loop until propagation_module_shutdown() clears g_poll_running.
+     * Use a short sleep granularity so shutdown is responsive (the
+     * previous 5-second sleep could keep the thread alive well past
+     * db_cleanup() and crash on a closed sqlite3 handle).
+     */
+    while (g_poll_running) {
+        for (int i = 0; i < PROPAGATION_POLL_INTERVAL_SECS && g_poll_running; i++)
+            sleep(1);
+        if (!g_poll_running) break;
         propagation_poll_tick();
     }
     return NULL;
@@ -1975,17 +1996,37 @@ void propagation_module_init(struct discord *client,
     g_last_block_version = -1;
     propagation_poll_tick();
 
-    pthread_t poll_tid;
-    if (pthread_create(&poll_tid, NULL, propagation_poll_thread, NULL) == 0) {
-        pthread_detach(poll_tid);
+    g_poll_running = 1;
+    if (pthread_create(&g_poll_tid, NULL, propagation_poll_thread, NULL) == 0) {
+        g_poll_started = 1;
         printf("[propagation] Started background poll thread "
                "(every %d s) to sync dashboard block/unblock state.\n",
                PROPAGATION_POLL_INTERVAL_SECS);
     } else {
+        g_poll_running = 0;
         fprintf(stderr, "[propagation] WARNING: failed to start poll thread; "
                         "dashboard block/unblock changes will require a restart.\n");
     }
 
     printf("[propagation] Propagation module initialised "
            "(self=%" PRIu64 ").\n", self_guild_id);
+}
+
+void propagation_module_shutdown(void) {
+    /*
+     * Signal the poll thread to exit and join it.  This MUST happen before
+     * db_cleanup() so the thread does not call sqlite3_prepare_v2() on a
+     * closed handle.  Idempotent: safe to call even if init never started
+     * the thread.
+     */
+    if (!g_poll_started) return;
+
+    g_poll_running = 0;
+    int rc = pthread_join(g_poll_tid, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "[propagation] pthread_join failed: %d\n", rc);
+    } else {
+        printf("[propagation] Background poll thread stopped.\n");
+    }
+    g_poll_started = 0;
 }

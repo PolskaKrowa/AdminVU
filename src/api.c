@@ -419,38 +419,69 @@ static int handle_guilds(Database *db, JB *j) {
 /* ── /api/mod-logs ──────────────────────────────────────────────────────── */
 
 static int handle_mod_logs(Database *db, const char *query, JB *j) {
+    /*
+     * All user-supplied filter values are bound as SQL parameters — never
+     * interpolated into the SQL string — to prevent SQL injection via the
+     * query string (the dashboard is loopback-only but the principle still
+     * holds, and it future-proofs the endpoint if it ever gets exposed).
+     *
+     * Binding layout (1-indexed):
+     *   1: action_type (only when both guild and action filters are active)
+     *   — guild_id is bound at the same slot for both count and data queries.
+     */
     char guild_buf[64] = {0};
     char action_buf[16] = {0};
     long long limit  = get_param_i64(query, "limit",  50);
     long long offset = get_param_i64(query, "offset", 0);
     if (limit < 1 || limit > 200) limit = 50;
+    if (offset < 0) offset = 0;
 
     get_param(query, "guild_id", guild_buf, sizeof(guild_buf));
     get_param(query, "action",   action_buf, sizeof(action_buf));
 
-    /* Count total */
-    char count_sql[512];
+    /* Validate that guild_id, if supplied, is a positive integer (not arbitrary SQL). */
+    sqlite3_int64 guild_filter = 0;
     if (guild_buf[0]) {
-        snprintf(count_sql, sizeof(count_sql),
-                 "SELECT COUNT(*) FROM mod_logs WHERE guild_id = %s%s",
-                 guild_buf,
-                 (action_buf[0] && strcmp(action_buf,"all")!=0)
-                   ? " AND action_type = ?" : "");
-    } else {
-        snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM mod_logs");
+        char *end = NULL;
+        long long v = strtoll(guild_buf, &end, 10);
+        if (end != guild_buf && *end == '\0' && v > 0)
+            guild_filter = (sqlite3_int64)v;
+        /* else: invalid guild_id — treated as "no filter" rather than erroring. */
     }
 
-    /* Full query */
+    int has_action = action_buf[0] && strcmp(action_buf, "all") != 0;
+    int action_filter = 0;
+    if (has_action) action_filter = atoi(action_buf);
+
+    /* Build COUNT query with parameterised placeholders. */
+    const char *count_sql =
+        (guild_filter != 0)
+            ? (has_action
+                ? "SELECT COUNT(*) FROM mod_logs WHERE guild_id = ? AND action_type = ?"
+                : "SELECT COUNT(*) FROM mod_logs WHERE guild_id = ?")
+            : "SELECT COUNT(*) FROM mod_logs";
+
+    long long total = 0;
+    sqlite3_stmt *cs = NULL;
+    if (sqlite3_prepare_v2(db->db, count_sql, -1, &cs, NULL) == SQLITE_OK) {
+        int bidx = 1;
+        if (guild_filter != 0) sqlite3_bind_int64(cs, bidx++, guild_filter);
+        if (has_action)        sqlite3_bind_int(cs, bidx++, action_filter);
+        if (sqlite3_step(cs) == SQLITE_ROW)
+            total = sqlite3_column_int64(cs, 0);
+        sqlite3_finalize(cs);
+    }
+
+    /* Build the data query. LIMIT/OFFSET are integer constants here so they
+     * can be formatted safely into the SQL — the values themselves are
+     * clamped above and not user-supplied strings. */
     char sql[1024];
-    if (guild_buf[0]) {
+    if (guild_filter != 0) {
         snprintf(sql, sizeof(sql),
                  "SELECT id, action_type, user_id, guild_id, moderator_id, reason, timestamp"
-                 " FROM mod_logs WHERE guild_id = %s"
-                 "%s"
+                 " FROM mod_logs WHERE guild_id = ?%s"
                  " ORDER BY timestamp DESC LIMIT %lld OFFSET %lld",
-                 guild_buf,
-                 (action_buf[0] && strcmp(action_buf,"all")!=0)
-                   ? " AND action_type = ?" : "",
+                 has_action ? " AND action_type = ?" : "",
                  limit, offset);
     } else {
         snprintf(sql, sizeof(sql),
@@ -464,11 +495,12 @@ static int handle_mod_logs(Database *db, const char *query, JB *j) {
         jb_raw(j, "{\"error\":\"db error\"}");
         return 500;
     }
-    /* Bind action filter if needed */
-    if (guild_buf[0] && action_buf[0] && strcmp(action_buf,"all") != 0)
-        sqlite3_bind_int(s, 1, atoi(action_buf));
+    /* Bind guild_id and action_type at the same positional slots used above. */
+    int bidx = 1;
+    if (guild_filter != 0) sqlite3_bind_int64(s, bidx++, guild_filter);
+    if (has_action)        sqlite3_bind_int(s, bidx++, action_filter);
 
-    jb_raw(j, "{\"items\":[");
+    jb_printf(j, "{\"total\":%lld,\"items\":[", total);
     int first = 1;
     while (sqlite3_step(s) == SQLITE_ROW) {
         if (!first) jb_raw(j, ",");
@@ -588,6 +620,7 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
     long long limit  = get_param_i64(query, "limit",  50);
     long long offset = get_param_i64(query, "offset", 0);
     if (limit < 1 || limit > 200) limit = 50;
+    if (offset < 0) offset = 0;
 
     char user_buf[64]  = {0};
     char guild_buf[64] = {0};
@@ -595,20 +628,22 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
     get_param(query, "source_guild_id", guild_buf, sizeof(guild_buf));
 
     /*
-     * Build a WHERE clause fragment so we can reuse it for both the COUNT
-     * query and the data query without duplicating filter logic.
+     * Parse the filter values as integers up-front and bind them as SQL
+     * parameters below.  We never splice raw user input into the SQL string —
+     * that was a SQL-injection hole in the previous implementation.
      */
-    char where_clause[256] = {0};
-    if (user_buf[0] && guild_buf[0])
-        snprintf(where_clause, sizeof(where_clause),
-                 " WHERE pe.target_user_id = %s AND pe.source_guild_id = %s",
-                 user_buf, guild_buf);
-    else if (user_buf[0])
-        snprintf(where_clause, sizeof(where_clause),
-                 " WHERE pe.target_user_id = %s", user_buf);
-    else if (guild_buf[0])
-        snprintf(where_clause, sizeof(where_clause),
-                 " WHERE pe.source_guild_id = %s", guild_buf);
+    sqlite3_int64 user_filter  = 0;
+    sqlite3_int64 guild_filter = 0;
+    if (user_buf[0])  user_filter  = (sqlite3_int64)strtoll(user_buf,  NULL, 10);
+    if (guild_buf[0]) guild_filter = (sqlite3_int64)strtoll(guild_buf, NULL, 10);
+
+    const char *where_clause = "";
+    if (user_filter != 0 && guild_filter != 0)
+        where_clause = " WHERE pe.target_user_id = ? AND pe.source_guild_id = ?";
+    else if (user_filter != 0)
+        where_clause = " WHERE pe.target_user_id = ?";
+    else if (guild_filter != 0)
+        where_clause = " WHERE pe.source_guild_id = ?";
 
     /* Total matching rows (for dashboard pagination). */
     long long total = 0;
@@ -618,6 +653,9 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
                  "SELECT COUNT(*) FROM propagation_events pe%s", where_clause);
         sqlite3_stmt *cs;
         if (sqlite3_prepare_v2(db->db, count_sql, -1, &cs, NULL) == SQLITE_OK) {
+            int bidx = 1;
+            if (user_filter  != 0) sqlite3_bind_int64(cs, bidx++, user_filter);
+            if (guild_filter != 0) sqlite3_bind_int64(cs, bidx++, guild_filter);
             if (sqlite3_step(cs) == SQLITE_ROW)
                 total = sqlite3_column_int64(cs, 0);
             sqlite3_finalize(cs);
@@ -656,6 +694,11 @@ static int handle_prop_events(Database *db, const char *query, JB *j) {
         jb_printf(j, "{\"total\":0,\"items\":[]}");
         return 200;
     }
+
+    /* Bind filter parameters in the same order as the COUNT query. */
+    int bidx = 1;
+    if (user_filter  != 0) sqlite3_bind_int64(s, bidx++, user_filter);
+    if (guild_filter != 0) sqlite3_bind_int64(s, bidx++, guild_filter);
 
     jb_printf(j, "{\"total\":%lld,\"items\":[", total);
     int first = 1;
@@ -849,26 +892,32 @@ static int handle_tickets(Database *db, const char *query, JB *j) {
     get_param(query, "guild_id", guild_buf,  sizeof(guild_buf));
     get_param(query, "status",   status_buf, sizeof(status_buf));
 
-    char sql[1024];
-    if (guild_buf[0] && status_buf[0] && strcmp(status_buf, "all") != 0) {
-        snprintf(sql, sizeof(sql),
-                 "SELECT id, channel_id, guild_id, opener_id, assigned_to,"
-                 "       status, priority, outcome, subject, created_at, updated_at"
-                 " FROM tickets WHERE guild_id = %s AND status = %s"
-                 " ORDER BY created_at DESC LIMIT 100",
-                 guild_buf, status_buf);
-    } else if (guild_buf[0]) {
-        snprintf(sql, sizeof(sql),
-                 "SELECT id, channel_id, guild_id, opener_id, assigned_to,"
-                 "       status, priority, outcome, subject, created_at, updated_at"
-                 " FROM tickets WHERE guild_id = %s"
-                 " ORDER BY created_at DESC LIMIT 100",
-                 guild_buf);
+    /*
+     * Parse filter values as integers up-front; bind them as parameters
+     * below rather than splicing the raw query string into the SQL.
+     */
+    sqlite3_int64 guild_filter  = 0;
+    int           status_filter = -1;  /* -1 = no filter */
+    if (guild_buf[0])
+        guild_filter = (sqlite3_int64)strtoll(guild_buf, NULL, 10);
+    if (status_buf[0] && strcmp(status_buf, "all") != 0)
+        status_filter = atoi(status_buf);
+
+    const char *sql;
+    if (guild_filter != 0 && status_filter >= 0) {
+        sql = "SELECT id, channel_id, guild_id, opener_id, assigned_to,"
+              "       status, priority, outcome, subject, created_at, updated_at"
+              " FROM tickets WHERE guild_id = ? AND status = ?"
+              " ORDER BY created_at DESC LIMIT 100";
+    } else if (guild_filter != 0) {
+        sql = "SELECT id, channel_id, guild_id, opener_id, assigned_to,"
+              "       status, priority, outcome, subject, created_at, updated_at"
+              " FROM tickets WHERE guild_id = ?"
+              " ORDER BY created_at DESC LIMIT 100";
     } else {
-        snprintf(sql, sizeof(sql),
-                 "SELECT id, channel_id, guild_id, opener_id, assigned_to,"
-                 "       status, priority, outcome, subject, created_at, updated_at"
-                 " FROM tickets ORDER BY created_at DESC LIMIT 100");
+        sql = "SELECT id, channel_id, guild_id, opener_id, assigned_to,"
+              "       status, priority, outcome, subject, created_at, updated_at"
+              " FROM tickets ORDER BY created_at DESC LIMIT 100";
     }
 
     sqlite3_stmt *s;
@@ -876,6 +925,9 @@ static int handle_tickets(Database *db, const char *query, JB *j) {
         jb_raw(j, "[]");
         return 200;
     }
+    int bidx = 1;
+    if (guild_filter != 0) sqlite3_bind_int64(s, bidx++, guild_filter);
+    if (status_filter >= 0) sqlite3_bind_int(s, bidx++, status_filter);
 
     jb_raw(j, "[");
     int first = 1;

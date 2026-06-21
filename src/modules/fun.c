@@ -339,9 +339,20 @@ static void cmd_roll(struct discord *client,
                      const struct discord_interaction *event) {
     long max_val = 6; /* default */
 
-    if (event->data->options) {
-        for (int i = 0; event->data->options[i] &&
-                        i < (int)(sizeof(event->data->options) / sizeof(*event->data->options)); i++) {
+    /*
+     * event->data->options is a NULL-terminated array of pointers
+     * (struct discord_application_command_interaction_data_option **),
+     * so iterating until a NULL entry is the correct loop bound.
+     *
+     * The previous code used `i < sizeof(options)/sizeof(*options)` — but
+     * `options` is a POINTER, not a local array, so sizeof gives the size
+     * of a pointer (8 bytes) divided by sizeof(one element pointer) (also
+     * 8 bytes), which evaluates to 1.  The loop only ever inspected the
+     * first option, silently ignoring the "max" argument when it was not
+     * the first option in the array.
+     */
+    if (event->data && event->data->options) {
+        for (int i = 0; event->data->options[i]; i++) {
             struct discord_application_command_interaction_data_option *opt =
                 event->data->options[i];
             if (strcmp(opt->name, "max") == 0 && opt->value)
@@ -365,9 +376,9 @@ static void cmd_8ball(struct discord *client,
                       const struct discord_interaction *event) {
     char question[512] = "(your question)";
 
-    if (event->data->options) {
-        for (int i = 0; event->data->options[i] &&
-                        i < (int)(sizeof(event->data->options) / sizeof(*event->data->options)); i++) {
+    /* Same fix as cmd_roll — options is a pointer, not a sized array. */
+    if (event->data && event->data->options) {
+        for (int i = 0; event->data->options[i]; i++) {
             struct discord_application_command_interaction_data_option *opt =
                 event->data->options[i];
             if (strcmp(opt->name, "question") == 0 && opt->value)

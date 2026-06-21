@@ -23,6 +23,18 @@ void propagation_module_init(struct discord *client,
                               Database       *db,
                               uint64_t        self_guild_id);
 
+/*
+ * propagation_module_shutdown
+ *
+ * Signals the background poll thread (started in propagation_module_init)
+ * to stop and joins it.  MUST be called before db_cleanup() so the poll
+ * thread does not race with sqlite3_close() and crash on a freed handle.
+ *
+ * Safe to call even if propagation_module_init() was never called or the
+ * thread failed to start — it is idempotent.
+ */
+void propagation_module_shutdown(void);
+
 /* Register all propagation-related slash commands for a guild. */
 void register_propagation_commands(struct discord *client,
                                     uint64_t        application_id,

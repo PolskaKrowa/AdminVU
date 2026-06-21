@@ -430,8 +430,13 @@ const char *cv2_build_json(CV2Msg *m) {
      *   {"flags":32768,"components":[<m->buf>]}
      *
      * We allocate a fresh output buffer each time this is called.
+     *
+     * NOTE: a previous version of this function had a spurious extra
+     * memcpy() that copied m->buf to m->json_out and was immediately
+     * overwritten by the prefix copy below it — pure dead code that
+     * wasted a memcpy on every call.  Removed.
      */
-    static const char prefix[] = "{\"flags\":" "32768" ",\"components\":[";
+    static const char prefix[] = "{\"flags\":32768,\"components\":[";
     static const char suffix[] = "]}";
 
     const size_t plen  = sizeof prefix - 1;
@@ -442,10 +447,9 @@ const char *cv2_build_json(CV2Msg *m) {
     m->json_out = malloc(total);
     if (!m->json_out) return NULL;
 
-    memcpy(m->json_out,                m->buf,    m->pos);  /* placeholder  */
-    memcpy(m->json_out,                prefix,    plen);    /* overwrite    */
-    memcpy(m->json_out + plen,         m->buf,    m->pos);
-    memcpy(m->json_out + plen + m->pos, suffix,   slen + 1);
+    memcpy(m->json_out,                 prefix,  plen);
+    memcpy(m->json_out + plen,          m->buf,  m->pos);
+    memcpy(m->json_out + plen + m->pos, suffix,  slen + 1);
 
     return m->json_out;
 }

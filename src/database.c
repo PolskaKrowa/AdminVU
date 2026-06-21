@@ -69,14 +69,41 @@ static const char *CREATE_TABLES_SQL =
 
 int db_init(Database *db, const char *path) {
     db->db_path = path;
-    
+
     int rc = sqlite3_open(path, &db->db);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db->db));
         return -1;
     }
-    
-    // Execute schema creation
+
+    /*
+     * The bot has multiple threads touching the database:
+     *   • main gateway thread (slash commands, message relay, …)
+     *   • HTTP server thread (dashboard API queries)
+     *   • propagation poll thread (every 5 s)
+     *   • background channel-refresh threads (per guild, on demand)
+     *
+     * SQLite serialises writes by default, but without a busy_timeout a
+     * colliding write returns SQLITE_BUSY immediately — which the older
+     * code treated as a hard failure (logged an error, returned -1).
+     *
+     * A 5-second busy timeout lets short colliding operations retry
+     * transparently instead of failing in front of the user.  This is
+     * the standard recommendation for multi-threaded SQLite clients.
+     */
+    sqlite3_busy_timeout(db->db, 5000);
+
+    /*
+     * Enable foreign-key enforcement.  The schema declares FOREIGN KEY
+     * constraints on warnings.ticket_notes.ticket_staff_messages, etc.,
+     * but SQLite leaves them OFF by default for backwards compatibility.
+     * Turning FK enforcement on makes the database reject orphaned rows
+     * (e.g. a note for a ticket that was deleted) instead of silently
+     * storing them.
+     */
+    sqlite3_exec(db->db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
+
+    /* Execute schema creation */
     char *err_msg = NULL;
     rc = sqlite3_exec(db->db, CREATE_TABLES_SQL, NULL, NULL, &err_msg);
     if (rc != SQLITE_OK) {
@@ -85,7 +112,7 @@ int db_init(Database *db, const char *path) {
         sqlite3_close(db->db);
         return -1;
     }
-    
+
     printf("Database initialised successfully: %s\n", path);
     return 0;
 }

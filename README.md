@@ -478,46 +478,115 @@ This serves both as a demonstration of C ↔ ASM interop and as a moderately fas
 
 ---
 
+## Resolved Issues
+
+The following items were previously listed as known bugs or TODOs and have
+since been addressed in the codebase.  They are documented here for
+historical context and to make it easier for new contributors to find the
+relevant code.
+
+---
+
+> [!IMPORTANT]
+> ### ✅ Bug — Dashboard Propagation Sync  *(resolved)*
+> **The Propagation dashboard page now stays in sync with live bot data.**
+>
+> A dedicated background poll thread (`propagation_poll_thread` in
+> `src/modules/propagation.c`) re-reads `propagation_blocked_guilds` every
+> 5 seconds and refreshes an in-memory cache used by `is_dashboard_blocked()`.
+> Dashboard block / unblock actions bump `propagation_state_version`, which
+> the poll thread detects and logs.  The change is picked up live — no bot
+> restart required.
+>
+> The poll thread is started by `propagation_module_init()` and stopped
+> cleanly by `propagation_module_shutdown()` (called from `main()` before
+> `db_cleanup()`), so a normal SIGINT/SIGTERM shutdown no longer leaves the
+> thread reading from a closed sqlite3 handle.
+
+---
+
+> [!IMPORTANT]
+> ### ✅ Feature — Propagation-Linked Tickets  *(implemented)*
+> **Warned users and staff in any receiving guild can now open a ticket
+> directly linked to a propagation alert.**
+>
+> Every alert embed posted by `notify_guild()` carries an "Open Linked
+> Ticket" button (`prop_ticket:<alert_id>` custom_id).  Clicking it calls
+> `ticket_open_for_propagation()` in `ticket.c`, which creates a real
+> ticket channel in the configured staff server and records the link in
+> the `propagation_linked_tickets` table.
+>
+> The DM sent to the target user when the alert fires also explains how
+> to file an appeal and how to open a linked ticket.
+>
+> The dashboard can query linked tickets for an alert via
+> `GET /api/propagation/events/<id>/tickets`.
+
+---
+
+> [!IMPORTANT]
+> ### ✅ Feature — Restrict Who Can Appeal a Propagation Warning  *(implemented)*
+> **Appeals are now restricted to the targeted user themselves, filed from
+> a guild that received the alert notification.**
+>
+> `handle_appeal()` in `src/modules/propagation.c` performs two checks:
+> 1. `ev.target_user_id != user_id` — only the named target may appeal.
+> 2. If the appeal is filed from a guild (`event->guild_id != 0`), the
+>    guild must either be the source guild of the alert OR appear in
+>    `propagation_notifications` for that alert.  Appeals filed from a DM
+>    (`guild_id == 0`) bypass the guild check.
+
+---
+
+> [!IMPORTANT]
+> ### ✅ Feature — Edit Propagation Message on Updates  *(implemented)*
+> **Severity recalculations, corroborations, and appeal outcomes now edit
+> the original alert message in place instead of posting follow-ups.**
+>
+> The `propagation_notifications` table gained a `message_id` column.
+> When `notify_guild()` posts an alert, the resulting Discord message ID
+> is persisted.  `broadcast_appeal_update()` and
+> `broadcast_corroboration_update()` then call `discord_edit_message()`
+> on the stored message ID, falling back to a follow-up post only when
+> the ID is missing (e.g. for alerts created before this schema change).
+
+---
+
 ## Known Issues & TODO
 
 > [!WARNING]
-> **The following items are known to be broken or incomplete.** Contributions and fixes are welcome — please open an issue or PR referencing the item below.
-
----
-
-> [!CAUTION]
-> ### 🐛 Bug — Dashboard Propagation Sync
-> **The Propagation dashboard page does not properly sync with live bot data.**
-> - Alert events are not displaying correctly in the events table.
-> - Block/unblock actions via the dashboard UI are accepted by the API but the bot does not pick up the change without a restart.
-> Needs a polling mechanism or a shared-state refresh path between `api.c` and `propagation.c`.
-
----
-
-> [!NOTE]
-> ### ✨ Feature — Propagation-Linked Tickets
-> **Propagation must allow warned users and staff members of other servers to create a ticket relating to a specific propagation warning.**
-> Suggested: when an alert fires, the DM to the target user should include a direct `/ticket open` pre-filled link (or a button). Staff in other guilds who receive the alert should also be able to raise a linked ticket referencing the alert ID. A `propagation_id` foreign key column on the `tickets` table would be needed.
-
----
-
-> [!NOTE]
-> ### ✨ Feature — Restrict Who Can Appeal a Propagation Warning
-> **Currently, any server can appeal any propagated warning**, regardless of whether they were named in it or received the alert.
-> The `handle_appeal` handler in `propagation.c` checks `ev.target_user_id != user_id` but there is no guild-level restriction. Appeals should be restricted to: (a) the targeted user themselves, or (b) staff in a guild that received the alert notification.
-
----
-
-> [!NOTE]
-> ### ✨ Feature — Edit Propagation Message on Updates
-> **Each new update to an existing propagation event (severity change, appeal outcome, report threshold) posts a new message instead of editing the original.**
-> The `propagation_notifications` table records `guild_id` but not the `message_id` of the alert that was posted. A `message_id` column should be added so that `broadcast_appeal_update()` and severity recalculations can call `discord_edit_message()` on the original embed rather than posting a follow-up.
+> **The following items are still open.**  Contributions welcome — please
+> open an issue or PR referencing the item below.
 
 ---
 
 > [!NOTE]
 > ### 🎉 Feature — High-Precision Scientific Calculator (for the fun of it)
 > **Add a `/calc` command** implementing a high-precision floating-point arithmetic calculator supporting scientific notation, standard mathematical functions (sin, cos, ln, exp, √, etc.), and arbitrary-precision integers. Could use the GNU MPFR library internally, or a bundled arbitrary-precision implementation. Purely for fun.
+
+---
+
+> [!NOTE]
+> ### 🔒 Hardening — Dashboard authentication
+> The HTTP dashboard is bound to `127.0.0.1` only and has no
+> authentication.  If you ever expose it beyond loopback (e.g. via an
+> SSH reverse tunnel, a sidecar proxy, or by changing the bind address
+> in `http_server.c`), add a token / password check before any
+> state-mutating endpoint (`POST /api/propagation/block`,
+> `POST /api/send-message`, etc.).  The current loopback-only binding
+> is the only thing preventing any local process from posting arbitrary
+> messages through the bot.
+
+---
+
+> [!NOTE]
+> ### ⚡ Performance — Synchronous delivery loop in `/propagate`
+> `handle_propagate()` in `src/modules/propagation.c` notifies every
+> opted-in guild synchronously, doing one REST `GET /guilds/{id}/members/{user}`
+> plus one `POST /channels/{id}/messages` per guild on the gateway
+> thread.  For communities with many opted-in guilds this can block the
+> bot's event loop for several seconds.  Consider moving delivery to a
+> worker thread or batching the member-existence checks.
 
 ---
 

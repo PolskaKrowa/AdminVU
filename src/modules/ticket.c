@@ -1293,9 +1293,13 @@ static void reply_ephemeral(struct discord *client,
  * array.  We relay CDN URLs to the destination channel.  The files remain
  * accessible as long as the source message exists; tickets are closed,
  * not deleted, so URLs stay live.
+ *
+ * NOTE: MAX_RELAY_ATTACHMENTS is defined once near the top of this file
+ * (set to 10) and shared by download_attachments() and relay_attachments().
+ * The previous duplicate #define here (which silently overrode it to 5)
+ * was removed because it caused the download path to cap at 5 attachments
+ * even though the constant was originally declared as 10.
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-#define MAX_RELAY_ATTACHMENTS 5
 
 static void relay_attachments(u64_snowflake_t dest_channel_id,
                                struct discord_attachment **attachments) {
@@ -2566,7 +2570,16 @@ char *ticket_render_archive_html(Database *db, int ticket_id) {
     } \
 } while (0)
 
-    /* ── HTML preamble ── */
+    /* ── HTML preamble ──
+     *
+     * IMPORTANT: this string is passed as a printf format to snprintf
+     * (HTML_APPEND uses snprintf internally), so any literal `%` in the
+     * CSS must be escaped as `%%`.  The previous code wrote `max-width:100%`
+     * directly, which snprintf interpreted as a malformed format spec
+     * ("%;"), producing "unknown conversion type character" warnings and a
+     * truncated/garbled HTML output (the `%` and what followed were
+     * silently dropped).
+     */
     HTML_APPEND("<!DOCTYPE html><html lang=\"en\"><head>"
         "<meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -2579,7 +2592,7 @@ char *ticket_render_archive_html(Database *db, int ticket_id) {
         ".header .meta{font-size:.85em;color:#949ba4;display:grid;"
         "grid-template-columns:auto 1fr;gap:4px 12px;}"
         ".messages{display:flex;flex-direction:column;gap:8px;}"
-        ".msg{border-radius:6px;padding:10px 14px;max-width:100%;}"
+        ".msg{border-radius:6px;padding:10px 14px;max-width:100%%;}"
         ".msg.user{background:#2b2d31;border-left:3px solid #5865f2;}"
         ".msg.staff{background:#2b2d31;border-left:3px solid #57f287;}"
         ".msg.system{background:#1e1f22;border-left:3px solid #fee75c;"
@@ -2914,25 +2927,25 @@ void register_ticket_commands(struct discord *client,
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "mainserver",
         .description = "Snowflake ID of the community server this staff server handles",
-        .required    = true,
+        .required    = false,
     };
     static struct discord_application_command_option cfg_staffserver = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "staffserver",
         .description = "Snowflake ID of this staff server (where ticket channels are created)",
-        .required    = true,
+        .required    = false,
     };
     static struct discord_application_command_option cfg_category = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "category",
         .description = "ID of the category channel where ticket channels will be created",
-        .required    = true,
+        .required    = false,
     };
     static struct discord_application_command_option cfg_logchannel = {
         .type        = DISCORD_APPLICATION_COMMAND_OPTION_STRING,
         .name        = "logchannel",
         .description = "ID of the staff-only channel where ticket events are logged",
-        .required    = true,
+        .required    = false,
     };
     static struct discord_application_command_option *cfg_opts[] = {
         &cfg_mainserver, &cfg_staffserver, &cfg_category, &cfg_logchannel, NULL

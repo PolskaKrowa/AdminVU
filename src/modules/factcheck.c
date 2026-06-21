@@ -478,9 +478,14 @@ void on_factcheck_message(struct discord *client,
     /* ------------------------------------------------------------------ *
      * 6. Format and send the final reply                                  *
      * ------------------------------------------------------------------ */
+    /*
+     * SECURITY: ai_response comes from an untrusted LLM and may contain
+     * printf format specifiers like %s or %n.  Always use a fixed format
+     * string and pass the AI text as a data argument — never as the format
+     * itself — to avoid a classic format-string vulnerability (CWE-134).
+     */
     char final_msg[2048];
-    snprintf(final_msg, sizeof(final_msg),
-             ai_response);
+    snprintf(final_msg, sizeof(final_msg), "%s", ai_response);
     free(ai_response);
 
     struct discord_message_reference reply_ref = {
