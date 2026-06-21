@@ -296,13 +296,29 @@ static void handle_client(int client_fd, HttpServer *srv) {
             return;
         }
 
-        static char api_buf[131072]; /* 128 KB shared buffer (single-threaded server) */
+        /*
+         * Initial response buffer.  Most API responses are small (a few KB
+         * of JSON) and fit here without any heap allocation.  Endpoints
+         * that return large bodies — notably GET /api/tickets/<id>/archive,
+         * which embeds every attachment as base64 — will overflow this
+         * buffer and api_handle will transparently switch to a heap buffer
+         * (tracked via api_handle_free_response).
+         *
+         * The buffer is static so it lives in BSS rather than on the stack
+         * — important because handle_client is called recursively deep in
+         * the call stack of the server thread.
+         */
+        static char api_buf[65536]; /* 64 KB initial; grows on demand */
         api_buf[0] = '\0';
+
+        char  *resp_buf    = api_buf;   /* may be replaced with heap ptr */
+        size_t resp_len    = 0;
 
         int status = api_handle(srv->db, method, url_path,
                                 url_query[0] ? url_query : NULL,
                                 body, body_len,
-                                api_buf, sizeof(api_buf));
+                                api_buf, sizeof(api_buf),
+                                &resp_buf, &resp_len);
 
         /* api_handle() sets the response content-type via
          * api_set_response_content_type() when it returns non-JSON (e.g.
@@ -316,7 +332,12 @@ static void handle_client(int client_fd, HttpServer *srv) {
 
         send_response(client_fd, status, status_text,
                       mime,
-                      api_buf, strlen(api_buf));
+                      resp_buf, resp_len);
+
+        /* Release any heap allocation api_handle made for this response.
+         * No-op if the response stayed in api_buf.  Must happen AFTER
+         * send_response() has finished reading resp_buf. */
+        api_handle_free_response(&resp_buf);
         return;
     }
 

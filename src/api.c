@@ -16,12 +16,96 @@
 #include <inttypes.h>
 
 /* ── JSON buffer helper ─────────────────────────────────────────────────── */
+/*
+ * JB is a growable byte buffer used to accumulate the response body of every
+ * /api/* endpoint.  It starts out wrapping a caller-provided buffer (so the
+ * common small-JSON case still needs zero heap allocations) and transparently
+ * upgrades to a heap-owned buffer the first time a write would overflow the
+ * caller's storage.  Once upgraded, the buffer doubles on demand up to
+ * JB_MAX_CAP, beyond which writes set `truncated=1` and are dropped (so the
+ * caller always gets a defined, terminated string instead of a silent
+ * half-written response).
+ *
+ * This growth path is what lets endpoints like GET /api/tickets/<id>/archive
+ * return multi-megabyte HTML (every image attachment is embedded as base64,
+ * which inflates the size by ~33%) without silently truncating to an empty
+ * page — which was the original bug: jb_raw() previously set `truncated=1`
+ * and returned WITHOUT copying anything whenever a single write exceeded the
+ * fixed 128 KB api_buf, leaving the response body completely empty.
+ */
+#define JB_MAX_CAP (64UL * 1024 * 1024)   /* 64 MiB hard cap */
 
-typedef struct { char *buf; size_t pos; size_t cap; int truncated; } JB;
+typedef struct {
+    char  *buf;        /* current backing storage (caller's or heap)        */
+    size_t pos;        /* bytes written so far (excluding NUL)              */
+    size_t cap;        /* bytes allocated at *buf (including NUL room)      */
+    int    truncated;  /* 1 once JB_MAX_CAP was hit — further writes drop  */
+    int    heap_owned; /* 1 iff *buf was malloc'd by us and must be freed  */
+} JB;
+
+/*
+ * Ensure at least `need` bytes are free past j->pos.  Returns 1 on success
+ * (either there was already enough room, or we grew the heap buffer to fit),
+ * 0 if the buffer cannot be grown any further (JB_MAX_CAP reached) — in
+ * which case the caller should set j->truncated and skip the write.
+ */
+/*
+ * jb_ensure — internal helper used by jb_raw / jb_printf.
+ *
+ * NOTE: this function references g_last_heap_response (defined further down
+ * near api_handle_free_response) so that any heap allocation made for a JB
+ * buffer is tracked and can later be freed by the HTTP layer.  We forward-
+ * declare it here.
+ */
+static char *g_last_heap_response;
+
+static int jb_ensure(JB *j, size_t need) {
+    if (j->truncated) return 0;
+    size_t free_bytes = j->cap > j->pos ? j->cap - j->pos : 0;
+    if (free_bytes >= need + 1) return 1;     /* +1 for the NUL terminator */
+
+    /* Not enough room — must grow.  Only possible if we already upgraded
+     * to a heap buffer (or are willing to now). */
+    size_t want = j->pos + need + 1;
+    size_t new_cap = j->cap ? j->cap : 4096;
+    while (new_cap < want) {
+        if (new_cap >= JB_MAX_CAP) break;
+        new_cap *= 2;
+    }
+    if (new_cap > JB_MAX_CAP) new_cap = JB_MAX_CAP;
+    if (new_cap < want) {
+        /* Even at the cap we can't fit this write.  Mark truncated and
+         * refuse — the caller will skip the write, preserving whatever we
+         * already have in the buffer rather than corrupting it. */
+        j->truncated = 1;
+        return 0;
+    }
+
+    char *new_buf;
+    if (j->heap_owned) {
+        new_buf = realloc(j->buf, new_cap);
+        if (!new_buf) { j->truncated = 1; return 0; }
+    } else {
+        /* First overflow: copy the existing caller-provided contents into
+         * a fresh heap buffer and switch over. */
+        new_buf = malloc(new_cap);
+        if (!new_buf) { j->truncated = 1; return 0; }
+        if (j->pos) memcpy(new_buf, j->buf, j->pos);
+        j->heap_owned = 1;
+    }
+    j->buf = new_buf;
+    j->cap = new_cap;
+    /* Track the most recent heap allocation so api_handle_free_response()
+     * can find and free it.  Safe because the HTTP server is single-
+     * threaded: there is only one in-flight api_handle() call at a time. */
+    g_last_heap_response = new_buf;
+    return 1;
+}
 
 static void jb_raw(JB *j, const char *s) {
+    if (!s || j->truncated) return;
     size_t len = strlen(s);
-    if (j->pos + len + 1 >= j->cap) { j->truncated = 1; return; }
+    if (!jb_ensure(j, len)) return;
     memcpy(j->buf + j->pos, s, len);
     j->pos += len;
     j->buf[j->pos] = '\0';
@@ -31,12 +115,20 @@ static void jb_printf(JB *j, const char *fmt, ...) {
     if (j->truncated) return;
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(j->buf + j->pos, j->cap - j->pos, fmt, ap);
+    /* First, compute how many bytes would be needed (vsnprintf with NULL
+     * just returns the count).  Then grow if necessary and print for real. */
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap2);
+    va_end(ap2);
+    if (n < 0) { va_end(ap); j->truncated = 1; return; }
+
+    if (!jb_ensure(j, (size_t)n)) { va_end(ap); return; }
+
+    int n2 = vsnprintf(j->buf + j->pos, j->cap - j->pos, fmt, ap);
     va_end(ap);
-    if (n > 0 && (size_t)n < j->cap - j->pos)
-        j->pos += n;
-    else
-        j->truncated = 1;
+    if (n2 < 0) { j->truncated = 1; return; }
+    j->pos += (size_t)n2;
 }
 
 /* JSON-escape a string and append it, including surrounding quotes. */
@@ -1186,8 +1278,11 @@ static int handle_ticket_archive(Database *db, const char *path, JB *j,
     int ticket_id = atoi(after_tickets);
     if (ticket_id <= 0) {
         jb_raw(j, "<h1>Invalid ticket ID</h1>");
+        if (content_type_out) *content_type_out = "text/html; charset=utf-8";
         return 400;
     }
+
+    if (content_type_out) *content_type_out = "text/html; charset=utf-8";
 
     /* Try pre-rendered archive first. */
     sqlite3_stmt *s;
@@ -1198,9 +1293,23 @@ static int handle_ticket_archive(Database *db, const char *path, JB *j,
         if (sqlite3_step(s) == SQLITE_ROW) {
             const char *html = (const char *)sqlite3_column_text(s, 0);
             if (html) {
+                /*
+                 * Pre-check the size before calling jb_raw: if the archive
+                 * is larger than the JB hard cap, jb_raw would silently
+                 * drop it (truncated=1) and the user would get a blank
+                 * page.  Show a clear error instead.
+                 */
+                size_t html_len = strlen(html);
+                if (html_len >= JB_MAX_CAP) {
+                    sqlite3_finalize(s);
+                    jb_raw(j, "<!DOCTYPE html><html><head><title>Archive too large</title></head>"
+                              "<body><h1>Archive too large to display inline</h1>"
+                              "<p>This ticket's transcript exceeds the server's in-memory cap. "
+                              "Use the database export tool to retrieve it directly.</p></body></html>");
+                    return 500;
+                }
                 jb_raw(j, html);
                 sqlite3_finalize(s);
-                if (content_type_out) *content_type_out = "text/html; charset=utf-8";
                 return 200;
             }
         }
@@ -1211,12 +1320,10 @@ static int handle_ticket_archive(Database *db, const char *path, JB *j,
     char *html = ticket_render_archive_html(db, ticket_id);
     if (!html) {
         jb_raw(j, "<h1>Ticket not found or no messages yet.</h1>");
-        if (content_type_out) *content_type_out = "text/html; charset=utf-8";
         return 404;
     }
     jb_raw(j, html);
     free(html);
-    if (content_type_out) *content_type_out = "text/html; charset=utf-8";
     return 200;
 }
 
@@ -1500,105 +1607,166 @@ static int handle_send_components_v2(Database *db, const char *body,
 int api_handle(Database *db,
                const char *method, const char *path,
                const char *query,  const char *body, size_t body_len,
-               char *out_buf, size_t out_size) {
+               char *out_buf, size_t out_size,
+               char **out_buf_ptr, size_t *out_len_ptr) {
     /* Reset the per-call content-type override so callers always get a
      * valid value from api_get_response_content_type() regardless of call
      * order. */
     g_response_content_type = NULL;
 
-    JB j = { .buf = out_buf, .pos = 0, .cap = out_size, .truncated = 0 };
+    /*
+     * JB starts out wrapping the caller-provided buffer.  If a write would
+     * overflow it, jb_ensure() transparently malloc's a larger buffer and
+     * flips j.heap_owned to 1.  After the handler returns we expose the
+     * final buffer pointer + length to the caller via out_buf_ptr /
+     * out_len_ptr so the HTTP layer can send_response() the right memory
+     * (which may now be heap-allocated rather than the original out_buf).
+     */
+    JB j = {
+        .buf        = out_buf,
+        .pos        = 0,
+        .cap        = out_size,
+        .truncated  = 0,
+        .heap_owned = 0,
+    };
     out_buf[0] = '\0';
 
     int is_get  = method && strcmp(method, "GET")  == 0;
     int is_post = method && strcmp(method, "POST") == 0;
 
+    int status;
     if (is_get && strcmp(path, "/api/status") == 0)
-        return handle_status(db, &j);
+        status = handle_status(db, &j);
 
-    if (is_get && strcmp(path, "/api/guilds") == 0)
-        return handle_guilds(db, &j);
+    else if (is_get && strcmp(path, "/api/guilds") == 0)
+        status = handle_guilds(db, &j);
 
     /* /api/guilds/<guild_id>/channels — get channels for a guild */
-    if (is_get && strncmp(path, "/api/guilds/", 12) == 0
+    else if (is_get && strncmp(path, "/api/guilds/", 12) == 0
                && strstr(path + 12, "/channels") != NULL)
-        return handle_channels(db, path, &j);
+        status = handle_channels(db, path, &j);
 
     /* POST /api/guilds/<guild_id>/refresh-channels — manually re-sync a
      * guild's cached channel list from Discord's REST API (non-blocking). */
-    if (is_post && strncmp(path, "/api/guilds/", 12) == 0
+    else if (is_post && strncmp(path, "/api/guilds/", 12) == 0
                && strstr(path + 12, "/refresh-channels") != NULL)
-        return handle_refresh_channels(db, path, &j);
+        status = handle_refresh_channels(db, path, &j);
 
-    if (is_get && strcmp(path, "/api/mod-logs") == 0)
-        return handle_mod_logs(db, query, &j);
+    else if (is_get && strcmp(path, "/api/mod-logs") == 0)
+        status = handle_mod_logs(db, query, &j);
 
-    if (is_get && strcmp(path, "/api/warnings") == 0)
-        return handle_warnings(db, query, &j);
+    else if (is_get && strcmp(path, "/api/warnings") == 0)
+        status = handle_warnings(db, query, &j);
 
-    if (is_get && strcmp(path, "/api/propagation/guilds") == 0)
-        return handle_prop_guilds(db, &j);
+    else if (is_get && strcmp(path, "/api/propagation/guilds") == 0)
+        status = handle_prop_guilds(db, &j);
 
-    if (is_get && strcmp(path, "/api/propagation/events") == 0)
-        return handle_prop_events(db, query, &j);
+    else if (is_get && strcmp(path, "/api/propagation/events") == 0)
+        status = handle_prop_events(db, query, &j);
 
-    if (is_get && strcmp(path, "/api/propagation/blocked") == 0)
-        return handle_prop_blocked(db, &j);
+    else if (is_get && strcmp(path, "/api/propagation/blocked") == 0)
+        status = handle_prop_blocked(db, &j);
 
-    if (is_post && strcmp(path, "/api/propagation/block") == 0)
-        return handle_prop_block(db, body, body_len, &j);
+    else if (is_post && strcmp(path, "/api/propagation/block") == 0)
+        status = handle_prop_block(db, body, body_len, &j);
 
-    if (is_post && strcmp(path, "/api/propagation/unblock") == 0)
-        return handle_prop_unblock(db, body, body_len, &j);
+    else if (is_post && strcmp(path, "/api/propagation/unblock") == 0)
+        status = handle_prop_unblock(db, body, body_len, &j);
 
     /* /api/propagation/events/<id>/tickets — linked tickets for one alert.
        Must be matched before the bare /events handler. */
-    if (is_get && strncmp(path, "/api/propagation/events/", 24) == 0
+    else if (is_get && strncmp(path, "/api/propagation/events/", 24) == 0
                && strstr(path + 24, "/tickets") != NULL)
-        return handle_prop_event_tickets(db, path, &j);
+        status = handle_prop_event_tickets(db, path, &j);
 
-    if (is_post && strcmp(path, "/api/send-message") == 0)
-        return handle_send_message(db, body, body_len, &j);
+    else if (is_post && strcmp(path, "/api/send-message") == 0)
+        status = handle_send_message(db, body, body_len, &j);
 
-    if (is_post && strcmp(path, "/api/send-components-v2") == 0)
-        return handle_send_components_v2(db, body, body_len, &j);
+    else if (is_post && strcmp(path, "/api/send-components-v2") == 0)
+        status = handle_send_components_v2(db, body, body_len, &j);
 
-    if (is_get && strcmp(path, "/api/tickets") == 0)
-        return handle_tickets(db, query, &j);
+    else if (is_get && strcmp(path, "/api/tickets") == 0)
+        status = handle_tickets(db, query, &j);
 
     /* Exact named sub-routes must precede the numeric wildcard. */
-    if (is_get && strcmp(path, "/api/tickets/events") == 0)
-        return handle_ticket_events(query, &j);
+    else if (is_get && strcmp(path, "/api/tickets/events") == 0)
+        status = handle_ticket_events(query, &j);
 
     /* /api/tickets/<id>/log — edit/delete audit log for one ticket. */
-    if (is_get && strncmp(path, "/api/tickets/", 13) == 0
+    else if (is_get && strncmp(path, "/api/tickets/", 13) == 0
                && strstr(path + 13, "/log") != NULL)
-        return handle_ticket_log(db, path, &j);
+        status = handle_ticket_log(db, path, &j);
 
     /* /api/tickets/<id>/chat — live message history (user/staff/system). */
-    if (is_get && strncmp(path, "/api/tickets/", 13) == 0
+    else if (is_get && strncmp(path, "/api/tickets/", 13) == 0
                && strstr(path + 13, "/chat") != NULL)
-        return handle_ticket_chat(db, path, &j);
+        status = handle_ticket_chat(db, path, &j);
 
     /* /api/tickets/<id>/archive — full HTML transcript. */
-    if (is_get && strncmp(path, "/api/tickets/", 13) == 0
+    else if (is_get && strncmp(path, "/api/tickets/", 13) == 0
                && strstr(path + 13, "/archive") != NULL) {
         char *ct = NULL;
-        int status = handle_ticket_archive(db, path, &j, &ct);
-        if (ct) {
-            /* Signal text/html to the caller — api_handle sets the
-             * Content-Type header.  Abuse the JB buffer as a plain
-             * string: it already contains raw HTML. */
-            /* NOTE: the caller (api_handle) reads j.buf and the return
-             * value; it must set Content-Type: text/html in this case.
-             * We communicate via a static thread-local flag. */
-            api_set_response_content_type(ct);
-        }
-        return status;
+        status = handle_ticket_archive(db, path, &j, &ct);
+        if (ct) api_set_response_content_type(ct);
     }
 
-    if (is_get && strncmp(path, "/api/tickets/", 13) == 0)
-        return handle_ticket_detail(db, path, &j);
+    else if (is_get && strncmp(path, "/api/tickets/", 13) == 0)
+        status = handle_ticket_detail(db, path, &j);
 
-    jb_raw(&j, "{\"error\":\"not found\"}");
-    return 404;
+    else {
+        jb_raw(&j, "{\"error\":\"not found\"}");
+        status = 404;
+    }
+
+    /*
+     * Report truncation loudly — silent truncation was the original bug
+     * that produced empty archive pages, so we want any future regression
+     * to be obvious in the log rather than invisible in the dashboard.
+     */
+    if (j.truncated) {
+        fprintf(stderr,
+                "[api] WARNING: response for %s %s was truncated at %zu bytes "
+                "(cap=%zu, heap_owned=%d).  The client will receive a partial "
+                "response.\n",
+                method ? method : "?",
+                path   ? path   : "?",
+                j.pos, j.cap, j.heap_owned);
+    }
+
+    /* Export the final buffer + length to the caller.  The buffer may be
+     * either the original out_buf (heap_owned=0) or a malloc'd replacement
+     * (heap_owned=1); the caller frees it via api_handle_free_response(). */
+    if (out_buf_ptr) *out_buf_ptr = j.buf;
+    if (out_len_ptr) *out_len_ptr = j.pos;
+
+    return status;
+}
+
+/*
+ * api_handle_free_response
+ *
+ * Frees the response buffer returned by api_handle() if (and only if) the
+ * API layer allocated it on the heap.  The caller passes the same char**
+ * it passed to api_handle() as out_buf_ptr; we inspect the heap_owned flag
+ * stored at the address to decide whether to free.
+ *
+ * Tracking the heap_owned flag in the buffer itself is not possible (the
+ * buffer is raw bytes), so we keep a single static pointer (declared
+ * earlier near jb_ensure) that records the most recent heap allocation.
+ * This is safe because the HTTP server is single-threaded — only one
+ * api_handle() call is in flight at a time, and api_handle_free_response()
+ * is always called before the next one.
+ */
+void api_handle_free_response(char **out_buf_ptr) {
+    if (!out_buf_ptr) return;
+    /*
+     * If the caller's pointer matches the most recent heap allocation,
+     * free it.  Otherwise the response stayed in the caller's original
+     * (stack/static) buffer and there is nothing to free.
+     */
+    if (g_last_heap_response && *out_buf_ptr == g_last_heap_response) {
+        free(g_last_heap_response);
+        g_last_heap_response = NULL;
+    }
+    *out_buf_ptr = NULL;
 }

@@ -42,22 +42,49 @@ int api_init(Database *db);
 /*
  * api_handle
  *
- * Dispatch an API request and write a JSON body into out_buf.
+ * Dispatch an API request and write the response body into *out_buf_ptr.
  *
  * method   – "GET" or "POST"
  * path     – URL path component, e.g. "/api/mod-logs"
  * query    – query string without leading '?', may be NULL
  * body     – POST body, may be NULL
  * body_len – length of body in bytes
- * out_buf  – caller-supplied output buffer (at least 65536 bytes recommended)
- * out_size – size of out_buf
+ * out_buf  – caller-supplied initial output buffer (at least 65536 bytes
+ *            recommended).  Used as-is for small responses; on large
+ *            responses (e.g. multi-MB ticket archives) api_handle may
+ *            malloc a bigger buffer and update *out_buf_ptr to point at
+ *            it.  The caller MUST call api_handle_free_response() when
+ *            done to release any heap allocation (it is a no-op if the
+ *            response stayed in the caller's original buffer).
+ * out_size – size of the initial out_buf
  *
  * Returns an HTTP status code: 200, 400, 404, or 500.
+ *
+ * On return, *out_buf_ptr points to the response body (NUL-terminated)
+ * and *out_len_ptr holds its length in bytes.  The body is always a
+ * valid C string — if the response was truncated for any reason, the
+ * buffer contains whatever was successfully written before truncation
+ * rather than being left empty.
  */
 int api_handle(Database *db,
                const char *method, const char *path,
                const char *query,  const char *body, size_t body_len,
-               char *out_buf, size_t out_size);
+               char *out_buf, size_t out_size,
+               char **out_buf_ptr, size_t *out_len_ptr);
+
+/*
+ * api_handle_free_response
+ *
+ * Releases any heap allocation made by api_handle() in the previous call.
+ * Safe to call with a pointer that still points at the caller's original
+ * (stack or static) buffer — the function tracks whether a heap allocation
+ * was made and only frees it if so.
+ *
+ * Pass the SAME char** that you passed to api_handle() as out_buf_ptr.
+ * After this call returns, *out_buf_ptr is reset to NULL so a double-free
+ * is impossible.
+ */
+void api_handle_free_response(char **out_buf_ptr);
 
 /*
  * api_set_response_content_type / api_get_response_content_type
