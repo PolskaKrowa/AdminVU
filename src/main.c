@@ -182,6 +182,21 @@ void on_interaction_create_combined(struct discord *client,
         /* Ticket button interactions use the "ticket:" prefix. */
         else if (strncmp(custom_id, "ticket:", 7) == 0)
             on_ticket_interaction(client, event);
+        /*
+         * Propagation "Open Linked Ticket" button uses the "prop_ticket:"
+         * prefix.  This MUST be matched BEFORE the "ticket:" check above
+         * would catch it — except it isn't, because "prop_ticket:" doesn't
+         * start with "ticket:".  Either way, we route to the propagation
+         * module's component handler, which creates the linked ticket and
+         * replies ephemerally.
+         *
+         * Without this branch, the interaction fell through silently,
+         * Discord's 3-second ACK window expired, and the user saw
+         * "This interaction failed."  The handler in propagation.c was
+         * ready all along — main.c just wasn't dispatching to it.
+         */
+        else if (strncmp(custom_id, "prop_ticket:", 12) == 0)
+            on_propagation_interaction(client, event);
 
         return;
     }

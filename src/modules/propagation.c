@@ -1578,7 +1578,31 @@ void on_propagation_interaction(struct discord                  *client,
         if (strncmp(cid, "prop_ticket:", 12) == 0) {
             int64_t  alert_id = (int64_t)strtoll(cid + 12, NULL, 10);
             uint64_t user_id  = event->member ? event->member->user->id : 0;
-            uint64_t guild_id = event->guild_id;
+            /*
+             * The ticket must be filed against the SOURCE guild of the
+             * propagation alert — i.e. the community that originally issued
+             * the alert — NOT the guild where the user happened to click the
+             * button.
+             *
+             * Why: ticket_open_for_propagation() looks up the ticket config
+             * via ticket_config_get_by_main_server(target_guild_id), which
+             * searches ticket_config.main_server_id.  Only the source
+             * community has a ticket_config row (set up via /ticketconfig
+             * in its paired staff server).  Receiving guilds typically have
+             * no ticket config at all, so passing event->guild_id here
+             * would fail with "That server hasn't configured its ticket
+             * system yet" — and even if it happened to succeed, the ticket
+             * would end up in the wrong staff server, disconnected from the
+             * staff who issued the alert.
+             *
+             * We fetch the source guild from the propagation event row
+             * (ev.source_guild_id) below, after the alert-existence check.
+             * The click-guild (event->guild_id) is only used for the
+             * db_register_known_guild() side-effect at the top of this
+             * function.
+             */
+            uint64_t click_guild_id = event->guild_id;
+            (void)click_guild_id;  /* currently only used for the known-guild side-effect above */
 
             if (alert_id <= 0 || !user_id) {
                 send_ephemeral(client, event,
@@ -1592,6 +1616,54 @@ void on_propagation_interaction(struct discord                  *client,
                 send_ephemeral(client, event, "❌ Alert not found.");
                 return;
             }
+
+            /*
+             * Target guild for the ticket = the source guild of the alert.
+             * This is the community whose staff issued the propagation and
+             * whose staff server will host the ticket channel.
+             */
+            uint64_t target_guild_id = ev.source_guild_id;
+            if (!target_guild_id) {
+                /* Defensive — should never happen because db_add_propagation_event
+                 * requires a non-zero source_guild_id, but guard anyway. */
+                send_ephemeral(client, event,
+                               "❌ This alert has no source guild on record. "
+                               "Please open a ticket manually via `/ticket open`.");
+                db_free_propagation_event(&ev);
+                return;
+            }
+
+            /*
+             * ACK the interaction IMMEDIATELY with a "working on it"
+             * placeholder.  Discord requires an interaction response within
+             * 3 seconds; ticket_open_for_propagation() below does 6+ REST
+             * calls (create channel, rename, set permissions, post header,
+             * open DM, post DM) which can easily take longer than that.
+             *
+             * The pattern is:
+             *   1. Respond now with DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+             *      (ephemeral) — this satisfies the 3-second ACK window.
+             *      The ephemeral flag MUST be set here, because Discord
+             *      does not allow changing visibility on the later edit.
+             *   2. Do the actual work.
+             *   3. Use discord_edit_original_interaction_response() to
+             *      replace the placeholder with the real result.  Note
+             *      that the edit params struct has NO `flags` field —
+             *      the original response's ephemeral flag is inherited.
+             *
+             * The previous code did all the work first and only then called
+             * send_ephemeral(), so any REST latency > 3s made Discord show
+             * "This interaction failed" — even though the ticket was
+             * actually created successfully behind the scenes.
+             */
+            struct discord_interaction_response defer = {
+                .type = DISCORD_INTERACTION_CALLBACK_DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+                .data = &(struct discord_interaction_callback_data){
+                    .flags = 1 << 6,  /* EPHEMERAL — set here, not on the edit */
+                },
+            };
+            discord_create_interaction_response(client, event->id, event->token,
+                                                 &defer, NULL);
 
             /* Determine the opener's display name for the ticket channel
              * header (member nick → username → "User"). */
@@ -1609,44 +1681,93 @@ void on_propagation_interaction(struct discord                  *client,
                      "Propagation alert #%" PRId64 " – linked ticket", alert_id);
 
             int ticket_id = 0;
-            int trc = ticket_open_for_propagation(client, guild_id, user_id,
+            int trc = ticket_open_for_propagation(client, target_guild_id, user_id,
                                                    uname, subject, &ticket_id);
 
-            if (trc != 0) {
-                send_ephemeral(client, event,
-                               "❌ Could not open a linked ticket. "
-                               "The ticket system may not be configured for "
-                               "this server — an admin must run `/ticketconfig` first.");
-                db_free_propagation_event(&ev);
-                return;
-            }
+            /*
+             * Replace the deferred placeholder with the real outcome via
+             * Discord's "edit original interaction response" endpoint.
+             * This is POST /webhooks/<app>/<token>/messages/@original
+             * and is what discord_edit_original_interaction_response()
+             * calls under the hood.
+             */
+            const char *final_msg;
+            char success_buf[512];
+            if (trc == 0) {
+                snprintf(success_buf, sizeof(success_buf),
+                         "🎫 **Linked ticket #%d opened for Alert #%" PRId64 ".**\n\n"
+                         "A ticket channel has been created in the **source server's** "
+                         "staff server (guild `%" PRIu64 "`).  Staff there will be in "
+                         "touch shortly.\n\n"
+                         "If you are the **warned user** and wish to dispute this "
+                         "alert, use `/propagate-appeal alert_id:%" PRId64 "` instead.",
+                         ticket_id, alert_id, target_guild_id, alert_id);
+                final_msg = success_buf;
 
-            /* Persist the link. */
-            if (g_db && g_db->db) {
-                sqlite3_stmt *st;
-                const char *sql =
-                    "INSERT OR REPLACE INTO propagation_linked_tickets"
-                    " (alert_id, guild_id, opener_id, ticket_id)"
-                    " VALUES (?, ?, ?, ?);";
-                if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) == SQLITE_OK) {
-                    sqlite3_bind_int64(st, 1, alert_id);
-                    sqlite3_bind_int64(st, 2, (sqlite3_int64)guild_id);
-                    sqlite3_bind_int64(st, 3, (sqlite3_int64)user_id);
-                    sqlite3_bind_int  (st, 4, ticket_id);
-                    sqlite3_step(st);
-                    sqlite3_finalize(st);
+                /* Persist the link.
+                 *
+                 * guild_id column = the guild the ticket was filed against
+                 * (i.e. the propagation event's source guild), NOT the guild
+                 * where the user clicked the button.  This keeps the
+                 * dashboard's "linked tickets for this alert" view consistent
+                 * with where the ticket actually lives. */
+                if (g_db && g_db->db) {
+                    sqlite3_stmt *st;
+                    const char *sql =
+                        "INSERT OR REPLACE INTO propagation_linked_tickets"
+                        " (alert_id, guild_id, opener_id, ticket_id)"
+                        " VALUES (?, ?, ?, ?);";
+                    if (sqlite3_prepare_v2(g_db->db, sql, -1, &st, NULL) == SQLITE_OK) {
+                        sqlite3_bind_int64(st, 1, alert_id);
+                        sqlite3_bind_int64(st, 2, (sqlite3_int64)target_guild_id);
+                        sqlite3_bind_int64(st, 3, (sqlite3_int64)user_id);
+                        sqlite3_bind_int  (st, 4, ticket_id);
+                        sqlite3_step(st);
+                        sqlite3_finalize(st);
+                    }
                 }
+            } else {
+                /*
+                 * Ticket creation failed — most commonly because the source
+                 * guild hasn't run /ticketconfig.  Tell the user WHICH guild
+                 * needs configuration so they know where to ask.
+                 */
+                char err_buf[512];
+                snprintf(err_buf, sizeof(err_buf),
+                         "❌ Could not open a linked ticket against the source "
+                         "server (guild `%" PRIu64 "`).  That server's ticket "
+                         "system may not be configured yet — an admin must run "
+                         "`/ticketconfig` in its paired staff server.  "
+                         "Alternatively, open a ticket manually with "
+                         "`/ticket open server:%" PRIu64 "`.",
+                         target_guild_id, target_guild_id);
+                final_msg = err_buf;
             }
 
-            char reply[512];
-            snprintf(reply, sizeof(reply),
-                     "🎫 **Linked ticket #%d opened for Alert #%" PRId64 ".**\n\n"
-                     "A ticket channel has been created in the staff server. "
-                     "Staff will be in touch shortly.\n\n"
-                     "If you are the **warned user** and wish to dispute this "
-                     "alert, use `/propagate-appeal alert_id:%" PRId64 "` instead.",
-                     ticket_id, alert_id, alert_id);
-            send_ephemeral(client, event, reply);
+            struct discord_edit_original_interaction_response_params edit_p = {
+                .content = (char *)final_msg,
+                /*
+                 * NOTE: no .flags field here — Discord does not allow
+                 * changing the ephemeral visibility of a message via the
+                 * edit-original-response endpoint.  The ephemeral flag was
+                 * set on the initial DEFERRED response above and is
+                 * inherited by this edit.  Setting flags here would be a
+                 * compile error against the real Orca header (the struct
+                 * does not have a `flags` member).
+                 */
+            };
+            /*
+             * discord_edit_original_interaction_response takes the application
+             * ID (which == the bot's user ID) and the interaction token.
+             * The bot's user ID is available via discord_get_self().
+             */
+            const struct discord_user *bot = discord_get_self(client);
+            if (bot) {
+                discord_edit_original_interaction_response(client, bot->id,
+                                                            event->token,
+                                                            &edit_p, NULL);
+            }
+
             db_free_propagation_event(&ev);
             return;
         }

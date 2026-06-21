@@ -661,6 +661,75 @@ static int ticket_config_get_by_main_server(Database *db,
     return -1;
 }
 
+/*
+ * ticket_config_get_for_guild
+ *
+ * Find the ticket config for a guild using three lookup strategies in order:
+ *
+ *   1. By main_server_id  —  handles the common case where the guild IS a
+ *      community's main server.  (e.g. /ticket open server:<main_guild>)
+ *
+ *   2. By guild_id         —  handles the case where the guild IS a staff
+ *      server with its own /ticketconfig row.  This happens when a
+ *      propagation alert is fired FROM the staff server: the source guild
+ *      is the staff server, not the main community server, so the
+ *      by-main-server lookup misses (the config row's main_server_id
+ *      points to the paired main community, not to the staff server
+ *      itself).  The by-guild-id lookup finds it because /ticketconfig
+ *      was run inside the staff server, creating a row with
+ *      guild_id = staff_guild_id.
+ *
+ *   3. Via propagation_guild_pairs  —  handles the edge case where the
+ *      guild is a staff server that has NO /ticketconfig row of its own,
+ *      but IS registered as the staff server for a main community (via
+ *      /propagate-pair).  In that case we look up the main guild from
+ *      the pair table and retry the by-main-server lookup with it.
+ *      This succeeds if some OTHER staff server (or the same one in a
+ *      previous configuration) created a config row for that main
+ *      community.
+ *
+ * Returns 0 on success (config written into *out), -1 if no config exists
+ * for this guild under any strategy.
+ */
+static int ticket_config_get_for_guild(Database *db,
+                                        u64_snowflake_t guild_id,
+                                        TicketConfig *out) {
+    /* Strategy 1: target is a main community server. */
+    if (ticket_config_get_by_main_server(db, guild_id, out) == 0)
+        return 0;
+
+    /* Strategy 2: target is a staff server with its own config row. */
+    if (ticket_config_get(db, guild_id, out) == 0)
+        return 0;
+
+    /*
+     * Strategy 3: target is a staff server registered in
+     * propagation_guild_pairs but without its own ticket_config row.
+     * Look up the main guild it's paired with, then retry strategy 1
+     * with that main guild.
+     */
+    sqlite3_stmt *stmt = NULL;
+    const char *pair_sql =
+        "SELECT main_guild_id FROM propagation_guild_pairs"
+        " WHERE staff_guild_id = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(db->db, pair_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, (sqlite3_int64)guild_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            u64_snowflake_t main_guild =
+                (u64_snowflake_t)sqlite3_column_int64(stmt, 0);
+            sqlite3_finalize(stmt);
+            if (main_guild && main_guild != guild_id) {
+                if (ticket_config_get_by_main_server(db, main_guild, out) == 0)
+                    return 0;
+            }
+        } else {
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    return -1;
+}
+
 static int cfg_upsert_text(Database *db, u64_snowflake_t guild_id,
                             const char *field, const char *value) {
     char sql[320];
@@ -1483,9 +1552,18 @@ static int create_ticket_core(struct discord  *client,
         return -1;
     }
 
-    /* ── Validate configuration ── */
+    /* ── Validate configuration ──
+     *
+     * Use the dual-strategy lookup so that tickets can be opened against
+     * EITHER a community's main server OR a staff server that has its own
+     * /ticketconfig row.  The latter case matters for propagation-linked
+     * tickets: if the propagation alert was fired from the staff server,
+     * the source guild is the staff server, and the by-main-server lookup
+     * alone would miss the config (because main_server_id points to the
+     * paired main community, not to the staff server itself).
+     */
     TicketConfig cfg = {0};
-    if (ticket_config_get_by_main_server(g_db, target_guild_id, &cfg) != 0) {
+    if (ticket_config_get_for_guild(g_db, target_guild_id, &cfg) != 0) {
         *err_out = "❌ That server hasn't configured its ticket system yet. "
                    "An admin must run `/ticketconfig` in the staff server first.";
         return -1;
